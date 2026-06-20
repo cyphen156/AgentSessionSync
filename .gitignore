@@ -1,0 +1,35 @@
+# Deny by default. Only the public tool and transported session formats are allowed.
+*
+!.gitignore
+!LICENSE
+!README.md
+!docs/
+!docs/**
+!*.cmd
+!*.ps1
+!*.psd1
+!ACTIVE_HOST.txt
+!Claude/
+!Claude/**/
+!Claude/**/*.jsonl
+!ClaudeApp/
+!ClaudeApp/**/
+!ClaudeApp/**/*.json
+!Codex/
+!Codex/**/
+!Codex/**/*.jsonl
+
+# Machine-local configuration must never be committed.
+AgentSessionSync.config.psd1
+
+# Explicit credential and local database blocks.
+auth.json
+config.toml
+*.db
+*.sqlite
+*.sqlite3
+*.key
+*.pem
+*.pfx
+*.env
+
