@@ -19,9 +19,11 @@ $body = @"
 }
 "@
 [IO.File]::WriteAllText($configPath, $body, (New-Object Text.UTF8Encoding($true)))
-Set-Content -LiteralPath (Join-Path $repoRoot 'ACTIVE_HOST.txt') -Value 'NONE' -Encoding ASCII
+$lockPath = Join-Path $repoRoot 'ACTIVE_HOST.txt'
+if (-not (Test-Path -LiteralPath $lockPath)) {
+    [IO.File]::WriteAllText($lockPath, "NONE`n", (New-Object Text.ASCIIEncoding))
+}
 Write-Host "Created local configuration: $configPath" -ForegroundColor Green
 if (-not $EnableSessionPush) {
     Write-Warning 'Session push remains disabled. Re-run with -EnableSessionPush only in your own PRIVATE transport repository.'
 }
-
