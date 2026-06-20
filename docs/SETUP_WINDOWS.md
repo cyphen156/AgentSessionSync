@@ -10,7 +10,7 @@
 git clone https://github.com/<YOU>/<PRIVATE-REPO>.git C:\AgentSessionSync
 ```
 
-클론 경로는 PC마다 달라도 됩니다.
+클론과 프로젝트 경로는 PC마다 달라도 됩니다.
 
 ## 3. PC별 설정 만들기
 
@@ -19,18 +19,28 @@ cd C:\AgentSessionSync
 .\Initialize-AgentSessionSync.ps1 -ProjectRoot 'D:\Work\MyProject' -EnableSessionPush
 ```
 
-`AgentSessionSync.config.psd1`은 Git에서 제외됩니다. 두 PC의 프로젝트 경로가 달라도 각자 실제 경로를 지정할 수 있으며, 스크립트가 Claude 프로젝트 키를 자동 계산합니다.
+로컬 `AgentSessionSync.config.psd1`은 Git에서 제외됩니다. 프로젝트 자체도 자동 동기화하려면 `-EnableProjectGitSync`를 추가합니다.
 
-- `-EnableSessionPush`: 본인의 Private 운반 저장소에서만 켭니다.
-- `-EnableProjectGitSync`: Start/Finish가 대상 프로젝트도 pull/add/commit/push합니다.
+## 4. 등록된 앱 확인
 
-## 4. 매일 사용
+기본 `Agents\Codex.psd1`, `Agents\Claude.psd1`의 `AppId`와 `ProcessName`을 확인합니다.
 
 ```powershell
-.\1_Start-Work.cmd
-# 작업
-.\2_Finish-Work.cmd
+Get-StartApps | Where-Object Name -Match 'Codex|Claude'
 ```
 
-한 세션 UUID를 두 PC에서 동시에 수정하지 않는 것을 권장합니다. 서로 다른 새 대화는 UUID가 달라 함께 보존됩니다.
+사용하지 않는 앱은 해당 파일의 `Enabled = $false`로 변경합니다.
 
+## 5. 작업 표시줄 바로가기 만들기
+
+```powershell
+.\Create-Shortcuts.ps1
+```
+
+`Shortcuts\Start.lnk`, `Shortcuts\Finish.lnk`를 작업 표시줄에 고정합니다.
+
+## 6. 매일 사용
+
+Start를 눌러 Pull과 에이전트 실행을 완료하고, 작업을 넘기기 전에 Finish를 눌러 정상 종료와 Push를 완료합니다.
+
+같은 세션 UUID를 두 PC에서 동시에 수정하지 않는 것을 권장합니다. 서로 다른 새 대화는 UUID가 달라 함께 보존됩니다.

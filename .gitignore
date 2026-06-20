@@ -8,6 +8,8 @@
 !*.cmd
 !*.ps1
 !*.psd1
+!Agents/
+!Agents/*.psd1
 !ACTIVE_HOST.txt
 !Claude/
 !Claude/**/
@@ -21,6 +23,7 @@
 
 # Machine-local configuration must never be committed.
 AgentSessionSync.config.psd1
+Shortcuts/
 
 # Explicit credential and local database blocks.
 auth.json
@@ -32,4 +35,3 @@ config.toml
 *.pem
 *.pfx
 *.env
-
