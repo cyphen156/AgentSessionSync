@@ -13,6 +13,8 @@ $profileA = Join-Path $testRoot 'ProfileA'
 $profileB = Join-Path $testRoot 'ProfileB'
 $projectA = Join-Path $testRoot 'Projects\DemoA'
 $projectB = Join-Path $testRoot 'Projects\DemoB'
+$oldAppData = $env:APPDATA
+$oldLocalAppData = $env:LOCALAPPDATA
 
 function Write-TestConfig([string]$Repo, [string]$Project, [string]$Profile) {
     $p = $Project.Replace("'", "''")
@@ -24,6 +26,9 @@ function Write-TestConfig([string]$Repo, [string]$Project, [string]$Profile) {
 
 try {
     New-Item -ItemType Directory -Force -Path $testRoot, $projectA, $projectB | Out-Null
+    $env:APPDATA = Join-Path $profileA 'AppData\Roaming'
+    $env:LOCALAPPDATA = Join-Path $profileA 'AppData\Local'
+    New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
     & git clone --bare $repoRoot $remote | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Unable to create temporary bare remote.' }
     & git clone $remote $hostA | Out-Null
@@ -44,6 +49,9 @@ try {
 
     & (Join-Path $hostA 'Push-Sessions.ps1') -ForceOwnership
     if ($LASTEXITCODE -ne 0) { throw 'Host A push failed.' }
+    $env:APPDATA = Join-Path $profileB 'AppData\Roaming'
+    $env:LOCALAPPDATA = Join-Path $profileB 'AppData\Local'
+    New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
     & (Join-Path $hostB 'Pull-Sessions.ps1') -Force
     if ($LASTEXITCODE -ne 0) { throw 'Host B pull failed.' }
 
@@ -56,6 +64,8 @@ try {
     Write-Host '[PASS] Temporary two-clone Claude/Codex round trip succeeded.' -ForegroundColor Green
 }
 finally {
+    $env:APPDATA = $oldAppData
+    $env:LOCALAPPDATA = $oldLocalAppData
     if (Test-Path -LiteralPath $testRoot) {
         $resolved = [IO.Path]::GetFullPath($testRoot)
         if ($resolved.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase)) {

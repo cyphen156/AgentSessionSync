@@ -116,3 +116,4 @@ if (Test-Path -LiteralPath $ClaudeDst) {
 }
 Write-Host "  재개:  claude --resume <UUID>   (반드시 $($Config.ProjectRoot) 에서 실행)"
 Write-Host '         codex  resume  <UUID>'
+$global:LASTEXITCODE = 0

@@ -156,3 +156,4 @@ if ($KeepBaton) {
 } else {
     Write-Host "[OK] Push 완료 ($ThisHost). baton 해제 — 다른 PC에서 Pull-Sessions 하세요." -ForegroundColor Green
 }
+$global:LASTEXITCODE = 0
