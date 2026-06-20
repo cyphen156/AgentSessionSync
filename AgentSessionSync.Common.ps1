@@ -35,6 +35,9 @@ function Get-AgentSessionSyncConfig {
         ClaudeProjectKey = $key
         ClaudeProjectPattern = if ($raw.IncludeClaudeWorktrees) { "$key*" } else { $key }
         SessionDataPushEnabled = [bool]$raw.SessionDataPushEnabled
+        GracefulCloseTimeoutSeconds = if ($raw.ContainsKey('GracefulCloseTimeoutSeconds') -and $raw['GracefulCloseTimeoutSeconds']) {
+            [int]$raw['GracefulCloseTimeoutSeconds']
+        } else { 20 }
     }
 }
 
@@ -43,4 +46,3 @@ function Assert-GitRepository {
     & git -C $Path rev-parse --is-inside-work-tree 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Not a Git repository: $Path" }
 }
-

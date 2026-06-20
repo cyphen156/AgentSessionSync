@@ -14,5 +14,7 @@
 
     # Safety gate. Enable only in your own PRIVATE transport repository.
     SessionDataPushEnabled = $false
-}
 
+    # Seconds to wait for every registered desktop agent to close cleanly.
+    GracefulCloseTimeoutSeconds = 20
+}
