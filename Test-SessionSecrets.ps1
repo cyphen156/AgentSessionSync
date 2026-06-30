@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $Patterns = @(
     @{ Name = 'GitHub token'; Regex = '(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{36}(?![A-Za-z0-9_])' },
     @{ Name = 'GitHub fine-grained token'; Regex = '(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}(?![A-Za-z0-9_])' },
-    @{ Name = 'Anthropic API key'; Regex = '(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])' },
+    @{ Name = 'Anthropic API key'; Regex = '(?<![A-Za-z0-9_-])sk-ant-api\d{2,}-[A-Za-z0-9_-]{50,}(?![A-Za-z0-9_-])' },
     @{ Name = 'OpenAI API key'; Regex = '(?<![A-Za-z0-9_-])sk-(?!ant-)[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])' }
 )
 
