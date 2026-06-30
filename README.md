@@ -1,6 +1,19 @@
 # AgentSessionSync
 
-Windows PC 사이에서 Claude Code와 Codex의 프로젝트별 대화 세션을 Git push/pull로 운반하고, 작업 표시줄의 **Start / Finish 버튼 두 개**로 등록된 에이전트를 함께 열고 닫는 도구입니다.
+Windows PC 사이에서 Claude Code와 Codex의 프로젝트별 대화 세션을 Git push/pull로 운반하고, 작업 표시줄의 **Start / Finish 버튼 두 개**로 등록된 에이전트를 함께 열고 닫는 선택형 도구입니다.
+
+AgentSessionSync는 MultiAgentCrossReview의 필수 구성요소가 아닙니다. 한 대의 머신에서만 작업하거나 대화 세션을 직접 관리한다면 쓰지 않아도 됩니다. 여러 머신에서 같은 에이전트 대화를 이어가야 할 때만 사용자가 직접 만든 **private session vault**를 대상으로 설정합니다.
+
+## 역할 구분
+
+| 계층 | 역할 |
+|---|---|
+| `MultiAgentCrossReview` | 공개 검토 워크벤치. `Reviews/`, 범용 룰, 프로젝트 템플릿, RuleSync 엔진을 포함합니다. |
+| `RuleSync` | 선택 기능. 개인 설정과 프로젝트별 룰 markdown을 private rules vault와 동기화합니다. |
+| `AgentSessionSync` | 선택 기능. Claude/Codex 세션 JSONL을 private session vault와 동기화합니다. |
+| private session vault | 실제 대화 JSONL과 baton을 보관하는 사용자 소유 비공개 저장소입니다. |
+
+룰 동기화와 세션 동기화는 분리합니다. 룰 markdown은 RuleSync가 맡고, 원문 대화 세션은 AgentSessionSync가 맡습니다.
 
 ## 핵심 흐름
 
@@ -21,7 +34,9 @@ Start/Finish 스크립트 자체는 AI를 호출하지 않으므로 AI 토큰을
 
 ## 중요한 보안 구조
 
-이 공개 저장소에는 스크립트와 예제만 있으며 실제 대화는 없습니다. **Use this template**로 본인 소유의 **Private 저장소**를 만든 뒤 그 저장소를 세션 운반용으로 사용하세요.
+이 공개 저장소에는 스크립트와 예제만 있으며 실제 대화는 없습니다. 실제 운반 저장소는 이 저장소를 템플릿으로 삼아 사용자가 직접 만든 **private repository**여야 합니다.
+
+원문 대화(JSONL)에는 시스템 지침, 도구 출력, 절대경로, 비공개 코드 조각, 계정/환경 정보가 섞일 수 있습니다. session vault는 공개하지 마세요.
 
 동기화 대상:
 
@@ -33,18 +48,19 @@ Start/Finish 스크립트 자체는 AI를 호출하지 않으므로 AI 토큰을
 
 - `auth.json`, 앱 DB, SQLite, 키 파일, 로컬 설정
 - Codex `state_5.sqlite`
+- RuleSync가 담당하는 `UserSettings/**/*.md`, `Projects/<name>/RULES.md`
 
-대화 본문 자체에 토큰이나 비공개 코드가 포함될 수 있으므로 운반 저장소는 Private이 기본입니다. Push 전 비밀값 패턴 검사도 수행하지만 모든 민감정보를 보장해 찾아내는 도구는 아닙니다.
+Push 전 비밀값 패턴 검사도 수행하지만 모든 민감정보를 보장해 찾아내는 도구는 아닙니다.
 
 ## 설치
 
-### 1. Private 저장소 생성 및 클론
+### 1. Private session vault 생성 및 클론
 
-이 저장소에서 **Use this template**를 누르고 Visibility를 Private으로 지정합니다.
+이 저장소에서 **Use this template**를 누르고 Visibility를 Private으로 지정합니다. 또는 같은 파일 구조를 가진 사용자 소유 private repository를 직접 만듭니다.
 
 ```powershell
-git clone https://github.com/<YOU>/<PRIVATE-SYNC-REPO>.git C:\AgentSessionSync
-cd C:\AgentSessionSync
+git clone https://github.com/<YOU>/<PRIVATE-SESSION-VAULT>.git C:\AgentSessionVault
+cd C:\AgentSessionVault
 ```
 
 ### 2. PC별 로컬 설정 생성
