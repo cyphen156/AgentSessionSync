@@ -11,13 +11,13 @@ AgentSessionSync는 MultiAgentCrossReview의 필수 구성요소가 아닙니다
 
 | 계층 | 역할 |
 |---|---|
-| `MultiAgentCrossReview` | 공개 검토 워크벤치. `Reviews/`, 범용 룰, 프로젝트 템플릿, RuleSync 엔진을 포함합니다. |
-| `RuleSync` | 선택 기능. 개인 설정과 프로젝트별 룰 markdown을 private rules vault와 동기화합니다. |
+| `MultiAgentCrossReview` | 공개 검토 워크벤치. `Reviews/` 프레임워크·범용 룰·프로젝트 템플릿을 포함합니다. 상태·세션 동기화는 외부 선택 도구가 담당합니다. |
+| `MultiAgentWorkbenchStateSync` | 선택 기능. 개인 설정·프로젝트별 룰·검토 기록을 상태 저장소와 동기화하는 외부 도구입니다. |
 | `AgentSessionSync` | 선택 기능. Claude/Codex 세션 JSONL을 private session vault와 동기화합니다. |
 | private session vault | 실제 대화 JSONL과 baton을 보관하는 사용자 소유 비공개 저장소입니다. |
 
-룰 동기화와 세션 동기화는 분리합니다.  
-룰 markdown은 RuleSync가 맡고, 원문 대화 세션은 AgentSessionSync가 맡습니다.
+상태 동기화와 세션 동기화는 분리합니다.  
+워크벤치 상태(룰·설정·검토 기록)는 MultiAgentWorkbenchStateSync가 맡고, 원문 대화 세션은 AgentSessionSync가 맡습니다.
 
 ## 핵심 흐름
 
@@ -55,7 +55,7 @@ Start/Finish 스크립트 자체는 AI를 호출하지 않으므로 AI 토큰을
 
 - `auth.json`, 앱 DB, SQLite, 키 파일, 로컬 설정
 - Codex `state_5.sqlite`
-- RuleSync가 담당하는 `UserSettings/**/*.md`, `Projects/<name>/RULES.md`
+- MultiAgentWorkbenchStateSync가 담당하는 `UserSettings/**/*.md`, `Projects/<name>/RULES.md`
 
 Push 전 비밀값 패턴 검사도 수행하지만 모든 민감정보를 보장해 찾아내는 도구는 아닙니다.
 
