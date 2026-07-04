@@ -23,7 +23,6 @@
 
 # Machine-local configuration must never be committed.
 AgentSessionSync.config.psd1
-Shortcuts/
 
 # Explicit credential and local database blocks.
 auth.json
