@@ -5,7 +5,7 @@ param(
     [switch]$EnableSessionPush
 )
 $ErrorActionPreference = 'Stop'
-$repoRoot = $PSScriptRoot
+$repoRoot = Split-Path -Parent $PSScriptRoot
 $configPath = Join-Path $repoRoot 'AgentSessionSync.config.psd1'
 $escapedProject = [IO.Path]::GetFullPath($ProjectRoot).Replace("'", "''")
 $body = @"

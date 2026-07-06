@@ -17,12 +17,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = Split-Path -Parent $PSScriptRoot
 $ThisHost = $env:COMPUTERNAME
 $LockFile = Join-Path $RepoRoot 'ACTIVE_HOST.txt'
 
 # Machine-local configuration is ignored by Git.
-. (Join-Path $RepoRoot 'AgentSessionSync.Common.ps1')
+. (Join-Path $PSScriptRoot 'AgentSessionSync.Common.ps1')
 $Config = Get-AgentSessionSyncConfig $RepoRoot
 if (-not $Config.SessionDataPushEnabled) {
     throw 'Session push is disabled. Enable it only in your own PRIVATE transport repository.'
@@ -97,15 +97,15 @@ if ($appRegSrcs) {
 $CodexIdxLocal = Join-Path $Config.CodexHome 'session_index.jsonl'
 $CodexIdxRepo  = Join-Path $RepoRoot 'Codex\session_index.jsonl'
 if (Test-Path -LiteralPath $CodexIdxLocal) {
-    & (Join-Path $RepoRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo, $CodexIdxLocal) -OutPath $CodexIdxRepo
-    & (Join-Path $RepoRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo) -OutPath $CodexIdxLocal
+    & (Join-Path $PSScriptRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo, $CodexIdxLocal) -OutPath $CodexIdxRepo
+    & (Join-Path $PSScriptRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo) -OutPath $CodexIdxLocal
 }
 
 # 4) 본문 시크릿 검사 — JSONL + 앱 레지스트리(local_*.json) + Codex 인덱스. 실제 값 출력 없이 Push를 차단한다.
 $regFiles = @(Get-ChildItem -Path $appRegDst -Filter 'local_*.json' -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
 $scanPaths = @($ClaudeProjectsDst, $CodexDst) + $regFiles
 if (Test-Path -LiteralPath $CodexIdxRepo) { $scanPaths += $CodexIdxRepo }
-& (Join-Path $RepoRoot 'Test-SessionSecrets.ps1') -Paths $scanPaths
+& (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths $scanPaths
 
 # 5) 이번 복사로 변경된 JSONL의 마지막 비어 있지 않은 줄이 완전한 JSON인지 검증한다.
 $changed = @(

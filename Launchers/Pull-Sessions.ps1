@@ -10,12 +10,12 @@
 param([switch]$Force)
 $ErrorActionPreference = 'Stop'
 
-$RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot = Split-Path -Parent $PSScriptRoot
 $ThisHost = $env:COMPUTERNAME
 $LockFile = Join-Path $RepoRoot 'ACTIVE_HOST.txt'
 
 # Machine-local configuration is ignored by Git.
-. (Join-Path $RepoRoot 'AgentSessionSync.Common.ps1')
+. (Join-Path $PSScriptRoot 'AgentSessionSync.Common.ps1')
 $Config = Get-AgentSessionSyncConfig $RepoRoot
 
 # 메인 프로젝트뿐 아니라 그 worktree 폴더들까지 한꺼번에 받는다.
@@ -102,7 +102,7 @@ if (Test-Path -LiteralPath $appRegSrc) {
 $CodexIdxLocal = Join-Path $Config.CodexHome 'session_index.jsonl'
 $CodexIdxRepo  = Join-Path $RepoRoot 'Codex\session_index.jsonl'
 if (Test-Path -LiteralPath $CodexIdxRepo) {
-    & (Join-Path $RepoRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo, $CodexIdxLocal) -OutPath $CodexIdxLocal
+    & (Join-Path $PSScriptRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo, $CodexIdxLocal) -OutPath $CodexIdxLocal
     Write-Host '  (Codex 목록: Codex 앱/CLI 재시작 시 대화 목록이 갱신됩니다.)' -ForegroundColor Cyan
 }
 

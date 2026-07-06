@@ -18,7 +18,7 @@ $items = @(
 )
 
 foreach ($item in $items) {
-    $scriptPath = Join-Path $RepoRoot $item.Script
+    $scriptPath = Join-Path $PSScriptRoot $item.Script
     $shortcutPath = Join-Path $OutputDirectory "$($item.Name).lnk"
     $sc = $shell.CreateShortcut($shortcutPath)
     $sc.TargetPath = "$env:SystemRoot\System32\cmd.exe"

@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 [CmdletBinding()] param()
 $ErrorActionPreference = 'Stop'
-$repoRoot = $PSScriptRoot
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 & git -C $repoRoot rev-parse --verify HEAD 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Commit this repository before running the integration test.' }
 
@@ -37,7 +37,7 @@ try {
 
     Write-TestConfig $hostA $projectA $profileA
     Write-TestConfig $hostB $projectB $profileB
-    . (Join-Path $hostA 'AgentSessionSync.Common.ps1')
+    . (Join-Path $hostA 'Launchers\AgentSessionSync.Common.ps1')
     $keyA = ConvertTo-ClaudeProjectKey $projectA
     $keyB = ConvertTo-ClaudeProjectKey $projectB
 
@@ -47,12 +47,12 @@ try {
     '{"type":"user","message":"portable claude test"}' | Set-Content -LiteralPath (Join-Path $claudeA 'claude-test.jsonl') -Encoding UTF8
     '{"type":"event_msg","payload":{"type":"user_message","message":"portable codex test"}}' | Set-Content -LiteralPath (Join-Path $codexA 'rollout-test.jsonl') -Encoding UTF8
 
-    & (Join-Path $hostA 'Push-Sessions.ps1') -ForceOwnership
+    & (Join-Path $hostA 'Launchers\Push-Sessions.ps1') -ForceOwnership
     if ($LASTEXITCODE -ne 0) { throw 'Host A push failed.' }
     $env:APPDATA = Join-Path $profileB 'AppData\Roaming'
     $env:LOCALAPPDATA = Join-Path $profileB 'AppData\Local'
     New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
-    & (Join-Path $hostB 'Pull-Sessions.ps1') -Force
+    & (Join-Path $hostB 'Launchers\Pull-Sessions.ps1') -Force
     if ($LASTEXITCODE -ne 0) { throw 'Host B pull failed.' }
 
     $claudeExpected = Join-Path $profileB ".claude\projects\$keyB\claude-test.jsonl"
