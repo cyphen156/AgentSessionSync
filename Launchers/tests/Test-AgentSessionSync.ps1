@@ -69,7 +69,13 @@ finally {
     if (Test-Path -LiteralPath $testRoot) {
         $resolved = [IO.Path]::GetFullPath($testRoot)
         if ($resolved.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath()), [StringComparison]::OrdinalIgnoreCase)) {
-            Remove-Item -LiteralPath $resolved -Recurse -Force
+            # Cloned session trees can exceed the 260-char path limit and defeat
+            # Remove-Item; mirror an empty directory over the tree first to flatten it.
+            $emptyDir = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $emptyDir | Out-Null
+            & robocopy $emptyDir $resolved /MIR /NFL /NDL /NJH /NJS /NC /NS > $null
+            Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $emptyDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }
