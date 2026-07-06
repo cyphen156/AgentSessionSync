@@ -22,7 +22,7 @@ foreach ($item in $items) {
     $shortcutPath = Join-Path $OutputDirectory "$($item.Name).lnk"
     $sc = $shell.CreateShortcut($shortcutPath)
     $sc.TargetPath = "$env:SystemRoot\System32\cmd.exe"
-    $sc.Arguments = "/k powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+    $sc.Arguments = "/c powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" & timeout /t 30"
     $sc.WorkingDirectory = $RepoRoot
     $sc.IconLocation = "$env:SystemRoot\System32\shell32.dll,$($item.Icon)"
     $sc.Description = $item.Desc
