@@ -59,6 +59,21 @@ Start/Finish 스크립트 자체는 AI를 호출하지 않으므로 AI 토큰을
 
 Push 전 비밀값 패턴 검사도 수행하지만 모든 민감정보를 보장해 찾아내는 도구는 아닙니다.
 
+## 예시 세션 레이아웃
+
+`examples/session-store/`에 이 도구가 머신 사이로 운반하는 **디렉터리 구조 예시**가 있습니다. 무엇이 동기화되는지를 보여주는 예시이며, 파일 내용은 실제 세션이 아닌 **합성 placeholder**입니다.
+
+```text
+examples/session-store/
+  ACTIVE_HOST.txt                                  # 단일 기록자 baton(잠금 보유 호스트)
+  Claude/projects/<path-neutral-key>/*.jsonl        # Claude Code 프로젝트 세션
+  ClaudeApp/claude-code-sessions/**/*.json          # Claude 데스크톱 앱 세션 레지스트리
+  Codex/session_index.jsonl                         # Codex 세션 인덱스
+  Codex/sessions/YYYY/MM/DD/*.jsonl                 # Codex rollout 세션
+```
+
+include/제외 규칙 전체는 [`SESSION_MANIFEST.schema.md`](SESSION_MANIFEST.schema.md)에 정의돼 있습니다. 실제 대화 JSONL은 공개 저장소가 아니라 사용자의 비공개 `AgentSessionVault`에만 둡니다.
+
 ## 설치
 
 ### 1. Private session vault 생성 및 클론

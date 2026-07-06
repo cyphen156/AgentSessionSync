@@ -22,6 +22,9 @@
 !Codex/**/*.jsonl
 !Launchers/
 !Launchers/**
+!SESSION_MANIFEST.schema.md
+!examples/
+!examples/**
 
 # Machine-local configuration must never be committed.
 AgentSessionSync.config.psd1
