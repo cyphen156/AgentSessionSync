@@ -7,7 +7,8 @@ $repoRoot = Split-Path -Parent $launchers
 $agents = @(Get-RegisteredAgents $repoRoot)
 if (-not $agents) { throw 'No enabled agents were loaded.' }
 if (($agents | Group-Object Name | Where-Object Count -gt 1)) { throw 'Duplicate agent names found.' }
-if (($agents | Group-Object ProcessName | Where-Object Count -gt 1)) { throw 'Duplicate process names found.' }
+$processNames = @($agents | ForEach-Object { $_.ProcessNames })
+if (($processNames | Group-Object | Where-Object Count -gt 1)) { throw 'Duplicate process names found.' }
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("AgentLauncher-Test-" + [guid]::NewGuid().ToString('N'))
 try {

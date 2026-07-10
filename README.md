@@ -113,7 +113,7 @@ Agents/
 Microsoft Store 패키지 식별자가 다른 경우 다음 명령으로 확인한 뒤 해당 파일의 `AppId`를 수정합니다.
 
 ```powershell
-Get-StartApps | Where-Object Name -Match 'Codex|Claude'
+Get-StartApps | Where-Object Name -Match 'Codex|ChatGPT|Claude'
 ```
 
 ### 4. Start / Finish 바로가기 생성

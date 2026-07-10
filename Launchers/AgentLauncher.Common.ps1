@@ -7,14 +7,21 @@ function Get-RegisteredAgents {
     $agentsRoot = Join-Path $RepoRoot 'Agents'
     $agents = foreach ($file in Get-ChildItem -LiteralPath $agentsRoot -Filter '*.psd1' -File) {
         $item = Import-PowerShellDataFile -LiteralPath $file.FullName
-        if (-not $item.Name -or -not $item.AppId -or -not $item.ProcessName) {
+        $processNames = if ($item.ContainsKey('ProcessNames') -and $item.ProcessNames) {
+            @($item.ProcessNames | ForEach-Object { [string]$_ } | Where-Object { $_ })
+        } elseif ($item.ContainsKey('ProcessName') -and $item.ProcessName) {
+            @([string]$item.ProcessName)
+        } else {
+            @()
+        }
+        if (-not $item.Name -or -not $item.AppId -or -not $processNames) {
             throw "Invalid agent definition: $($file.FullName)"
         }
         if ($item.Enabled) {
             [pscustomobject]@{
                 Name = [string]$item.Name
                 AppId = [string]$item.AppId
-                ProcessName = [string]$item.ProcessName
+                ProcessNames = $processNames
                 Order = [int]$item.Order
             }
         }
@@ -23,8 +30,8 @@ function Get-RegisteredAgents {
 }
 
 function Get-AgentWindowProcesses {
-    param([Parameter(Mandatory)][string]$ProcessName)
-    @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+    param([Parameter(Mandatory)][string[]]$ProcessNames)
+    @(Get-Process -Name $ProcessNames -ErrorAction SilentlyContinue |
         Where-Object { $_.MainWindowHandle -ne 0 })
 }
 
@@ -33,7 +40,7 @@ function Stop-AgentGracefully {
         [Parameter(Mandatory)]$Agent,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
-    $windows = @(Get-AgentWindowProcesses $Agent.ProcessName)
+    $windows = @(Get-AgentWindowProcesses $Agent.ProcessNames)
     if (-not $windows) {
         Write-Host "[$($Agent.Name)] No open desktop window." -ForegroundColor DarkGray
         return
@@ -45,7 +52,7 @@ function Stop-AgentGracefully {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         Start-Sleep -Milliseconds 250
-        $remaining = @(Get-AgentWindowProcesses $Agent.ProcessName)
+        $remaining = @(Get-AgentWindowProcesses $Agent.ProcessNames)
     } while ($remaining -and (Get-Date) -lt $deadline)
     if ($remaining) {
         throw "$($Agent.Name) did not close within $TimeoutSeconds seconds. Push was cancelled; no force kill was used."
@@ -56,7 +63,7 @@ function Stop-AgentGracefully {
 function Assert-AllAgentsClosed {
     param([Parameter(Mandatory)][array]$Agents)
     foreach ($agent in $Agents) {
-        if (Get-AgentWindowProcesses $agent.ProcessName) {
+        if (Get-AgentWindowProcesses $agent.ProcessNames) {
             throw "$($agent.Name) is still open. Push was cancelled."
         }
     }

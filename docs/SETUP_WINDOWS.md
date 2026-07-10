@@ -23,10 +23,10 @@ cd C:\AgentSessionSync
 
 ## 4. 등록된 앱 확인
 
-기본 `Agents\Codex.psd1`, `Agents\Claude.psd1`의 `AppId`와 `ProcessName`을 확인합니다.
+기본 `Agents\Codex.psd1`, `Agents\Claude.psd1`의 `AppId`와 `ProcessName` 또는 `ProcessNames`를 확인합니다.
 
 ```powershell
-Get-StartApps | Where-Object Name -Match 'Codex|Claude'
+Get-StartApps | Where-Object Name -Match 'Codex|ChatGPT|Claude'
 ```
 
 사용하지 않는 앱은 해당 파일의 `Enabled = $false`로 변경합니다.

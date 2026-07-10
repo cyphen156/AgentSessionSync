@@ -54,7 +54,7 @@ if ($CheckOnly)
 
 # 2) 실행 중 세션은 종료를 요구하지 않고 스냅숏으로 처리한다.
 $running = Get-Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.ProcessName -match 'claude|codex' }
+    Where-Object { $_.ProcessName -match 'claude|codex|chatgpt' }
 if ($running) {
     Write-Warning 'Claude/Codex 실행 중: 현재까지 기록된 append-only JSONL을 스냅숏으로 동기화합니다.'
 }
