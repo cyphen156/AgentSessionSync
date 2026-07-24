@@ -103,7 +103,8 @@ $CodexIdxLocal = Join-Path $Config.CodexHome 'session_index.jsonl'
 $CodexIdxRepo  = Join-Path $RepoRoot 'Codex\session_index.jsonl'
 if (Test-Path -LiteralPath $CodexIdxRepo) {
     & (Join-Path $PSScriptRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo, $CodexIdxLocal) -OutPath $CodexIdxLocal
-    Write-Host '  (Codex 목록: Codex 앱/CLI 재시작 시 대화 목록이 갱신됩니다.)' -ForegroundColor Cyan
+    & (Join-Path $PSScriptRoot 'Repair-CodexThreadVisibility.ps1')
+    Write-Host '  (Codex 목록: rollout 복원 후 로컬 thread DB 스캔·복구를 요청했습니다.)' -ForegroundColor Cyan
 }
 
 Write-Host "[OK] Pull 완료 — 세션을 $ThisHost 로 가져왔습니다." -ForegroundColor Green

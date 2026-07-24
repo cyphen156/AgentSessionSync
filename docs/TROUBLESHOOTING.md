@@ -8,15 +8,22 @@
 
 등록된 앱이 제한 시간 안에 정상 종료되지 않았거나 다른 등록 에이전트 창이 남아 있습니다. 데이터 기록을 보호하기 위한 동작이며 강제 종료는 수행하지 않습니다. 앱을 직접 종료한 뒤 Finish를 다시 실행하세요.
 
-## 파일은 있는데 앱 목록에 안 보임
+## Codex 파일은 있는데 사이드바에 안 보임
 
-Claude와 Codex 앱을 완전히 종료한 뒤 다시 실행합니다. Claude는 본문 JSONL 외에 `claude-code-sessions` 앱 레지스트리를, Codex는 `session_index.jsonl`을 목록 표시에 사용할 수 있습니다. 이 도구는 두 메타데이터도 함께 운반합니다.
+Pull은 rollout JSONL과 `session_index.jsonl`을 복원한 뒤 `Repair-CodexThreadVisibility.ps1`을 자동
+실행합니다. 이 스크립트는 설치된 `codex app-server`의 `thread/list` 스캔·복구 경로를 호출해 로컬
+thread DB를 갱신합니다. 별도로 `state_5.sqlite`를 복사하지 않습니다.
 
-Codex의 `state_5.sqlite` 같은 앱 DB는 인증·기기 상태가 섞일 수 있어 복사하지 않습니다. 원본 rollout JSONL이 있으면 `codex://threads/<UUID>`로 직접 열어 확인할 수도 있습니다.
+경고가 출력되면 `Get-Command codex`와 `codex app-server --help`가 현재 설치본에서 동작하는지
+확인한 뒤 `.\Launchers\Repair-CodexThreadVisibility.ps1`을 다시 실행합니다. Codex 앱이 이미 열려
+있었다면 사이드바를 새로고침하거나 앱을 다시 열어 표시를 갱신합니다.
+
+Claude는 별도 구조이므로 기존처럼 본문 JSONL과 `claude-code-sessions` 앱 레지스트리를 복원합니다.
 
 ## 다른 PC가 baton을 갖고 있다는 경고
 
-이전 PC에서 Finish를 생략했다는 신호입니다. 스크립트는 경고 후 병합을 시도하지만, 아직 push하지 않은 내용은 가져올 수 없습니다.
+이전 PC에서 Finish를 생략했다는 신호입니다. baton은 경고용이며 Start를 막지 않습니다. 스크립트는
+원격이 앞서 있으면 명시적으로 pull/merge를 시도하지만, 아직 push하지 않은 내용은 가져올 수 없습니다.
 
 ## 비밀값 검사에서 push가 중단됨
 

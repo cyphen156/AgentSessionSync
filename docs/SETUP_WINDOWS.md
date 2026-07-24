@@ -16,10 +16,12 @@ git clone https://github.com/<YOU>/<PRIVATE-REPO>.git C:\AgentSessionSync
 
 ```powershell
 cd C:\AgentSessionSync
-.\Initialize-AgentSessionSync.ps1 -ProjectRoot 'D:\Work\MyProject' -EnableSessionPush
+.\Launchers\Initialize-AgentSessionSync.ps1 -ProjectRoot 'D:\Work\MyProject' -EnableSessionPush
 ```
 
-로컬 `AgentSessionSync.config.psd1`은 Git에서 제외됩니다. 프로젝트 자체도 자동 동기화하려면 `-EnableProjectGitSync`를 추가합니다.
+로컬 `AgentSessionSync.config.psd1`과 머신별 `.lnk`는 Git에서 제외됩니다. 설치 명령이 둘을 함께
+생성합니다. 프로젝트 자체도 자동 동기화하려면 `-EnableProjectGitSync`를 추가합니다. 이때 프로젝트는
+`-ProjectRoot`에 지정한 저장소이며, 연결된 원본 프로젝트를 자동 추론하지 않습니다.
 
 ## 4. 등록된 앱 확인
 
@@ -31,13 +33,11 @@ Get-StartApps | Where-Object Name -Match 'Codex|ChatGPT|Claude'
 
 사용하지 않는 앱은 해당 파일의 `Enabled = $false`로 변경합니다.
 
-## 5. 작업 표시줄 바로가기 만들기
+## 5. 작업 표시줄 바로가기
 
-```powershell
-.\Create-Shortcuts.ps1
-```
-
-`Shortcuts\Start.lnk`, `Shortcuts\Finish.lnk`를 작업 표시줄에 고정합니다.
+설치 중 생성된 `Launchers\Shortcuts\AgentSession-Start.lnk`,
+`AgentSession-Finish.lnk`를 작업 표시줄에 고정합니다. 경로를 옮긴 경우에만
+`.\Launchers\Create-Shortcuts.ps1`을 다시 실행합니다.
 
 ## 6. 매일 사용
 

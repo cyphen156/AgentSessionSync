@@ -14,12 +14,11 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("AgentLauncher-Test-" + [guid]
 try {
     & (Join-Path $launchers 'Create-Shortcuts.ps1') -OutputDirectory $testRoot
     $links = @(Get-ChildItem -LiteralPath $testRoot -Filter '*.lnk' -File)
-    if ($links.Count -ne 3) { throw "Expected three shortcuts, found $($links.Count)." }
+    if ($links.Count -ne 2) { throw "Expected two shortcuts, found $($links.Count)." }
     $shell = New-Object -ComObject WScript.Shell
     $expected = [ordered]@{
         'AgentSession-Start'   = 'Start.ps1'
         'AgentSession-Finish'  = 'Finish.ps1'
-        'AgentSession-Startup' = 'Initialize-AgentSessionSync.ps1'
     }
     foreach ($name in $expected.Keys) {
         $link = Join-Path $testRoot "$name.lnk"
@@ -28,7 +27,7 @@ try {
         if ($shortcut.TargetPath -notlike '*\cmd.exe') { throw "Invalid target: $link" }
         if ($shortcut.Arguments -notmatch [regex]::Escape($expected[$name])) { throw "Invalid arguments: $link" }
     }
-    Write-Host "[PASS] Loaded $($agents.Count) agents and validated Start/Finish/Startup shortcuts without launching apps." -ForegroundColor Green
+    Write-Host "[PASS] Loaded $($agents.Count) agents and validated Start/Finish shortcuts without launching apps." -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }

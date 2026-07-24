@@ -22,6 +22,7 @@
 !Codex/**/*.jsonl
 !Launchers/
 !Launchers/**
+Launchers/Shortcuts/*.lnk
 !SESSION_MANIFEST.schema.md
 !examples/
 !examples/**

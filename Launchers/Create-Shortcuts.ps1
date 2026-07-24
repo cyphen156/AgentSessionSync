@@ -1,5 +1,5 @@
 #requires -Version 5.1
-# Generate taskbar-pinnable .lnk shortcuts for this tool's commands.
+# Generate machine-local taskbar-pinnable .lnk shortcuts for this tool's commands.
 [CmdletBinding()]
 param([string] $OutputDirectory = '')
 
@@ -14,7 +14,6 @@ $shell = New-Object -ComObject WScript.Shell
 $items = @(
     @{ Name = 'AgentSession-Start';   Script = 'Start.ps1';                        Icon = '137'; Desc = 'AgentSessionSync: pull sessions and launch agents' }
     @{ Name = 'AgentSession-Finish';  Script = 'Finish.ps1';                       Icon = '131'; Desc = 'AgentSessionSync: close agents and push sessions' }
-    @{ Name = 'AgentSession-Startup'; Script = 'Initialize-AgentSessionSync.ps1';  Icon = '176'; Desc = 'AgentSessionSync: initialize on a new machine' }
 )
 
 foreach ($item in $items) {

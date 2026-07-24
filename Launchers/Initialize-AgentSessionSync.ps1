@@ -25,6 +25,7 @@ if (-not (Test-Path -LiteralPath $lockPath)) {
     [IO.File]::WriteAllText($lockPath, "NONE`n", (New-Object Text.ASCIIEncoding))
 }
 Write-Host "Created local configuration: $configPath" -ForegroundColor Green
+& (Join-Path $PSScriptRoot 'Create-Shortcuts.ps1')
 if (-not $EnableSessionPush) {
     Write-Warning 'Session push remains disabled. Re-run with -EnableSessionPush only in your own PRIVATE transport repository.'
 }
