@@ -52,6 +52,12 @@ try {
     $env:APPDATA = Join-Path $profileB 'AppData\Roaming'
     $env:LOCALAPPDATA = Join-Path $profileB 'AppData\Local'
     New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
+    # The integration test validates the current worktree without requiring an
+    # intermediate commit. Overlay receiver-side files only after Host A pushed.
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'Launchers\Pull-Sessions.ps1') `
+        -Destination (Join-Path $hostB 'Launchers\Pull-Sessions.ps1') -Force
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'Launchers\Repair-CodexThreadVisibility.ps1') `
+        -Destination (Join-Path $hostB 'Launchers\Repair-CodexThreadVisibility.ps1') -Force
     & (Join-Path $hostB 'Launchers\Pull-Sessions.ps1') -Force
     if ($LASTEXITCODE -ne 0) { throw 'Host B pull failed.' }
 
@@ -61,6 +67,14 @@ try {
     $transportedCodex = Get-ChildItem (Join-Path $profileB '.codex\sessions') -Filter 'rollout-test.jsonl' -Recurse -File -ErrorAction SilentlyContinue
     if (-not $transportedClaude) { throw "Claude session was not restored (expected transport under $claudeExpected)." }
     if (-not $transportedCodex) { throw 'Codex session was not restored.' }
+    $diagnosticPath = Join-Path $env:LOCALAPPDATA 'AgentSessionSync\Logs\latest.json'
+    if (-not (Test-Path -LiteralPath $diagnosticPath)) { throw 'Codex visibility diagnostic log was not created.' }
+    $diagnostic = Get-Content -LiteralPath $diagnosticPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($diagnostic.schemaVersion -ne 1) { throw 'Unexpected Codex visibility diagnostic schema version.' }
+    if ($diagnostic.inventory.rolloutFiles -lt 1) { throw 'Diagnostic log did not inventory restored rollouts.' }
+    if ($diagnostic.status -notin @('no-index', 'complete', 'partial', 'version-mismatch', 'no-compatible-cli')) {
+        throw "Unexpected Codex visibility diagnostic status: $($diagnostic.status)"
+    }
     Write-Host '[PASS] Temporary two-clone Claude/Codex round trip succeeded.' -ForegroundColor Green
 }
 finally {
@@ -79,3 +93,5 @@ finally {
         }
     }
 }
+
+$global:LASTEXITCODE = 0

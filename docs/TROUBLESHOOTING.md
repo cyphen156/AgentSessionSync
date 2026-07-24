@@ -11,14 +11,30 @@
 ## Codex 파일은 있는데 사이드바에 안 보임
 
 Pull은 rollout JSONL과 `session_index.jsonl`을 복원한 뒤 `Repair-CodexThreadVisibility.ps1`을 자동
-실행합니다. 이 스크립트는 설치된 `codex app-server`의 `thread/list` 스캔·복구 경로를 호출해 로컬
-thread DB를 갱신합니다. 별도로 `state_5.sqlite`를 복사하지 않습니다.
+실행합니다. 진단기는 앱 패키지와 CLI 버전을 비교하고, 호환되는 실행 파일을 찾은 경우에만 인덱스에는
+있지만 앱 목록에는 없는 ID를 `thread/read`로 등록합니다.
 
-경고가 출력되면 `Get-Command codex`와 `codex app-server --help`가 현재 설치본에서 동작하는지
-확인한 뒤 `.\Launchers\Repair-CodexThreadVisibility.ps1`을 다시 실행합니다. Codex 앱이 이미 열려
-있었다면 사이드바를 새로고침하거나 앱을 다시 열어 표시를 갱신합니다.
+`state_5.sqlite`는 복사하거나 직접 수정하지 않습니다. 호환되는 자동 등록 경로가 없으면 세션 Pull은
+계속 진행하고 아래 머신 로컬 로그에 원인을 남깁니다. Codex 앱이 이미 열려 있었다면 진단 후 앱을
+다시 열어 표시를 갱신합니다.
 
 Claude는 별도 구조이므로 기존처럼 본문 JSONL과 `claude-code-sessions` 앱 레지스트리를 복원합니다.
+
+## Codex 진단 로그 확인
+
+사이드바 항목이 다르면 먼저 다음 파일을 확인합니다.
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\AgentSessionSync\Logs\latest.json" -Raw
+```
+
+`version-mismatch`는 복원된 rollout보다 실행 가능한 Codex CLI가 오래됐다는 뜻입니다.
+`partial`은 일부 ID의 `thread/read` 등록만 성공했다는 뜻이며 `visibility.repairFailed`에 ID와
+앱 서버 오류가 기록됩니다. `no-compatible-cli` 또는 `failed`이면 `cliCandidates`, `appPackages`,
+`appServer`, `errors`를 함께 확인합니다.
+
+로그에는 대화 본문을 넣지 않으므로 원인 분석용으로 전달할 수 있지만, 사용자 경로와 세션 UUID는
+포함됩니다.
 
 ## 다른 PC가 baton을 갖고 있다는 경고
 

@@ -103,9 +103,9 @@ $CodexIdxLocal = Join-Path $Config.CodexHome 'session_index.jsonl'
 $CodexIdxRepo  = Join-Path $RepoRoot 'Codex\session_index.jsonl'
 if (Test-Path -LiteralPath $CodexIdxRepo) {
     & (Join-Path $PSScriptRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo, $CodexIdxLocal) -OutPath $CodexIdxLocal
-    & (Join-Path $PSScriptRoot 'Repair-CodexThreadVisibility.ps1')
-    Write-Host '  (Codex 목록: rollout 복원 후 로컬 thread DB 스캔·복구를 요청했습니다.)' -ForegroundColor Cyan
 }
+& (Join-Path $PSScriptRoot 'Repair-CodexThreadVisibility.ps1') -CodexHome $Config.CodexHome
+Write-Host '  (Codex 목록: 호환 버전은 누락 세션 등록을 시도하고, 결과는 로컬 진단 로그에 남깁니다.)' -ForegroundColor Cyan
 
 Write-Host "[OK] Pull 완료 — 세션을 $ThisHost 로 가져왔습니다." -ForegroundColor Green
 Write-Host '최근 Claude 세션(UUID = 파일명):' -ForegroundColor Cyan
