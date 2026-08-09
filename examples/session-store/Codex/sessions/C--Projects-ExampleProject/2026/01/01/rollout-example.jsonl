@@ -1,0 +1,1 @@
+{"timestamp":"2026-01-01T09:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"[synthetic example - not a real session] Codex rollout session JSONL. Locally it lives at ~/.codex/sessions/YYYY/MM/DD/; the vault copy adds the <cwd-key> axis and Pull strips it back off."}}

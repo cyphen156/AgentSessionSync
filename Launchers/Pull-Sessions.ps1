@@ -18,13 +18,13 @@ $LockFile = Join-Path $RepoRoot 'ACTIVE_HOST.txt'
 . (Join-Path $PSScriptRoot 'AgentSessionSync.Common.ps1')
 $Config = Get-AgentSessionSyncConfig $RepoRoot
 
-# 메인 프로젝트뿐 아니라 그 worktree 폴더들까지 한꺼번에 받는다.
+# 전송 단위는 프로젝트가 아니라 앱 인덱스다(Push-Sessions.ps1 와 동일 계약).
+# ~/.claude/projects 전체를 폴더 이름 그대로 받는다.
 $ClaudeProjectsSrc = Join-Path $RepoRoot 'Claude\projects'
 $ClaudeProjectsDst = Join-Path $Config.ClaudeHome 'projects'
-$ProjectPattern    = $Config.ClaudeProjectPattern
 $CodexSrc  = Join-Path $RepoRoot 'Codex\sessions'
 $CodexDst  = Join-Path $Config.CodexHome 'sessions'
-# 목록 표시에 쓰는 메인 폴더 경로(패턴에서 끝의 * 제거)
+# 마지막 요약 표시에만 쓰는 ProjectRoot 폴더 경로
 $ClaudeDst = Join-Path $ClaudeProjectsDst $Config.ClaudeProjectKey
 
 # 1) 최신 받기
@@ -62,15 +62,18 @@ if ($LASTEXITCODE -ne 0) {                       # 스테이지에 변경 있음
     if (-not $pushed) { Write-Warning 'baton push가 계속 거부됨 — 네트워크/원격 확인 필요. 로컬 세션 복사는 계속 진행합니다.' }
 }
 
-# 4) Restore path-neutral Claude folders using this PC's derived project key.
+# 4) 앱 인덱스 폴더를 복원한다.
+#    primary / worktree* 는 구버전 Push 가 남긴 경로 치환 이름이므로 ProjectRoot 키로
+#    되돌려 받는다(읽기 전용 하위호환 — 새로 만들지는 않는다).
 New-Item -ItemType Directory -Force -Path $ClaudeProjectsDst, $CodexDst | Out-Null
-$claudeDirs = @(Get-ChildItem -LiteralPath $ClaudeProjectsSrc -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -eq 'primary' -or $_.Name -like 'worktree*' })
+$claudeDirs = @(Get-ChildItem -LiteralPath $ClaudeProjectsSrc -Directory -ErrorAction SilentlyContinue)
 foreach ($dir in $claudeDirs) {
-    $localName = if ($dir.Name -eq 'primary') {
-        $Config.ClaudeProjectKey
+    if ($dir.Name -eq 'primary') {
+        $localName = $Config.ClaudeProjectKey
+    } elseif ($dir.Name -like 'worktree*') {
+        $localName = $Config.ClaudeProjectKey + $dir.Name.Substring('worktree'.Length)
     } else {
-        $Config.ClaudeProjectKey + $dir.Name.Substring('worktree'.Length)
+        $localName = $dir.Name
     }
     $dst = Join-Path $ClaudeProjectsDst $localName
     New-Item -ItemType Directory -Force -Path $dst | Out-Null
@@ -78,8 +81,37 @@ foreach ($dir in $claudeDirs) {
     if ($LASTEXITCODE -ge 8) { throw "robocopy(Claude:$($dir.Name)) 실패 code=$LASTEXITCODE" }
 }
 if (Test-Path -LiteralPath $CodexSrc) {
-    robocopy $CodexSrc $CodexDst *.jsonl /E /XO /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "robocopy(Codex) 실패 code=$LASTEXITCODE" }
+    # Vault 의 첫 축은 rollout 원문의 origin cwd 키다. 로컬 Codex 앱은 이 축을 모르므로
+    # 제거하고 원래 YYYY/MM/DD 트리로 복원한다. 날짜로 바로 시작하는 구 경로도 읽는다.
+    $codexRestore = Copy-CodexTransportTreeToNative -SourceRoot $CodexSrc -DestinationRoot $CodexDst
+    if ($codexRestore.Raw -gt 0) {
+        Write-Host "  [layout] cwd-key Vault에서 Codex JSONL $($codexRestore.Raw)개를 앱 날짜 트리로 복원했습니다." -ForegroundColor DarkCyan
+    }
+    if ($codexRestore.Expanded -gt 0) {
+        Write-Host "  [gzip] 압축 운반된 Codex 세션 $($codexRestore.Expanded)개를 JSONL로 복원했습니다." -ForegroundColor DarkCyan
+    }
+}
+
+# Codex/archive 는 복원하지 않는다(위 robocopy 는 Codex/sessions 만 본다). 다만 상대 PC 가
+# 보관 처리한 세션이 이 PC 작업 집합에 아직 있으면 내려줘야 보관이 양쪽에서 성립한다.
+# 지우지 않고 앱이 쓰는 archived_sessions 로 옮긴다.
+$CodexArchiveSrc  = Join-Path $RepoRoot 'Codex\archive'
+$CodexArchivedDst = Join-Path $Config.CodexHome 'archived_sessions'
+if (Test-Path -LiteralPath $CodexArchiveSrc) {
+    $archivedIds = Get-CodexRolloutIds $CodexArchiveSrc
+    $demotedCodex = 0
+    foreach ($file in @(Get-ChildItem -LiteralPath $CodexDst -File -Recurse -Filter '*.jsonl' -ErrorAction SilentlyContinue)) {
+        $sessionId = Get-CodexSessionId $file.Name
+        if (-not $sessionId -or -not $archivedIds.ContainsKey($sessionId)) { continue }
+        New-Item -ItemType Directory -Force -Path $CodexArchivedDst | Out-Null
+        $target = Join-Path $CodexArchivedDst $file.Name
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $file.FullName -Force }
+        else { Move-Item -LiteralPath $file.FullName -Destination $target -Force }
+        $demotedCodex++
+    }
+    if ($demotedCodex -gt 0) {
+        Write-Host "  [archive] 보관 처리된 Codex 세션 $demotedCodex 건을 이 PC 작업 집합에서 내렸습니다(archived_sessions 로 이동)." -ForegroundColor DarkCyan
+    }
 }
 
 # 4b) Claude 앱 대화목록 레지스트리 복원 — 이 PC의 앱 저장소(존재하는 경로)로. 앱 재시작하면 목록에 뜸.
@@ -89,11 +121,21 @@ if (Test-Path -LiteralPath $appRegSrc) {
         (Join-Path $env:APPDATA 'Claude'),
         (Join-Path $env:LOCALAPPDATA 'Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude')
     ) | Where-Object { Test-Path -LiteralPath $_ }
+    # 레포의 손상된 항목이 이 PC의 멀쩡한 항목을 덮어쓰지 않도록 항목 단위로 머지한다.
+    # 삭제 마커를 먼저 내려받아 폐기 선언을 반영한 뒤 머지해야, 지운 대화가 되살아나지 않는다.
     foreach ($root in $appRoots) {
         $d = Join-Path $root 'claude-code-sessions'
         New-Item -ItemType Directory -Force -Path $d | Out-Null
-        robocopy $appRegSrc $d local_*.json /E /XO /NFL /NDL /NJH /NJS /NP | Out-Null
-        if ($LASTEXITCODE -ge 8) { throw "robocopy(앱레지스트리 복원) 실패 code=$LASTEXITCODE" }
+        Copy-ClaudeDeletionMarkers -Source $appRegSrc -Destination $d | Out-Null
+        $tombstones = Get-ClaudeDeletionMarkers $d
+        $regStats = Merge-ClaudeAppRegistry -Source $appRegSrc -Destination $d -Tombstones $tombstones
+        Write-ClaudeAppRegistryStats -Stats $regStats -Label 'pull'
+        # 상대 PC의 삭제를 이 PC 목록에도 반영한다. 복사를 건너뛰는 것만으로는 그 대화를
+        # 원래 갖고 있던 PC에서 항목이 살아남는다.
+        $localRemoved = Remove-TombstonedLocalEntries -RegistryRoot $d
+        if ($localRemoved -gt 0) {
+            Write-Host "  [폐기] 상대 PC에서 삭제된 대화 $localRemoved 건을 이 PC 목록에서도 치웠습니다(원문은 보존)." -ForegroundColor DarkCyan
+        }
     }
     if ($appRoots) { Write-Host '  (앱 목록: Claude 앱을 완전 재시작하면 대화가 목록에 뜹니다.)' -ForegroundColor Cyan }
 }

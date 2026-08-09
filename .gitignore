@@ -17,9 +17,13 @@
 !ClaudeApp/
 !ClaudeApp/**/
 !ClaudeApp/**/*.json
+# 앱이 대화를 지울 때 남기는 확장자 없는 삭제 마커. 이것이 운반되어야 한쪽에서 지운
+# 대화가 반대편 Pull 때 되살아나지 않는다.
+!ClaudeApp/**/deleted_*
 !Codex/
 !Codex/**/
 !Codex/**/*.jsonl
+!Codex/**/*.jsonl.gz
 !Launchers/
 !Launchers/**
 Launchers/Shortcuts/*.lnk

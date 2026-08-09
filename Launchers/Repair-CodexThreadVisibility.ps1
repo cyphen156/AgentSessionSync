@@ -238,6 +238,23 @@ try {
     }
     $report.inventory.indexEntries = $indexIds.Count
 
+    # 원문이 없는 목록 항목(unresolved)은 복구 대상에서 제외한다. 보관·삭제 판정을 보류한 항목이
+    # 인덱스에 남을 수 있는데, rollout 이 없는 id 를 등록하려 들면 백필이 통째로 실패한다.
+    # 복구는 실제 원문이 있는 세션만 대상으로 삼는다.
+    $rolloutIdSet = @{}
+    foreach ($rolloutFile in $rolloutFiles) {
+        $bareName = $rolloutFile.Name -replace '\.gz$', '' -replace '\.jsonl$', ''
+        if ($bareName -match '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$') {
+            $rolloutIdSet[$Matches[1]] = $true
+        }
+    }
+    $unresolvedIndexIds = @($indexIds.Keys | Where-Object { -not $rolloutIdSet.ContainsKey($_) } | Sort-Object)
+    if ($unresolvedIndexIds.Count -gt 0) {
+        $report.inventory.unresolvedIndexEntries = $unresolvedIndexIds
+        foreach ($unresolvedId in $unresolvedIndexIds) { [void]$indexIds.Remove($unresolvedId) }
+        $report.inventory.indexEntries = $indexIds.Count
+    }
+
     $candidatePaths = [ordered]@{}
     try {
         foreach ($package in @(Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction Stop)) {

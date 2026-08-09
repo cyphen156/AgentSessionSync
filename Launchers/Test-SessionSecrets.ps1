@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'AgentSessionSync.Common.ps1')
 $Patterns = @(
     @{ Name = 'GitHub token'; Regex = '(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{36}(?![A-Za-z0-9_])' },
     @{ Name = 'GitHub fine-grained token'; Regex = '(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}(?![A-Za-z0-9_])' },
@@ -26,14 +27,16 @@ $Files = foreach ($path in $Paths)
 
 $Findings = foreach ($file in $Files)
 {
-    $text = [IO.File]::ReadAllText($file.FullName)
-    foreach ($pattern in $Patterns)
+    foreach ($text in [IO.File]::ReadLines((ConvertTo-ExtendedPath $file.FullName)))
     {
-        if ([regex]::IsMatch($text, $pattern.Regex))
+        foreach ($pattern in $Patterns)
         {
-            [pscustomobject]@{
-                Type = $pattern.Name
-                File = $file.FullName
+            if ([regex]::IsMatch($text, $pattern.Regex))
+            {
+                [pscustomobject]@{
+                    Type = $pattern.Name
+                    File = $file.FullName
+                }
             }
         }
     }

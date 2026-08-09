@@ -1,0 +1,1 @@
+[synthetic example - not real data] The app writes an extension-less deleted_<appSessionId> file when a conversation is deleted. It is transported and honored on both Push and Pull so a deletion on one machine is not undone by the other.

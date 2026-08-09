@@ -45,6 +45,50 @@ Get-Content "$env:LOCALAPPDATA\AgentSessionSync\Logs\latest.json" -Raw
 
 대화 JSONL 또는 앱 레지스트리에 토큰처럼 보이는 문자열이 포함됐습니다. 검사 우회보다 해당 비밀값을 폐기·교체하고 세션 내용을 정리하는 편이 안전합니다.
 
+## 지운 적 없는 대화가 목록에서 사라짐
+
+`ActiveWindowDays`(기본 30)가 지난 세션은 Push가 `archive/` 계층으로 **옮깁니다.** 지우지
+않으므로 언제든 되돌릴 수 있습니다.
+
+```powershell
+.\Launchers\Restore-ArchivedSession.ps1                 # 아카이브 목록
+.\Launchers\Restore-ArchivedSession.ps1 <세션ID 일부>    # 활성 폴더로 복원
+```
+
+복원 후 이 PC에 내려받으려면 `Pull-Sessions.ps1`을 실행합니다. 앱 목록에도 다시 띄우려면 해당
+대화의 `deleted_` 마커를 지워야 할 수 있습니다.
+
+## 지운 대화가 다시 살아남
+
+앱이 남긴 `deleted_<id>` 마커가 운반되지 않은 경우입니다. 두 PC 모두에서 최신 Pull을 받았는지
+확인하세요. 마커는 Push/Pull 양쪽에서 묘비로 취급되며, 목록 항목만 물러나고 대화 원문은
+`archive/`에 보존됩니다. 반대로 **원문이 어느 계층에도 없는 항목**은 자동으로 지우지도
+아카이브하지도 않습니다. 반대편 PC에만 원문이 있을 수 있기 때문이며, 이 경우 Push가 경고만
+남기고 활성 인덱스에 그대로 둡니다.
+
+## 대화 목록에 같은 제목이 여러 번 뜸
+
+앱이 `~/.claude/projects`를 스캔해 CLI로 생긴 transcript마다 목록 항목을 자동 생성한 결과입니다.
+이런 항목은 `sessionId`와 `cliSessionId`가 같고 `completedTurns`가 0이라 실제 대화와 구분됩니다.
+Claude 앱을 완전히 종료한 뒤 정리합니다.
+
+```powershell
+.\Launchers\Remove-AdoptedSessionEntries.ps1            # 대상만 확인
+.\Launchers\Remove-AdoptedSessionEntries.ps1 -Apply     # 실제 정리
+```
+
+목록 항목만 걷어내며 대화 원문은 건드리지 않습니다. 반대로 원문은 있는데 목록 항목이 연결을 잃은
+경우에는 `Repair-ClaudeEntryBinding.ps1`로 다시 묶습니다.
+
+## Codex 세션 파일이 `.jsonl.gz`로 보임
+
+GitHub 파일당 100MiB 제한에 근접한 rollout은 전송 사본만 압축합니다. 로컬 앱 파일은 그대로이며
+Pull이 원래 JSONL 경로로 되돌린 뒤 인덱스 병합을 계속합니다.
+
 ## Claude 프로젝트 폴더를 못 찾음
 
-로컬 설정의 `ProjectRoot`가 Claude를 실행한 실제 작업 경로와 같은지 확인합니다. 경로는 PC마다 다르게 설정할 수 있습니다.
+`ProjectRoot`는 Start/Finish의 기준일 뿐 전송 범위가 아닙니다. `~/.claude/projects`의 모든 폴더는
+이름 그대로 운반되므로, 프로젝트가 설정에 없다는 이유로 대화가 빠지지는 않습니다.
+
+목록 항목과 세션 파일이 서로 다른 곳을 가리킨다면 두 PC의 **프로젝트 절대경로가 다른 것**이
+원인입니다. 앱 목록 항목은 `cwd`를 그대로 들고 다니므로 두 PC에서 경로를 같게 두는 편이 안전합니다.

@@ -10,7 +10,9 @@
 git clone https://github.com/<YOU>/<PRIVATE-REPO>.git C:\AgentSessionSync
 ```
 
-클론과 프로젝트 경로는 PC마다 달라도 됩니다.
+운반 저장소 클론 위치는 PC마다 달라도 됩니다. 다만 **프로젝트 경로는 두 PC에서 같게 두는 것을
+권장합니다.** 앱 목록 항목이 `cwd` 절대경로를 그대로 들고 다니므로, 경로가 다르면 세션 파일
+위치와 앱 목록이 가리키는 위치가 어긋납니다.
 
 ## 3. PC별 설정 만들기
 
@@ -22,6 +24,12 @@ cd C:\AgentSessionSync
 로컬 `AgentSessionSync.config.psd1`과 머신별 `.lnk`는 Git에서 제외됩니다. 설치 명령이 둘을 함께
 생성합니다. 프로젝트 자체도 자동 동기화하려면 `-EnableProjectGitSync`를 추가합니다. 이때 프로젝트는
 `-ProjectRoot`에 지정한 저장소이며, 연결된 원본 프로젝트를 자동 추론하지 않습니다.
+
+`-ProjectRoot`는 Start/Finish의 기준 프로젝트일 뿐 전송 범위가 아닙니다. 대화는 프로젝트와
+무관하게 앱 인덱스 전체가 따라오므로, 새 프로젝트를 시작할 때 설정을 고칠 필요가 없습니다.
+
+보존 기간을 바꾸려면 설정에 `ActiveWindowDays`를 추가합니다(기본 30). 이 기간이 지난 세션은
+삭제되지 않고 저장소의 `archive/` 계층으로 옮겨지며, Pull은 그 계층을 복원하지 않습니다.
 
 ## 4. 등록된 앱 확인
 
