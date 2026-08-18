@@ -172,6 +172,23 @@ function Send-AgentCloseRequest {
     [AgentSessionSync.NativeMethods]::PostMessage($WindowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
 }
 
+function Send-AgentCloseRequests {
+    <#
+      Posts WM_CLOSE to every top-level window the given processes own, skipping handles
+      that were already asked once. Returns how many windows those processes own now.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][int[]]$ProcessIds,
+        [Parameter(Mandatory)]$PostedWindows
+    )
+    if (-not $ProcessIds) { return 0 }
+    $windows = @(Get-AgentTopLevelWindows $ProcessIds)
+    foreach ($window in $windows) {
+        if ($PostedWindows.Add([long]$window)) { [void](Send-AgentCloseRequest $window) }
+    }
+    $windows.Count
+}
+
 function Stop-AgentGracefully {
     param(
         [Parameter(Mandatory)]$Agent,
@@ -183,29 +200,26 @@ function Stop-AgentGracefully {
         return
     }
 
-    $knownIds = New-Object 'Collections.Generic.HashSet[int]'
+    # A PID identifies a process only while that process is alive. Windows reuses freed
+    # PIDs right away and this function frees dozens at once, so a remembered id can name
+    # an unrelated process moments later — killing it, or making the final check report a
+    # still-running agent and cancel a push that should have succeeded. Every decision
+    # below therefore re-enumerates the tree, which re-validates process name and the
+    # WindowsApps path each time, and no id outlives the iteration that observed it.
     $postedWindows = New-Object 'Collections.Generic.HashSet[long]'
-    foreach ($process in $processes) { [void]$knownIds.Add([int]$process.Id) }
-    $windows = @(Get-AgentTopLevelWindows @($knownIds))
-    foreach ($window in $windows) {
-        if ($postedWindows.Add([long]$window)) {
-            [void](Send-AgentCloseRequest $window)
-        }
-    }
-    if ($windows) {
-        Write-Host "[$($Agent.Name)] Requested close for $($windows.Count) top-level window(s); waiting for the complete process tree to exit..." -ForegroundColor Cyan
+    $windowCount = Send-AgentCloseRequests -ProcessIds @($processes | ForEach-Object Id) -PostedWindows $postedWindows
+    if ($windowCount -gt 0) {
+        Write-Host "[$($Agent.Name)] Requested close for $windowCount top-level window(s); waiting for the complete process tree to exit..." -ForegroundColor Cyan
         $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
         do {
             Start-Sleep -Milliseconds 250
             $processes = @(Get-AgentProcessTree $Agent)
-            foreach ($process in $processes) { [void]$knownIds.Add([int]$process.Id) }
             if (-not $processes) {
                 Write-Host "[$($Agent.Name)] Complete process tree exited cleanly." -ForegroundColor Green
                 return
             }
-            foreach ($window in @(Get-AgentTopLevelWindows @($processes.Id))) {
-                if ($postedWindows.Add([long]$window)) { [void](Send-AgentCloseRequest $window) }
-            }
+            # A tray app can open a window after the first request; ask the new ones too.
+            [void](Send-AgentCloseRequests -ProcessIds @($processes | ForEach-Object Id) -PostedWindows $postedWindows)
         } while ((Get-Date) -lt $deadline)
     } else {
         Write-Host "[$($Agent.Name)] No top-level window; terminating the registered process tree immediately." -ForegroundColor Yellow
@@ -215,18 +229,13 @@ function Stop-AgentGracefully {
     $forceDeadline = (Get-Date).AddSeconds(5)
     do {
         $processes = @(Get-AgentProcessTree $Agent)
-        foreach ($process in $processes) { [void]$knownIds.Add([int]$process.Id) }
-        $remaining = @($knownIds | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue } | Sort-Object Id -Unique)
-        if (-not $remaining -and -not $processes) { break }
-        $forceIds = @(@($remaining | ForEach-Object Id) + @($processes | ForEach-Object Id) | Sort-Object -Unique)
-        foreach ($processId in $forceIds) {
+        if (-not $processes) { break }
+        foreach ($processId in @($processes | ForEach-Object Id)) {
             Stop-AgentProcessTree $processId
         }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $forceDeadline)
-    $processes = @(Get-AgentProcessTree $Agent)
-    $remaining = @($knownIds | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-    if ($remaining -or $processes) {
+    if (Get-AgentProcessTree $Agent) {
         throw "$($Agent.Name) is still running after process-tree termination. Push was cancelled."
     }
     Write-Host "[$($Agent.Name)] Complete process tree terminated and verified." -ForegroundColor Yellow
