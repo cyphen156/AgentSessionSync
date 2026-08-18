@@ -8,14 +8,14 @@ $config = Get-AgentSessionSyncConfig $repoRoot
 $agents = @(Get-RegisteredAgents $repoRoot)
 if (-not $agents) { throw 'No enabled agents found in Agents.' }
 $timeout = [int]$config.GracefulCloseTimeoutSeconds
+Assert-CurrentProcessOutsideAgentTrees $agents
 
-Write-Host "[1/4] Closing $($agents.Count) registered agent(s); process-tree fallback is used after timeout..." -ForegroundColor Cyan
+Write-Host "[1/4] Closing all registered agent process trees..." -ForegroundColor Cyan
 foreach ($agent in ($agents | Sort-Object Order -Descending)) {
     Stop-AgentGracefully $agent $timeout
 }
 Write-Host '[2/4] Verifying all registered agents are closed...' -ForegroundColor Cyan
 Assert-AllAgentsClosed $agents
-Start-Sleep -Seconds 1
 
 if ($config.SyncProjectGit) {
     Assert-GitRepository $config.ProjectRoot

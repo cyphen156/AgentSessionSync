@@ -30,5 +30,5 @@
     SessionDataPushEnabled = $false
 
     # Seconds to wait for every registered desktop agent to close cleanly.
-    GracefulCloseTimeoutSeconds = 20
+    GracefulCloseTimeoutSeconds = 8
 }

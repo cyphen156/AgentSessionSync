@@ -192,8 +192,13 @@ try {
     $largeTransportGzip = Join-Path $hostA "Codex\sessions\$codexKey\2026\06\20\rollout-large-test.jsonl.gz"
     $gzipLock = [IO.File]::Open($largeTransportGzip, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
-        & (Join-Path $hostA 'Launchers\Push-Sessions.ps1') -ForceOwnership
-        if ($LASTEXITCODE -ne 0) { throw 'Unchanged oversized-session Push failed while gzip was locked.' }
+        $unchangedPushOutput = @(& (Join-Path $hostA 'Launchers\Push-Sessions.ps1') -ForceOwnership 6>&1)
+        $unchangedPushExitCode = $LASTEXITCODE
+        $unchangedPushOutput | ForEach-Object { Write-Host $_ }
+        if ($unchangedPushExitCode -ne 0) { throw 'Unchanged oversized-session Push failed while gzip was locked.' }
+        if (($unchangedPushOutput | Out-String) -notmatch '\[scan\] Incremental secret scan \(0 changed file\(s\)\)') {
+            throw 'Unchanged Push rescanned committed session files instead of using the incremental secret scan.'
+        }
     }
     finally {
         $gzipLock.Dispose()

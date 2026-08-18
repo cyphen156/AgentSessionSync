@@ -13,7 +13,8 @@ param(
     [switch]$Force,        # 이전 호출과의 호환성 유지용
     [switch]$ForceOwnership, # 다른 호스트의 baton 소유권까지 명시적으로 무시
     [switch]$KeepBaton,    # baton 을 풀지 않고 이 PC가 계속 소유
-    [switch]$CheckOnly     # 현재 PC의 baton 소유권만 확인
+    [switch]$CheckOnly,    # 현재 PC의 baton 소유권만 확인
+    [Alias('Full')][switch]$FullSecretScan # 패턴 변경/감사 시 gzip 포함 전체 세션 재검사
 )
 $ErrorActionPreference = 'Stop'
 
@@ -38,6 +39,7 @@ $CodexDst  = Join-Path $RepoRoot 'Codex\sessions'
 $CodexArchivedSrc = Join-Path $Config.CodexHome 'archived_sessions'
 $CodexArchiveDst  = Join-Path $RepoRoot 'Codex\archive'
 $CodexProjectsRepo = Join-Path $RepoRoot 'Codex\session_projects.jsonl'
+$ClaudeAppRegistryRelative = 'ClaudeApp\claude-code-sessions'
 
 # 1) 원격 baton 최신화 및 소유권 확인
 git -C $RepoRoot pull --ff-only
@@ -113,7 +115,7 @@ if ($dedupedCount -gt 0) {
 
 # 3b) Claude 데스크톱 앱 대화목록 레지스트리(claude-code-sessions)도 레포로 — 앱에 목록이 뜨게 하는 메타.
 #     앱 데이터 경로는 머신마다 다르다(일반설치=Roaming, Store판=Packages\...\LocalCache\Roaming). 존재하는 것만 사용.
-$appRegDst  = Join-Path $RepoRoot 'ClaudeApp\claude-code-sessions'
+$appRegDst  = Join-Path $RepoRoot $ClaudeAppRegistryRelative
 $appRegSrcs = @(
     (Join-Path $env:APPDATA 'Claude\claude-code-sessions'),
     (Join-Path $env:LOCALAPPDATA 'Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude-code-sessions')
@@ -362,23 +364,67 @@ if ($split.Orphan.Count -gt 0) {
     Write-Warning '  상대 PC 에 원문이 있을 수 있습니다. 처리하려면 명시적으로 지시해 주세요.'
 }
 
-# 4) 본문 시크릿 검사 — JSONL + 앱 레지스트리(local_*.json) + Codex 인덱스. 실제 값 출력 없이 Push를 차단한다.
-$regFiles = @(Get-ChildItem -Path $appRegDst -Filter 'local_*.json' -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
-$scanPaths = @($ClaudeProjectsDst, $CodexDst) + $regFiles
-# 보관 계층도 저장소에 올라가는 내용이므로 검사 범위에 포함한다.
-foreach ($archiveScanRoot in @((Join-Path $RepoRoot 'Claude\archive'), $CodexArchiveDst)) {
-    if (Test-Path -LiteralPath $archiveScanRoot) { $scanPaths += $archiveScanRoot }
+# 4) 이번 Push에서 실제로 변경·추가된 운반물만 찾는다. 이미 커밋되어 변경 없는 수백 MiB의
+#    JSONL을 매번 다시 읽지 않는다. 스캐너 코드(패턴 포함)가 바뀐 첫 실행이나 -Full에서는
+#    gzip까지 전체 재검사하며, 성공한 스캐너 해시를 저장해 다음 Push부터 증분으로 돌아간다.
+$trackedChanges = @(& git -C $RepoRoot -c core.quotepath=false diff --name-only --diff-filter=ACMRTUXB HEAD --)
+if ($LASTEXITCODE -ne 0) { throw 'Unable to enumerate changed tracked session files.' }
+$untrackedChanges = @(& git -C $RepoRoot -c core.quotepath=false ls-files --others --exclude-standard)
+if ($LASTEXITCODE -ne 0) { throw 'Unable to enumerate untracked session files.' }
+$changedRepoPaths = @(($trackedChanges + $untrackedChanges) |
+    Where-Object { $_ } |
+    Sort-Object -Unique)
+
+$secretScanner = Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1'
+$scannerHash = (Get-FileHash -LiteralPath $secretScanner -Algorithm SHA256).Hash
+$repoHashAlgorithm = [Security.Cryptography.SHA256]::Create()
+try {
+    $repoHashBytes = $repoHashAlgorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($RepoRoot.ToLowerInvariant()))
+    $repoCacheKey = -join @($repoHashBytes | ForEach-Object { $_.ToString('x2') })
+} finally {
+    $repoHashAlgorithm.Dispose()
 }
-if (Test-Path -LiteralPath $CodexIdxRepo) { $scanPaths += $CodexIdxRepo }
-if (Test-Path -LiteralPath $CodexArchiveIdxRepo) { $scanPaths += $CodexArchiveIdxRepo }
-if (Test-Path -LiteralPath $CodexProjectsRepo) { $scanPaths += $CodexProjectsRepo }
-& (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths $scanPaths
+$secretScanStateRoot = Join-Path $env:LOCALAPPDATA 'AgentSessionSync\SecretScan'
+$secretScanStatePath = Join-Path $secretScanStateRoot ($repoCacheKey + '.json')
+$previousScannerHash = ''
+if (Test-Path -LiteralPath $secretScanStatePath) {
+    try { $previousScannerHash = [string]((Get-Content -Raw -LiteralPath $secretScanStatePath | ConvertFrom-Json).ScannerSha256) } catch {}
+}
+$runFullSecretScan = $FullSecretScan -or -not [string]::Equals($previousScannerHash, $scannerHash, [StringComparison]::OrdinalIgnoreCase)
+
+if ($runFullSecretScan) {
+    $regFiles = @(Get-ChildItem -Path $appRegDst -Filter 'local_*.json' -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
+    $scanPaths = @($ClaudeProjectsDst, $CodexDst) + $regFiles
+    foreach ($archiveScanRoot in @((Join-Path $RepoRoot 'Claude\archive'), $CodexArchiveDst)) {
+        if (Test-Path -LiteralPath $archiveScanRoot) { $scanPaths += $archiveScanRoot }
+    }
+    foreach ($indexPath in @($CodexIdxRepo, $CodexArchiveIdxRepo, $CodexProjectsRepo)) {
+        if (Test-Path -LiteralPath $indexPath) { $scanPaths += $indexPath }
+    }
+    $reason = if ($FullSecretScan) { '-Full requested' } else { 'scanner patterns changed or no completed full scan exists' }
+    Write-Host "  [scan] Full secret scan, including gzip ($reason)." -ForegroundColor DarkCyan
+    & $secretScanner -Paths $scanPaths -IncludeCompressed
+    New-Item -ItemType Directory -Path $secretScanStateRoot -Force | Out-Null
+    [pscustomobject]@{ ScannerSha256 = $scannerHash; CompletedAtUtc = [DateTime]::UtcNow.ToString('o') } |
+        ConvertTo-Json | Set-Content -LiteralPath $secretScanStatePath -Encoding UTF8
+} else {
+    $registryPrefix = $ClaudeAppRegistryRelative.Replace('\', '/').TrimEnd('/') + '/'
+    $changedSecretPaths = @($changedRepoPaths | Where-Object {
+        $normalized = $_.Replace('\', '/')
+        $normalized.EndsWith('.jsonl', [StringComparison]::OrdinalIgnoreCase) -or
+            $normalized.EndsWith('.jsonl.gz', [StringComparison]::OrdinalIgnoreCase) -or
+            ($normalized.StartsWith($registryPrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                [IO.Path]::GetFileName($normalized) -match '(?i)^local_[^/]+\.json$')
+    } | ForEach-Object {
+        $candidate = Join-Path $RepoRoot $_
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { $candidate }
+    })
+    Write-Host "  [scan] Incremental secret scan ($($changedSecretPaths.Count) changed file(s))." -ForegroundColor DarkCyan
+    & $secretScanner -Paths $changedSecretPaths -IncludeCompressed
+}
 
 # 5) 이번 복사로 변경된 JSONL의 마지막 비어 있지 않은 줄이 완전한 JSON인지 검증한다.
-$changed = @(
-    git -C $RepoRoot diff --name-only -- '*.jsonl'
-    git -C $RepoRoot ls-files --others --exclude-standard -- '*.jsonl'
-) | Sort-Object -Unique
+$changed = @($changedRepoPaths | Where-Object { $_.EndsWith('.jsonl', [StringComparison]::OrdinalIgnoreCase) })
 
 foreach ($relativePath in $changed) {
     $snapshot = Join-Path $RepoRoot $relativePath

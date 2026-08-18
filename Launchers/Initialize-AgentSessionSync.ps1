@@ -16,7 +16,7 @@ $body = @"
     ClaudeHome = ''
     CodexHome = ''
     SessionDataPushEnabled = `$$($EnableSessionPush.IsPresent.ToString().ToLower())
-    GracefulCloseTimeoutSeconds = 20
+    GracefulCloseTimeoutSeconds = 8
 }
 "@
 [IO.File]::WriteAllText($configPath, $body, (New-Object Text.UTF8Encoding($true)))

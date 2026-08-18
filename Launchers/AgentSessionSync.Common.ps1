@@ -43,7 +43,7 @@ function Get-AgentSessionSyncConfig {
         SessionDataPushEnabled = [bool]$raw.SessionDataPushEnabled
         GracefulCloseTimeoutSeconds = if ($raw.ContainsKey('GracefulCloseTimeoutSeconds') -and $raw['GracefulCloseTimeoutSeconds']) {
             [int]$raw['GracefulCloseTimeoutSeconds']
-        } else { 20 }
+        } else { 8 }
     }
 }
 
