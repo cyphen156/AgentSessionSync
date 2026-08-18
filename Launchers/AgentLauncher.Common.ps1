@@ -123,12 +123,17 @@ function Assert-CurrentProcessOutsideAgentTrees {
 }
 
 function Stop-AgentProcessTree {
+    <#
+      Best effort by design. taskkill reports ERROR_NOT_SUPPORTED for a packaged process
+      the app lifetime manager currently has suspended, and that clears on its own a
+      moment later. Failing here would abort the caller's retry deadline on the first
+      attempt, which is the one thing that must not happen: the deadline is what decides
+      when to give up, not a single taskkill exit code.
+    #>
     param([Parameter(Mandatory)][int]$ProcessId)
     $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
     & $taskkill /PID $ProcessId /T /F | Out-Null
-    if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
-        throw "Failed to terminate process tree rooted at PID $ProcessId (taskkill exit code $LASTEXITCODE)."
-    }
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Initialize-AgentWindowApi {
@@ -226,12 +231,20 @@ function Stop-AgentGracefully {
     }
 
     Write-Warning "$($Agent.Name) still has registered app processes. Terminating the complete process tree."
-    $forceDeadline = (Get-Date).AddSeconds(5)
+    $forceDeadline = (Get-Date).AddSeconds(10)
     do {
-        $processes = @(Get-AgentProcessTree $Agent)
+        $snapshot = @(Get-SystemProcessSnapshot)
+        $processes = @(Get-AgentProcessTree -Agent $Agent -Snapshot $snapshot)
         if (-not $processes) { break }
-        foreach ($processId in @($processes | ForEach-Object Id)) {
-            Stop-AgentProcessTree $processId
+        $treeIds = New-Object 'Collections.Generic.HashSet[int]'
+        foreach ($process in $processes) { [void]$treeIds.Add([int]$process.Id) }
+        $parentOf = @{}
+        foreach ($row in $snapshot) { $parentOf[[int]$row.ProcessId] = [int]$row.ParentProcessId }
+        # /T already takes the descendants, so asking for them by id as well only produces
+        # "process not found" noise once the root's kill lands. Kill the roots of the tree.
+        foreach ($processId in @($treeIds)) {
+            if ($parentOf.ContainsKey($processId) -and $treeIds.Contains($parentOf[$processId])) { continue }
+            [void](Stop-AgentProcessTree $processId)
         }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $forceDeadline)
