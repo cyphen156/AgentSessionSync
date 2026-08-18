@@ -200,10 +200,27 @@ $oversized = @(@($CodexDst, $CodexArchiveDst) | Where-Object { Test-Path -Litera
         Get-ChildItem -LiteralPath $_ -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue
     } | Where-Object { $_.Length -gt $TransportFileLimitBytes })
 if ($oversized) {
-    # 압축본은 시크릿 스캐너가 직접 읽을 수 없으므로 원본 운반 사본을 먼저 검사한다.
-    & (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths @($oversized | ForEach-Object FullName)
-    Write-Host "  [gzip] GitHub 파일당 한도에 근접한 Codex 세션 $($oversized.Count)개를 압축합니다." -ForegroundColor DarkCyan
+    $toCompress = @()
+    $reused = 0
     foreach ($file in $oversized) {
+        $compressed = $file.FullName + '.gz'
+        if (Test-CompressedJsonlTransportCurrent -Source $file.FullName -Compressed $compressed) {
+            Remove-Item -LiteralPath $file.FullName -Force
+            $reused++
+            continue
+        }
+        $toCompress += $file
+    }
+    if ($reused -gt 0) {
+        Write-Host "  [gzip] 변경 없는 대형 Codex 세션 ${reused}개는 기존 압축본을 재사용합니다." -ForegroundColor DarkCyan
+    }
+
+    # 압축본은 시크릿 스캐너가 직접 읽을 수 없으므로 원본 운반 사본을 먼저 검사한다.
+    if ($toCompress.Count -gt 0) {
+        & (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths @($toCompress | ForEach-Object FullName)
+        Write-Host "  [gzip] 변경된 대형 Codex 세션 $($toCompress.Count)개를 압축합니다." -ForegroundColor DarkCyan
+    }
+    foreach ($file in $toCompress) {
         $relative = $file.FullName.Substring($RepoRoot.Length).TrimStart('\', '/').Replace('\', '/')
         Test-JsonlSnapshotComplete $file.FullName
         $compressed = $file.FullName + '.gz'

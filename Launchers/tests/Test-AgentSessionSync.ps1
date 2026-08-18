@@ -2,7 +2,7 @@
 [CmdletBinding()] param()
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-& git -C $repoRoot rev-parse --verify HEAD 2>$null | Out-Null
+& git -C $repoRoot -c "safe.directory=$($repoRoot.Replace('\', '/'))" rev-parse --verify HEAD 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Commit this repository before running the integration test.' }
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("AgentSessionSync-Test-" + [guid]::NewGuid().ToString('N'))
@@ -32,9 +32,11 @@ try {
     New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
     & git clone --bare $repoRoot $remote | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Unable to create temporary bare remote.' }
-    & git clone $remote $hostA | Out-Null
-    & git clone $remote $hostB | Out-Null
+    & git -c core.longpaths=true clone $remote $hostA | Out-Null
+    & git -c core.longpaths=true clone $remote $hostB | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Unable to create test clones.' }
+    & git -C $hostA config core.longpaths true
+    & git -C $hostB config core.longpaths true
 
     # 통합 테스트의 작은 전송 한도가 실제 Vault의 기존 세션까지 압축 대상으로 잡지 않도록
     # 임시 송신 저장소의 운반 데이터만 비우고 테스트 픽스처로 새 기준을 만든다.
@@ -184,6 +186,25 @@ try {
     if (-not @(& git -C $hostA ls-files -- "Codex/sessions/$codexKey/2026/06/20/rollout-large-test.jsonl.gz")) {
         throw 'Codex gzip 운반물이 Git 추적 대상에 포함되지 않았습니다.'
     }
+
+    # 변경 없는 대형 세션은 기존 gzip을 교체하지 않아야 한다. gzip을 읽기 전용 공유로
+    # 열어 둔 채 두 번째 Push가 성공하면 재압축/교체 경로를 타지 않았다는 뜻이다.
+    $largeTransportGzip = Join-Path $hostA "Codex\sessions\$codexKey\2026\06\20\rollout-large-test.jsonl.gz"
+    $gzipLock = [IO.File]::Open($largeTransportGzip, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        & (Join-Path $hostA 'Launchers\Push-Sessions.ps1') -ForceOwnership
+        if ($LASTEXITCODE -ne 0) { throw 'Unchanged oversized-session Push failed while gzip was locked.' }
+    }
+    finally {
+        $gzipLock.Dispose()
+    }
+
+    # append-only 원본이 늘어나면 기존 gzip을 재사용하지 않고 새 내용으로 교체해야 한다.
+    '{"type":"event_msg","payload":{"type":"user_message","message":"large session appended"}}' |
+        Add-Content -LiteralPath $largeCodexSource -Encoding UTF8
+    $largeCodexHash = (Get-FileHash -LiteralPath $largeCodexSource -Algorithm SHA256).Hash
+    & (Join-Path $hostA 'Launchers\Push-Sessions.ps1') -ForceOwnership
+    if ($LASTEXITCODE -ne 0) { throw 'Changed oversized-session Push failed.' }
 
     # 보존은 하되 활성 폴더에서는 빠져야 한다. 삭제가 아니라 이동인지 둘 다 확인한다.
     if (Test-Path -LiteralPath (Join-Path $agedDir 'aged-test.jsonl')) {

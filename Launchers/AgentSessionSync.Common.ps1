@@ -121,6 +121,45 @@ function Compress-JsonlTransportFile {
     }
 }
 
+function Test-CompressedJsonlTransportCurrent {
+    <#
+      변경되지 않은 append-only JSONL을 매 Push마다 다시 검사·압축하지 않도록
+      기존 gzip 운반물이 현재 raw 스냅숏과 같은지를 저비용으로 판정한다.
+
+      Compress-JsonlTransportFile은 gzip의 LastWriteTimeUtc를 원본과 같게 보존한다.
+      gzip footer의 ISIZE는 비압축 원본 길이 modulo 2^32를 담으므로, 두 값이 모두
+      일치하면 이 워크플로의 append-only 계약 아래에서는 기존 운반물을 재사용한다.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Compressed
+    )
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { return $false }
+    if (-not (Test-Path -LiteralPath $Compressed -PathType Leaf)) { return $false }
+
+    $sourceInfo = Get-Item -LiteralPath $Source
+    $compressedInfo = Get-Item -LiteralPath $Compressed
+    if ($sourceInfo.LastWriteTimeUtc -ne $compressedInfo.LastWriteTimeUtc) { return $false }
+    if ($compressedInfo.Length -lt 4) { return $false }
+
+    $stream = $null
+    try {
+        $stream = [IO.File]::OpenRead((ConvertTo-ExtendedPath $Compressed))
+        [void]$stream.Seek(-4, [IO.SeekOrigin]::End)
+        $footer = New-Object byte[] 4
+        if ($stream.Read($footer, 0, 4) -ne 4) { return $false }
+        $storedLength = [BitConverter]::ToUInt32($footer, 0)
+        $expectedLength = [uint32]($sourceInfo.Length % ([int64]4294967296))
+        return $storedLength -eq $expectedLength
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
 function Expand-JsonlTransportFile {
     <#
       gzip 운반물을 로컬 앱이 읽는 원래 JSONL 경로로 복원한다.
