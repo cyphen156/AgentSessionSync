@@ -35,27 +35,78 @@ function Get-AgentWindowProcesses {
         Where-Object { $_.MainWindowHandle -ne 0 })
 }
 
+function Test-AgentDesktopProcess {
+    param([Parameter(Mandatory)]$Process)
+    if ($Process.MainWindowHandle -ne 0) { return $true }
+    try {
+        $executablePath = [string]$Process.Path
+    } catch {
+        $executablePath = ''
+    }
+    return $executablePath -match '(?i)\\WindowsApps\\'
+}
+
+function Get-AgentDesktopProcesses {
+    param([Parameter(Mandatory)][string[]]$ProcessNames)
+    @(Get-Process -Name $ProcessNames -ErrorAction SilentlyContinue |
+        Where-Object { Test-AgentDesktopProcess $_ } |
+        Sort-Object Id -Unique)
+}
+
+function Get-RunningProcessesById {
+    param([Parameter(Mandatory)][int[]]$ProcessIds)
+    @($ProcessIds | ForEach-Object {
+        Get-Process -Id $_ -ErrorAction SilentlyContinue
+    })
+}
+
+function Stop-AgentProcessTree {
+    param([Parameter(Mandatory)][int]$ProcessId)
+    $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    & $taskkill /PID $ProcessId /T /F | Out-Null
+    if ($LASTEXITCODE -ne 0 -and (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+        throw "Failed to terminate process tree rooted at PID $ProcessId (taskkill exit code $LASTEXITCODE)."
+    }
+}
+
 function Stop-AgentGracefully {
     param(
         [Parameter(Mandatory)]$Agent,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
-    $windows = @(Get-AgentWindowProcesses $Agent.ProcessNames)
-    if (-not $windows) {
-        Write-Host "[$($Agent.Name)] No open desktop window." -ForegroundColor DarkGray
+    $processes = @(Get-AgentDesktopProcesses $Agent.ProcessNames)
+    if (-not $processes) {
+        Write-Host "[$($Agent.Name)] No running desktop process." -ForegroundColor DarkGray
         return
     }
-    foreach ($process in $windows) {
-        Write-Host "[$($Agent.Name)] Requesting graceful close (PID $($process.Id))..." -ForegroundColor Cyan
-        $null = $process.CloseMainWindow()
+    $processIds = @($processes.Id)
+    foreach ($process in $processes) {
+        if ($process.MainWindowHandle -ne 0) {
+            Write-Host "[$($Agent.Name)] Requesting graceful close (PID $($process.Id))..." -ForegroundColor Cyan
+            $null = $process.CloseMainWindow()
+        }
     }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
         Start-Sleep -Milliseconds 250
-        $remaining = @(Get-AgentWindowProcesses $Agent.ProcessNames)
+        $remaining = @(Get-RunningProcessesById $processIds)
     } while ($remaining -and (Get-Date) -lt $deadline)
     if ($remaining) {
-        throw "$($Agent.Name) did not close within $TimeoutSeconds seconds. Push was cancelled; no force kill was used."
+        $remainingIds = @($remaining.Id)
+        Write-Warning "$($Agent.Name) still has $($remainingIds.Count) process(es) after $TimeoutSeconds seconds. Terminating its registered desktop process tree."
+        foreach ($processId in $remainingIds) {
+            Stop-AgentProcessTree $processId
+        }
+        $forceDeadline = (Get-Date).AddSeconds(5)
+        do {
+            Start-Sleep -Milliseconds 250
+            $remaining = @(Get-RunningProcessesById $processIds)
+        } while ($remaining -and (Get-Date) -lt $forceDeadline)
+        if ($remaining) {
+            throw "$($Agent.Name) is still running after process-tree termination. Push was cancelled."
+        }
+        Write-Host "[$($Agent.Name)] Closed with process-tree fallback." -ForegroundColor Yellow
+        return
     }
     Write-Host "[$($Agent.Name)] Closed cleanly." -ForegroundColor Green
 }
@@ -63,8 +114,8 @@ function Stop-AgentGracefully {
 function Assert-AllAgentsClosed {
     param([Parameter(Mandatory)][array]$Agents)
     foreach ($agent in $Agents) {
-        if (Get-AgentWindowProcesses $agent.ProcessNames) {
-            throw "$($agent.Name) is still open. Push was cancelled."
+        if (Get-AgentDesktopProcesses $agent.ProcessNames) {
+            throw "$($agent.Name) still has a running desktop process. Push was cancelled."
         }
     }
 }

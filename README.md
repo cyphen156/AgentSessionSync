@@ -31,7 +31,7 @@ AgentSessionSync는 MultiAgentCrossReview의 필수 구성요소가 아닙니다
 ### Finish
 
 1. 등록된 에이전트 전부 정상 종료 요청
-2. 모든 창이 닫혔는지 확인 — 강제 종료하지 않음
+2. 캡처한 데스크톱 프로세스의 실제 종료 확인 — 제한시간 초과 시 해당 앱 프로세스 트리 종료
 3. 선택적으로 대상 프로젝트 commit/push
 4. Claude/Codex 세션 검사 후 commit/push
 
@@ -229,8 +229,8 @@ Windows 정책상 작업 표시줄 고정과 위치 이동은 사용자가 직�
 .\Launchers\Finish.ps1
 ```
 
-Finish는 에이전트가 제한 시간 안에 정상 종료되지 않으면 Push를 중단합니다.  
-마지막 기록을 보호하기 위해 강제 종료하지 않습니다.
+Finish는 먼저 창 닫기 요청으로 정상 종료를 기다립니다. 창만 사라지고 프로세스가 남거나 제한시간을
+넘기면 등록된 데스크톱 앱의 프로세스 트리를 종료한 뒤, 실제 PID가 모두 사라진 경우에만 Push를 진행합니다.
 
 Codex 세션 JSONL이 GitHub 파일당 100MiB 제한에 근접하면 Push는 원본 앱 파일을
 건드리지 않고 전송 사본만 `.jsonl.gz`로 압축합니다. Pull은 이를 원래 JSONL 경로로

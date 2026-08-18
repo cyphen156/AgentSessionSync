@@ -9,7 +9,7 @@ $agents = @(Get-RegisteredAgents $repoRoot)
 if (-not $agents) { throw 'No enabled agents found in Agents.' }
 $timeout = [int]$config.GracefulCloseTimeoutSeconds
 
-Write-Host "[1/4] Closing $($agents.Count) registered agent(s) without force kill..." -ForegroundColor Cyan
+Write-Host "[1/4] Closing $($agents.Count) registered agent(s); process-tree fallback is used after timeout..." -ForegroundColor Cyan
 foreach ($agent in ($agents | Sort-Object Order -Descending)) {
     Stop-AgentGracefully $agent $timeout
 }

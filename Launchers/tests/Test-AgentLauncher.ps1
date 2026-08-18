@@ -27,7 +27,46 @@ try {
         if ($shortcut.TargetPath -notlike '*\cmd.exe') { throw "Invalid target: $link" }
         if ($shortcut.Arguments -notmatch [regex]::Escape($expected[$name])) { throw "Invalid arguments: $link" }
     }
-    Write-Host "[PASS] Loaded $($agents.Count) agents and validated Start/Finish shortcuts without launching apps." -ForegroundColor Green
+
+    $hiddenPackageProcess = [pscustomobject]@{
+        Id = 4242
+        MainWindowHandle = 0
+        Path = 'C:\Program Files\WindowsApps\Example.Agent_1.0.0.0_x64__test\Agent.exe'
+    }
+    $cliProcess = [pscustomobject]@{
+        Id = 4243
+        MainWindowHandle = 0
+        Path = 'C:\Tools\agent.exe'
+    }
+    if (-not (Test-AgentDesktopProcess $hiddenPackageProcess)) {
+        throw 'A hidden packaged desktop process was not recognized.'
+    }
+    if (Test-AgentDesktopProcess $cliProcess) {
+        throw 'A windowless non-packaged CLI process was incorrectly recognized as a desktop app.'
+    }
+
+    $script:testProcessRunning = $true
+    $script:fallbackProcessId = $null
+    $fakeProcess = [pscustomobject]@{
+        Id = 4242
+        MainWindowHandle = 0
+        Path = $hiddenPackageProcess.Path
+    }
+    function Get-AgentDesktopProcesses { @($fakeProcess) }
+    function Get-RunningProcessesById {
+        if ($script:testProcessRunning) { @($fakeProcess) } else { @() }
+    }
+    function Stop-AgentProcessTree {
+        param([int]$ProcessId)
+        $script:fallbackProcessId = $ProcessId
+        $script:testProcessRunning = $false
+    }
+    Stop-AgentGracefully ([pscustomobject]@{ Name = 'TestAgent'; ProcessNames = @('TestAgent') }) 0
+    if ($script:fallbackProcessId -ne 4242) {
+        throw 'The lingering hidden desktop process did not use the process-tree fallback.'
+    }
+
+    Write-Host "[PASS] Loaded $($agents.Count) agents, validated shortcuts, and covered lingering desktop-process shutdown without launching apps." -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
