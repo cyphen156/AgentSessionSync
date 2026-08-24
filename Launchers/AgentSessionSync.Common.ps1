@@ -346,12 +346,45 @@ function Move-ToTransportArchive {
     return $targetRelative
 }
 
+function Get-CodexSessionMeta {
+    <# File names may end in a page ID. Identity comes from session_meta. #>
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Codex rollout does not exist: $Path" }
+    $rawStream = $null; $gzipStream = $null; $reader = $null
+    try {
+        $rawStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $Path), [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        if ($Path -like '*.gz') {
+            $gzipStream = [IO.Compression.GZipStream]::new($rawStream, [IO.Compression.CompressionMode]::Decompress, $true)
+            $reader = [IO.StreamReader]::new($gzipStream, [Text.Encoding]::UTF8, $true)
+        } else {
+            $reader = [IO.StreamReader]::new($rawStream, [Text.Encoding]::UTF8, $true)
+        }
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $record = $null
+            try { $record = $line | ConvertFrom-Json } catch { continue }
+            if ($null -eq $record -or [string]$record.type -ne 'session_meta' -or $null -eq $record.payload) { continue }
+            $id = [string]$record.payload.id
+            $sessionId = [string]$record.payload.session_id
+            if ($id -and $sessionId -and -not [string]::Equals($id, $sessionId, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Codex session_meta IDs disagree in $Path (id=$id, session_id=$sessionId)"
+            }
+            $canonical = if ($id) { $id } else { $sessionId }
+            if ([string]::IsNullOrWhiteSpace($canonical)) { throw "Codex session_meta has no canonical ID: $Path" }
+            return [pscustomobject]@{ Id = $canonical; Cwd = [string]$record.payload.cwd }
+        }
+        throw "Codex rollout has no readable session_meta record: $Path"
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($gzipStream) { $gzipStream.Dispose() }
+        if ($rawStream) { $rawStream.Dispose() }
+    }
+}
+
 function Get-CodexSessionId {
-    # rollout 파일명 끝의 UUID 가 세션 id 다. .jsonl / .jsonl.gz 양쪽을 받는다.
-    param([Parameter(Mandatory)][string]$FileName)
-    $bare = $FileName -replace '\.gz$', '' -replace '\.jsonl$', ''
-    if ($bare -match '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$') { return $Matches[1] }
-    return $null
+    param([Parameter(Mandatory)][string]$Path)
+    return (Get-CodexSessionMeta $Path).Id
 }
 
 function Get-CodexRolloutIds {
@@ -360,7 +393,7 @@ function Get-CodexRolloutIds {
     if (-not (Test-Path -LiteralPath $Root)) { return $ids }
     foreach ($file in @(Get-ChildItem -LiteralPath $Root -File -Recurse -ErrorAction SilentlyContinue |
                         Where-Object { $_.Name -like '*.jsonl' -or $_.Name -like '*.jsonl.gz' })) {
-        $id = Get-CodexSessionId $file.Name
+        $id = Get-CodexSessionId $file.FullName
         if (-not $id) { continue }
         if ($ids.ContainsKey($id) -and
             -not [string]::Equals($ids[$id].FullName, $file.FullName, [StringComparison]::OrdinalIgnoreCase)) {
@@ -370,6 +403,12 @@ function Get-CodexRolloutIds {
                 # Push가 최신 raw 스냅숏을 만든 뒤 gzip 단계에서 기존 .gz를 교체하기 전의
                 # 정상 과도기다. 같은 cwd/date/file의 두 표현만 허용하고 raw를 우선한다.
                 if ($file.Name -like '*.jsonl') { $ids[$id] = $file }
+                continue
+            }
+            $knownCwd = [string](Get-CodexSessionMeta $ids[$id].FullName).Cwd
+            $newCwd = [string](Get-CodexSessionMeta $file.FullName).Cwd
+            if ([string]::Equals($knownCwd, $newCwd, [StringComparison]::OrdinalIgnoreCase)) {
+                # 같은 canonical thread의 page 파일이다. 호출자는 ID 존재만 확인한다.
                 continue
             }
             throw "같은 Codex 세션 ID가 둘 이상의 경로에 있습니다: $id`n  $($ids[$id].FullName)`n  $($file.FullName)"
@@ -384,34 +423,7 @@ function Get-CodexSessionOriginCwd {
        세션의 출처가 아니므로 사용하지 않는다. raw/gzip 모두 스트리밍으로 처리한다. #>
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-
-    $rawStream = $null; $gzipStream = $null; $reader = $null
-    try {
-        if ($Path -like '*.gz') {
-            $rawStream = [IO.File]::OpenRead((ConvertTo-ExtendedPath $Path))
-            $gzipStream = [IO.Compression.GZipStream]::new($rawStream, [IO.Compression.CompressionMode]::Decompress, $true)
-            $reader = [IO.StreamReader]::new($gzipStream)
-        } else {
-            $rawStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $Path), [IO.FileMode]::Open,
-                [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-            $reader = [IO.StreamReader]::new($rawStream, [Text.Encoding]::UTF8, $true)
-        }
-
-        while ($null -ne ($line = $reader.ReadLine())) {
-            if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            $record = $null
-            try { $record = $line | ConvertFrom-Json } catch { continue }
-            if ($null -eq $record -or [string]$record.type -ne 'session_meta') { continue }
-            if ($null -eq $record.payload) { continue }
-            $cwd = [string]$record.payload.cwd
-            if (-not [string]::IsNullOrWhiteSpace($cwd)) { return $cwd }
-        }
-        return $null
-    } finally {
-        if ($reader) { $reader.Dispose() }
-        if ($gzipStream) { $gzipStream.Dispose() }
-        if ($rawStream) { $rawStream.Dispose() }
-    }
+    return (Get-CodexSessionMeta $Path).Cwd
 }
 
 function Copy-OpenFileSnapshot {
@@ -566,23 +578,19 @@ function Get-JsonlLastActivity {
 
       .jsonl.gz 는 탐색이 안 되므로 스트리밍으로 한 번 훑는다.
     #>
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [int]$TailLineCount = 400
-    )
+    param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     $fullPath = ConvertTo-ExtendedPath $Path
 
-    # 각 줄은 JSON 객체다. 최상위 timestamp 만 활동 시각이며, session_meta.payload.timestamp 나
-    # 대화 본문에 박힌 시각은 아니다. 정규식으로 줄 안의 마지막 "timestamp" 를 집으면 중첩된
-    # 값을 골라 경계 날짜에서 오분류된다. 그러므로 파싱해서 최상위 속성만 읽는다.
-    # 전체를 파싱하면 100MiB 급에서 느리므로 끝의 몇 줄만 보관했다가 뒤에서부터 확인한다.
-    $tail = New-Object System.Collections.Generic.Queue[string]
-    $pushLine = {
+    # 각 줄은 JSON 객체다. 최상위 timestamp만 활동 시각이다. 마지막 수백 줄에 timestamp가
+    # 있다는 가정도 하지 않는다. 스트리밍으로 전체를 읽되 마지막 유효 값 하나만 보관한다.
+    $state = [pscustomobject]@{ Latest = $null }
+    $inspectLine = {
         param($line)
         if ([string]::IsNullOrWhiteSpace($line)) { return }
-        $tail.Enqueue($line)
-        while ($tail.Count -gt $TailLineCount) { [void]$tail.Dequeue() }
+        try { $record = $line | ConvertFrom-Json } catch { return }
+        if ($null -eq $record -or $record.PSObject.Properties.Name -notcontains 'timestamp') { return }
+        try { $state.Latest = ([datetimeoffset]([string]$record.timestamp)).UtcDateTime } catch {}
     }
 
     if ($Path -like '*.gz') {
@@ -591,27 +599,16 @@ function Get-JsonlLastActivity {
             $rawStream = [IO.File]::OpenRead($fullPath)
             $gzipStream = [IO.Compression.GZipStream]::new($rawStream, [IO.Compression.CompressionMode]::Decompress, $true)
             $reader = [IO.StreamReader]::new($gzipStream)
-            while ($null -ne ($line = $reader.ReadLine())) { & $pushLine $line }
+            while ($null -ne ($line = $reader.ReadLine())) { & $inspectLine $line }
         } finally {
             if ($reader) { $reader.Dispose() }
             if ($gzipStream) { $gzipStream.Dispose() }
             if ($rawStream) { $rawStream.Dispose() }
         }
     } else {
-        foreach ($line in [IO.File]::ReadLines($fullPath)) { & $pushLine $line }
+        foreach ($line in [IO.File]::ReadLines($fullPath)) { & $inspectLine $line }
     }
-
-    $lines = @($tail.ToArray())
-    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
-        $record = $null
-        try { $record = $lines[$i] | ConvertFrom-Json } catch { continue }
-        if ($null -eq $record) { continue }
-        if ($record.PSObject.Properties.Name -notcontains 'timestamp') { continue }
-        $value = $record.timestamp
-        if ([string]::IsNullOrWhiteSpace([string]$value)) { continue }
-        try { return ([datetimeoffset]([string]$value)).UtcDateTime } catch { continue }
-    }
-    return $null
+    return $state.Latest
 }
 
 function Split-CodexSessionIndex {

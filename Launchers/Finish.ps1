@@ -16,9 +16,8 @@ foreach ($agent in ($agents | Sort-Object Order -Descending)) {
 }
 Write-Host '[2/4] Verifying all registered agents are closed...' -ForegroundColor Cyan
 Assert-AllAgentsClosed $agents
-# Force termination is the normal path for a tray-resident app, and the kernel releases
-# the session file handles slightly after the process is gone. Snapshotting immediately
-# hits sharing violations, so settle before the copy below.
+# The process tree is gone, but the kernel can release the final session-file handle
+# slightly later. Settle briefly before reading the files.
 Start-Sleep -Seconds 1
 
 if ($config.SyncProjectGit) {

@@ -1,1 +1,2 @@
-{"timestamp":"2025-11-02T09:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"[synthetic example - not a real session] A Codex rollout past ActiveWindowDays, or archived in the app. Aging is judged by this top-level timestamp, never by file mtime or the filename date."}}
+{"timestamp":"2025-11-02T09:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-7000-8000-000000000002","session_id":"00000000-0000-7000-8000-000000000002","cwd":"C:\\Projects\\ExampleProject"}}
+{"timestamp":"2025-11-02T09:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"[synthetic example - not a real session] Vault Archived placeholder selected by the 30-day activity rule."}}

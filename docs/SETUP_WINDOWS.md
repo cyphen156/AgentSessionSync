@@ -1,54 +1,52 @@
 # Windows 설치
 
-## 1. Private 운반 저장소 만들기
+## 1. 실행환경을 맞춥니다
 
-공개 `AgentSessionSync` 저장소의 **Use this template**를 선택하고 Visibility를 **Private**으로 지정합니다. 템플릿에는 실제 세션이나 개인 저장소의 과거 Git 이력이 없습니다.
+두 PC에서 같은 설치 방식과 프로젝트 절대경로를 사용합니다. 앱은 Start 이후 업데이트될 수 있으므로
+세션 데이터 형식은 매 Start와 Finish에서 다시 검사합니다.
 
-## 2. 두 PC에 클론하기
-
-```powershell
-git clone https://github.com/<YOU>/<PRIVATE-REPO>.git C:\AgentSessionSync
-```
-
-운반 저장소 클론 위치는 PC마다 달라도 됩니다. 다만 **프로젝트 경로는 두 PC에서 같게 두는 것을
-권장합니다.** 앱 목록 항목이 `cwd` 절대경로를 그대로 들고 다니므로, 경로가 다르면 세션 파일
-위치와 앱 목록이 가리키는 위치가 어긋납니다.
-
-## 3. PC별 설정 만들기
+## 2. Private Vault를 clone합니다
 
 ```powershell
-cd C:\AgentSessionSync
-.\Launchers\Initialize-AgentSessionSync.ps1 -ProjectRoot 'D:\Work\MyProject' -EnableSessionPush
+git clone https://github.com/<YOU>/<PRIVATE-REPO>.git C:\Project\MultiAgent\AgentSessionVault
 ```
 
-로컬 `AgentSessionSync.config.psd1`과 머신별 `.lnk`는 Git에서 제외됩니다. 설치 명령이 둘을 함께
-생성합니다. 프로젝트 자체도 자동 동기화하려면 `-EnableProjectGitSync`를 추가합니다. 이때 프로젝트는
-`-ProjectRoot`에 지정한 저장소이며, 연결된 원본 프로젝트를 자동 추론하지 않습니다.
+실제 대화가 들어가는 저장소는 반드시 private이어야 합니다. Git 이력에는 삭제 전 원문이 남습니다.
 
-`-ProjectRoot`는 Start/Finish의 기준 프로젝트일 뿐 전송 범위가 아닙니다. 대화는 프로젝트와
-무관하게 앱 인덱스 전체가 따라오므로, 새 프로젝트를 시작할 때 설정을 고칠 필요가 없습니다.
+## 3. 기존 앱 데이터를 정리합니다
 
-보존 기간을 바꾸려면 설정에 `ActiveWindowDays`를 추가합니다(기본 30). 이 기간이 지난 세션은
-삭제되지 않고 저장소의 `archive/` 계층으로 옮겨지며, Pull은 그 계층을 복원하지 않습니다.
+첫 Start 전에 동기화 대상 앱의 세션 저장소가 비어 있어야 합니다. 남길 대화를 선별해야 한다면 먼저
+별도 백업하고, 초기 정리 절차로 삭제 범위를 확정합니다. 새 도구는 첫 실행에서 출처를 모르는 기존
+원문을 임의로 Vault에 흡수하지 않습니다.
 
-## 4. 등록된 앱 확인
+Codex는 `sessions`, `archived_sessions`, 세션 인덱스를 함께 확인합니다. 앱 DB를 직접 수정하지
+않습니다.
 
-기본 `Agents\Codex.psd1`, `Agents\Claude.psd1`의 `AppId`와 `ProcessName` 또는 `ProcessNames`를 확인합니다.
+## 4. PC별 설정을 만듭니다
 
 ```powershell
-Get-StartApps | Where-Object Name -Match 'Codex|ChatGPT|Claude'
+cd C:\Project\MultiAgent\AgentSessionVault
+.\Launchers\Initialize-AgentSessionSync.ps1 `
+  -ProjectRoot 'C:\Project\MyProject' `
+  -EnableSessionPush
 ```
 
-사용하지 않는 앱은 해당 파일의 `Enabled = $false`로 변경합니다.
+머신별 설정과 바로가기는 Git에 넣지 않습니다. `ProjectRoot`는 Start/Finish에서 선택적으로 Git
+동기화할 프로젝트 하나를 가리킬 뿐, 대화 전송 범위를 제한하지 않습니다. 대화는 앱 전체 단위로
+동기화합니다.
 
-## 5. 작업 표시줄 바로가기
+## 5. 등록 앱과 바로가기를 확인합니다
 
-설치 중 생성된 `Launchers\Shortcuts\AgentSession-Start.lnk`,
-`AgentSession-Finish.lnk`를 작업 표시줄에 고정합니다. 경로를 옮긴 경우에만
-`.\Launchers\Create-Shortcuts.ps1`을 다시 실행합니다.
+`Agents\*.psd1`에서 사용하지 않는 앱은 `Enabled = $false`로 바꿉니다. 설치 중 생성된 Start와
+Finish 바로가기를 작업 표시줄에 고정합니다. Restore는 필요할 때 PowerShell에서 실행합니다.
 
-## 6. 매일 사용
+## 6. 운용합니다
 
-Start를 눌러 Pull과 에이전트 실행을 완료하고, 작업을 넘기기 전에 Finish를 눌러 정상 종료와 Push를 완료합니다.
+- 작업 시작: Start
+- 작업 종료 및 전달: Finish
+- 오래된 대화 복원: `Restore-ArchivedSession.ps1`
 
-같은 세션 UUID를 두 PC에서 동시에 수정하지 않는 것을 권장합니다. 서로 다른 새 대화는 UUID가 달라 함께 보존됩니다.
+Finish 또는 Restore가 앱을 정상 종료하지 못하면 강제 종료하지 않고 중단합니다. 앱을 직접 닫고
+같은 명령을 다시 실행하세요.
+
+Push가 거부되면 자동 merge하지 않습니다. 한 PC의 변경을 먼저 정리한 뒤 다시 실행합니다.

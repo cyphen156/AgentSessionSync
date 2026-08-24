@@ -1,1 +1,2 @@
-{"timestamp":"2026-01-01T09:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"[synthetic example - not a real session] Codex rollout session JSONL. Locally it lives at ~/.codex/sessions/YYYY/MM/DD/; the vault copy adds the <cwd-key> axis and Pull strips it back off."}}
+{"timestamp":"2026-01-01T09:00:00.000Z","type":"session_meta","payload":{"id":"00000000-0000-7000-8000-000000000001","session_id":"00000000-0000-7000-8000-000000000001","cwd":"C:\\Projects\\ExampleProject"}}
+{"timestamp":"2026-01-01T09:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"[synthetic example - not a real session] Vault Active placeholder."}}

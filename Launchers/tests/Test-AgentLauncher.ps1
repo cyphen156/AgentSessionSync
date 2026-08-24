@@ -46,7 +46,6 @@ try {
     }
 
     $script:testProcessRunning = $true
-    $script:fallbackProcessId = $null
     $fakeProcess = [pscustomobject]@{
         Id = 4242
         MainWindowHandle = 123
@@ -62,20 +61,20 @@ try {
         if ($script:testProcessRunning) { @($fakeProcess) } else { @() }
     }
     function Get-AgentTopLevelWindows { @([IntPtr]123) }
-    function Stop-AgentProcessTree {
-        param([int]$ProcessId)
-        $script:fallbackProcessId = $ProcessId
-        $script:testProcessRunning = $false
+    $closeRejected = $false
+    try {
+        Stop-AgentGracefully ([pscustomobject]@{ Name = 'TestAgent'; ProcessNames = @('TestAgent') }) 0
+    } catch {
+        $closeRejected = $_.Exception.Message -match 'without force-terminating'
     }
-    Stop-AgentGracefully ([pscustomobject]@{ Name = 'TestAgent'; ProcessNames = @('TestAgent') }) 0
     if ($script:closeRequestWindow -ne 123) {
         throw 'The top-level window did not receive a close request.'
     }
-    if ($script:fallbackProcessId -ne 4242) {
-        throw 'The lingering hidden desktop process did not use the process-tree fallback.'
+    if (-not $closeRejected -or -not $script:testProcessRunning) {
+        throw 'A lingering process was force-terminated instead of cancelling the operation.'
     }
 
-    Write-Host "[PASS] Loaded $($agents.Count) agents, validated shortcuts, and covered lingering desktop-process shutdown without launching apps." -ForegroundColor Green
+    Write-Host "[PASS] Loaded $($agents.Count) agents, validated shortcuts, and rejected force termination." -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }

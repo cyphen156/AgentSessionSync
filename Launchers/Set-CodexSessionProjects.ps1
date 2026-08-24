@@ -16,16 +16,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'AgentSessionSync.Common.ps1')
+. (Join-Path $PSScriptRoot 'CodexSessionState.Common.ps1')
 
-$activeRoot = Join-Path $RepoRoot 'Codex\sessions'
-$archiveRoot = Join-Path $RepoRoot 'Codex\archive'
+$tiers = Get-CodexTierInventory $RepoRoot
 $known = @{}
-foreach ($root in @($activeRoot, $archiveRoot)) {
-    foreach ($id in (Get-CodexRolloutIds $root).Keys) {
-        if ($known.ContainsKey($id)) { throw "세션이 active/archive 양쪽에 중복되어 태그할 수 없습니다: $id" }
-        $known[$id] = $true
-    }
-}
+foreach ($id in @($tiers.Active.Keys) + @($tiers.Archived.Keys)) { $known[$id] = $true }
 if (-not $known.ContainsKey($SessionId)) { throw "Vault에서 Codex 세션을 찾지 못했습니다: $SessionId" }
 
 $path = Join-Path $RepoRoot 'Codex\session_projects.jsonl'
@@ -53,4 +48,3 @@ $lines = @($records | Sort-Object { [string]$_.id } | ForEach-Object { $_ | Conv
 Write-CodexIndexLines -Path $path -Lines $lines
 if ($Remove) { Write-Host "[OK] 프로젝트 태그 제거: $SessionId" -ForegroundColor Green }
 else { Write-Host "[OK] 프로젝트 태그 설정: $SessionId -> $($normalized -join ', ')" -ForegroundColor Green }
-

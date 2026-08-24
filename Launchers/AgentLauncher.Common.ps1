@@ -122,20 +122,6 @@ function Assert-CurrentProcessOutsideAgentTrees {
     }
 }
 
-function Stop-AgentProcessTree {
-    <#
-      Best effort by design. taskkill reports ERROR_NOT_SUPPORTED for a packaged process
-      the app lifetime manager currently has suspended, and that clears on its own a
-      moment later. Failing here would abort the caller's retry deadline on the first
-      attempt, which is the one thing that must not happen: the deadline is what decides
-      when to give up, not a single taskkill exit code.
-    #>
-    param([Parameter(Mandatory)][int]$ProcessId)
-    $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-    & $taskkill /PID $ProcessId /T /F | Out-Null
-    return ($LASTEXITCODE -eq 0)
-}
-
 function Initialize-AgentWindowApi {
     if (-not ('AgentSessionSync.NativeMethods' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -226,32 +212,9 @@ function Stop-AgentGracefully {
             # A tray app can open a window after the first request; ask the new ones too.
             [void](Send-AgentCloseRequests -ProcessIds @($processes | ForEach-Object Id) -PostedWindows $postedWindows)
         } while ((Get-Date) -lt $deadline)
-    } else {
-        Write-Host "[$($Agent.Name)] No top-level window; terminating the registered process tree immediately." -ForegroundColor Yellow
     }
 
-    Write-Warning "$($Agent.Name) still has registered app processes. Terminating the complete process tree."
-    $forceDeadline = (Get-Date).AddSeconds(10)
-    do {
-        $snapshot = @(Get-SystemProcessSnapshot)
-        $processes = @(Get-AgentProcessTree -Agent $Agent -Snapshot $snapshot)
-        if (-not $processes) { break }
-        $treeIds = New-Object 'Collections.Generic.HashSet[int]'
-        foreach ($process in $processes) { [void]$treeIds.Add([int]$process.Id) }
-        $parentOf = @{}
-        foreach ($row in $snapshot) { $parentOf[[int]$row.ProcessId] = [int]$row.ParentProcessId }
-        # /T already takes the descendants, so asking for them by id as well only produces
-        # "process not found" noise once the root's kill lands. Kill the roots of the tree.
-        foreach ($processId in @($treeIds)) {
-            if ($parentOf.ContainsKey($processId) -and $treeIds.Contains($parentOf[$processId])) { continue }
-            [void](Stop-AgentProcessTree $processId)
-        }
-        Start-Sleep -Milliseconds 250
-    } while ((Get-Date) -lt $forceDeadline)
-    if (Get-AgentProcessTree $Agent) {
-        throw "$($Agent.Name) is still running after process-tree termination. Push was cancelled."
-    }
-    Write-Host "[$($Agent.Name)] Complete process tree terminated and verified." -ForegroundColor Yellow
+    throw "$($Agent.Name) did not close within $TimeoutSeconds seconds. The operation was cancelled without force-terminating the app."
 }
 
 function Assert-AllAgentsClosed {

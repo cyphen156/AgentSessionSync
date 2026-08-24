@@ -16,13 +16,13 @@ $LockFile = Join-Path $RepoRoot 'ACTIVE_HOST.txt'
 
 # Machine-local configuration is ignored by Git.
 . (Join-Path $PSScriptRoot 'AgentSessionSync.Common.ps1')
+. (Join-Path $PSScriptRoot 'CodexSessionState.Common.ps1')
 $Config = Get-AgentSessionSyncConfig $RepoRoot
 
 # 전송 단위는 프로젝트가 아니라 앱 인덱스다(Push-Sessions.ps1 와 동일 계약).
 # ~/.claude/projects 전체를 폴더 이름 그대로 받는다.
 $ClaudeProjectsSrc = Join-Path $RepoRoot 'Claude\projects'
 $ClaudeProjectsDst = Join-Path $Config.ClaudeHome 'projects'
-$CodexSrc  = Join-Path $RepoRoot 'Codex\sessions'
 $CodexDst  = Join-Path $Config.CodexHome 'sessions'
 # 마지막 요약 표시에만 쓰는 ProjectRoot 폴더 경로
 $ClaudeDst = Join-Path $ClaudeProjectsDst $Config.ClaudeProjectKey
@@ -35,32 +35,19 @@ if ($LASTEXITCODE -ne 0) { throw 'git pull 실패(히스토리 분기 가능). �
 $active = (Get-Content $LockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
 if (-not $active) { $active = 'NONE' }
 if ($active -ne 'NONE' -and $active -ne $ThisHost) {
-    Write-Warning "다른 호스트($active)가 baton 을 쥔 채였습니다(상대가 Finish 안 함). 막지 않고 이어받습니다. 상대의 미Push 작업은 그 PC에만 남아 있을 수 있고, 나중에 그쪽에서 Finish하면 git 머지로 합쳐집니다(세션은 UUID가 달라 합집합)."
+    Write-Warning "다른 호스트($active)가 baton 을 쥔 채였습니다. 이어받기는 시도하지만 원격이 분기되면 자동 merge하지 않고 중단합니다."
 }
 
-# 3) baton 이어받기 — push 거부 시 막지 말고 머지로 합류(reconcile)한다.
+# 3) baton 이어받기. push 거부 시 자동 merge하지 않는다.
 $ThisHost | Set-Content -Encoding ASCII $LockFile
 git -C $RepoRoot add ACTIVE_HOST.txt
 git -C $RepoRoot diff --cached --quiet
 if ($LASTEXITCODE -ne 0) {                       # 스테이지에 변경 있음 = baton 갱신 필요
     git -C $RepoRoot commit -q -m "claim by $ThisHost @ $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
     if ($LASTEXITCODE -ne 0) { throw 'baton commit 실패.' }
-    $pushed = $false
-    for ($try = 1; $try -le 3 -and -not $pushed; $try++) {
-        git -C $RepoRoot push
-        if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
-        # 원격이 앞서감(상대가 Push) → 막지 말고 머지로 합류.
-        # 세션 jsonl 은 UUID가 달라 충돌 없이 합쳐지고, 충돌나는 단일 파일(ACTIVE_HOST)은 이 호스트로 확정(-X ours).
-        Write-Warning "원격이 앞서 있어 머지로 합류합니다 (시도 $try/3)."
-        git -C $RepoRoot pull --no-rebase --no-edit -X ours
-        if ($LASTEXITCODE -ne 0) { throw 'git 머지 실패 — 충돌 파일을 수동 확인하세요(git status).' }
-        $ThisHost | Set-Content -Encoding ASCII $LockFile
-        git -C $RepoRoot add ACTIVE_HOST.txt
-        git -C $RepoRoot diff --cached --quiet
-        if ($LASTEXITCODE -ne 0) { git -C $RepoRoot commit -q -m "claim(reconcile) by $ThisHost" }
-    }
-    if (-not $pushed) { Write-Warning 'baton push가 계속 거부됨 — 네트워크/원격 확인 필요. 로컬 세션 복사는 계속 진행합니다.' }
 }
+git -C $RepoRoot push
+if ($LASTEXITCODE -ne 0) { throw 'Vault push가 거부됐습니다. 자동 merge하지 않으며 로컬 세션을 변경하지 않습니다.' }
 
 # 4) 앱 인덱스 폴더를 복원한다.
 #    primary / worktree* 는 구버전 Push 가 남긴 경로 치환 이름이므로 ProjectRoot 키로
@@ -80,39 +67,8 @@ foreach ($dir in $claudeDirs) {
     robocopy $dir.FullName $dst *.jsonl /E /XO /NFL /NDL /NJH /NJS /NP | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy(Claude:$($dir.Name)) 실패 code=$LASTEXITCODE" }
 }
-if (Test-Path -LiteralPath $CodexSrc) {
-    # Vault 의 첫 축은 rollout 원문의 origin cwd 키다. 로컬 Codex 앱은 이 축을 모르므로
-    # 제거하고 원래 YYYY/MM/DD 트리로 복원한다. 날짜로 바로 시작하는 구 경로도 읽는다.
-    $codexRestore = Copy-CodexTransportTreeToNative -SourceRoot $CodexSrc -DestinationRoot $CodexDst
-    if ($codexRestore.Raw -gt 0) {
-        Write-Host "  [layout] cwd-key Vault에서 Codex JSONL $($codexRestore.Raw)개를 앱 날짜 트리로 복원했습니다." -ForegroundColor DarkCyan
-    }
-    if ($codexRestore.Expanded -gt 0) {
-        Write-Host "  [gzip] 압축 운반된 Codex 세션 $($codexRestore.Expanded)개를 JSONL로 복원했습니다." -ForegroundColor DarkCyan
-    }
-}
-
-# Codex/archive 는 복원하지 않는다(위 robocopy 는 Codex/sessions 만 본다). 다만 상대 PC 가
-# 보관 처리한 세션이 이 PC 작업 집합에 아직 있으면 내려줘야 보관이 양쪽에서 성립한다.
-# 지우지 않고 앱이 쓰는 archived_sessions 로 옮긴다.
-$CodexArchiveSrc  = Join-Path $RepoRoot 'Codex\archive'
-$CodexArchivedDst = Join-Path $Config.CodexHome 'archived_sessions'
-if (Test-Path -LiteralPath $CodexArchiveSrc) {
-    $archivedIds = Get-CodexRolloutIds $CodexArchiveSrc
-    $demotedCodex = 0
-    foreach ($file in @(Get-ChildItem -LiteralPath $CodexDst -File -Recurse -Filter '*.jsonl' -ErrorAction SilentlyContinue)) {
-        $sessionId = Get-CodexSessionId $file.Name
-        if (-not $sessionId -or -not $archivedIds.ContainsKey($sessionId)) { continue }
-        New-Item -ItemType Directory -Force -Path $CodexArchivedDst | Out-Null
-        $target = Join-Path $CodexArchivedDst $file.Name
-        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $file.FullName -Force }
-        else { Move-Item -LiteralPath $file.FullName -Destination $target -Force }
-        $demotedCodex++
-    }
-    if ($demotedCodex -gt 0) {
-        Write-Host "  [archive] 보관 처리된 Codex 세션 $demotedCodex 건을 이 PC 작업 집합에서 내렸습니다(archived_sessions 로 이동)." -ForegroundColor DarkCyan
-    }
-}
+$codexState = Invoke-CodexStartState -RepoRoot $RepoRoot -Config $Config
+Write-Host "  [Codex] Vault Active $($codexState.Active)건, 로컬 활성 $($codexState.Local)건을 확인했습니다." -ForegroundColor DarkCyan
 
 # 4b) Claude 앱 대화목록 레지스트리 복원 — 이 PC의 앱 저장소(존재하는 경로)로. 앱 재시작하면 목록에 뜸.
 $appRegSrc = Join-Path $RepoRoot 'ClaudeApp\claude-code-sessions'
@@ -140,12 +96,7 @@ if (Test-Path -LiteralPath $appRegSrc) {
     if ($appRoots) { Write-Host '  (앱 목록: Claude 앱을 완전 재시작하면 대화가 목록에 뜹니다.)' -ForegroundColor Cyan }
 }
 
-# 4c) Codex 대화목록 인덱스 union 복원 → 로컬 (덮어쓰지 않고 양쪽 항목 합집합)
-$CodexIdxLocal = Join-Path $Config.CodexHome 'session_index.jsonl'
-$CodexIdxRepo  = Join-Path $RepoRoot 'Codex\session_index.jsonl'
-if (Test-Path -LiteralPath $CodexIdxRepo) {
-    & (Join-Path $PSScriptRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo, $CodexIdxLocal) -OutPath $CodexIdxLocal
-}
+# 4c) Codex 인덱스는 Invoke-CodexStartState가 현재 로컬 활성 집합으로 제한한다.
 & (Join-Path $PSScriptRoot 'Repair-CodexThreadVisibility.ps1') -CodexHome $Config.CodexHome
 Write-Host '  (Codex 목록: 호환 버전은 누락 세션 등록을 시도하고, 결과는 로컬 진단 로그에 남깁니다.)' -ForegroundColor Cyan
 

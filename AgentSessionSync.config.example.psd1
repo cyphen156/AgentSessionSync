@@ -11,10 +11,8 @@
     # backward-compatible config files.
     IncludeClaudeWorktrees = $true
 
-    # Working-window in days. Claude sessions absent from the local app index and
-    # Codex sessions whose last top-level event timestamp is older than this are
-    # MOVED to their archive tier (never deleted). Restore-ArchivedSession.ps1 can
-    # bring them back.
+    # Active window in days. Age comes from the last valid conversation record,
+    # not file mtime or Git history. Aged sessions move to the Vault archive tier.
     ActiveWindowDays = 30
 
     # Raw Codex JSONL files above this transport threshold are stored as .jsonl.gz
@@ -30,5 +28,6 @@
     SessionDataPushEnabled = $false
 
     # Seconds to wait for every registered desktop agent to close cleanly.
+    # Timeout aborts the operation; the tool does not force-terminate the app.
     GracefulCloseTimeoutSeconds = 8
 }

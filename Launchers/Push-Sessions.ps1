@@ -24,6 +24,7 @@ $LockFile = Join-Path $RepoRoot 'ACTIVE_HOST.txt'
 
 # Machine-local configuration is ignored by Git.
 . (Join-Path $PSScriptRoot 'AgentSessionSync.Common.ps1')
+. (Join-Path $PSScriptRoot 'CodexSessionState.Common.ps1')
 $Config = Get-AgentSessionSyncConfig $RepoRoot
 if (-not $Config.SessionDataPushEnabled) {
     throw 'Session push is disabled. Enable it only in your own PRIVATE transport repository.'
@@ -34,22 +35,19 @@ if (-not $Config.SessionDataPushEnabled) {
 # ~/.claude/projects 전체를 폴더 이름 그대로 나른다. ProjectRoot 는 전송 범위를 정하지 않는다.
 $ClaudeProjectsSrc = Join-Path $Config.ClaudeHome 'projects'
 $ClaudeProjectsDst = Join-Path $RepoRoot 'Claude\projects'
-$CodexSrc  = Join-Path $Config.CodexHome 'sessions'
 $CodexDst  = Join-Path $RepoRoot 'Codex\sessions'
-$CodexArchivedSrc = Join-Path $Config.CodexHome 'archived_sessions'
 $CodexArchiveDst  = Join-Path $RepoRoot 'Codex\archive'
 $CodexProjectsRepo = Join-Path $RepoRoot 'Codex\session_projects.jsonl'
 $ClaudeAppRegistryRelative = 'ClaudeApp\claude-code-sessions'
 
-# 1) 원격 baton 최신화 및 소유권 확인
-git -C $RepoRoot pull --ff-only
-if ($LASTEXITCODE -ne 0) { throw 'git pull 실패 — 소유권을 확인할 수 없어 Push를 중단합니다.' }
+# 1) 원격 상태 확인. 이전 Push의 미전송 로컬 commit만 같은 commit으로 재시도한다.
+$retriedPendingCommit = Prepare-AgentSessionVaultMutation -RepoRoot $RepoRoot
 
 $active = (Get-Content $LockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
 if (-not $active) { $active = 'NONE' }
 if ($active -ne $ThisHost -and -not $ForceOwnership)
 {
-    Write-Warning "baton 소유자는 현재 $active 입니다($ThisHost 아님 — 상대가 이어받았을 수 있음). 막지 않고 진행하며, push 충돌 시 머지로 합류합니다. (주의: 한 세션을 두 PC에서 동시에 잇지 마세요 — 같은 UUID 파일은 머지 충돌 시 이 호스트 것이 우선됩니다.)"
+    Write-Warning "baton 소유자는 현재 $active 입니다($ThisHost 아님). 계속 검사하지만 push 충돌 시 자동 merge하지 않고 중단합니다."
 }
 
 if ($CheckOnly)
@@ -82,10 +80,6 @@ foreach ($dir in $claudeDirs) {
     New-Item -ItemType Directory -Force -Path $dst | Out-Null
     robocopy $dir.FullName $dst *.jsonl /E /NFL /NDL /NJH /NJS /NP | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy(Claude:$($dir.Name)) 실패 code=$LASTEXITCODE" }
-}
-if (Test-Path -LiteralPath $CodexSrc) {
-    $copiedCodex = Copy-CodexNativeTreeToTransport -SourceRoot $CodexSrc -DestinationRoot $CodexDst
-    Write-Host "  [layout] Codex 활성 세션 $copiedCodex 건을 cwd-key Vault 경로로 투영했습니다." -ForegroundColor DarkCyan
 }
 
 # 3a) 한 세션은 한 계층에만 있어야 한다. 두 PC의 보존 창이 다르면 한쪽이 archive 로 내린
@@ -155,43 +149,12 @@ if ($appRegSrcs) {
     Write-Warning 'Claude 앱 레지스트리(claude-code-sessions)를 못 찾음 — 앱 목록 동기화는 건너뜁니다.'
 }
 
-# 3c) Codex 대화목록 인덱스(session_index.jsonl) — 양쪽이 같은 파일에 쓰므로 덮어쓰면 한쪽 소실 → id 기준 union 머지.
+# 3c) Codex는 checkpoint의 이전 Active와 현재 sessions/archived_sessions 존재 집합을 비교한다.
+#      native archived_sessions는 최종 삭제 전 존재 확인에만 쓰며 Vault Archived 신호로 쓰지 않는다.
+$codexResult = Invoke-CodexFinishCollect -RepoRoot $RepoRoot -Config $Config -AllowCheckpointAncestor:$retriedPendingCommit
 $CodexIdxLocal = Join-Path $Config.CodexHome 'session_index.jsonl'
 $CodexIdxRepo  = Join-Path $RepoRoot 'Codex\session_index.jsonl'
-if (Test-Path -LiteralPath $CodexIdxLocal) {
-    & (Join-Path $PSScriptRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo, $CodexIdxLocal) -OutPath $CodexIdxRepo
-    & (Join-Path $PSScriptRoot 'Sync-CodexIndex.ps1') -Inputs @($CodexIdxRepo) -OutPath $CodexIdxLocal
-}
-
-# 3c-2) 앱에서 이미 보관된 세션은 ~/.codex/sessions 에 없으므로 위 robocopy 로는 올라가지 않는다.
-#       저장소 어느 계층에도 없다면 원문이 이 PC에만 있다는 뜻이니 archive 로 직접 올린다.
-#       이 경로가 없으면 "보관된 뒤 한 번도 동기화되지 않은 대화"는 영원히 전송되지 않는다.
-#       활성으로 되돌리는 것이 아니다 — 보관 상태 그대로 보존만 한다.
-$repoKnownCodexIds = @{}
-foreach ($key in (Get-CodexRolloutIds $CodexDst).Keys)        { $repoKnownCodexIds[$key] = $true }
-foreach ($key in (Get-CodexRolloutIds $CodexArchiveDst).Keys) { $repoKnownCodexIds[$key] = $true }
-#       검사는 반드시 복사 '전' 에 로컬 원본을 대상으로 한다. 복사한 뒤에 검사하면 검사가
-#       실패했을 때 민감한 원문이 이미 저장소 작업트리에 남는다.
-$uploadedArchived = @()
-foreach ($file in @(Get-ChildItem -LiteralPath $CodexArchivedSrc -File -Recurse -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -like '*.jsonl' })) {
-    $sessionId = Get-CodexSessionId $file.Name
-    if (-not $sessionId -or $repoKnownCodexIds.ContainsKey($sessionId)) { continue }
-    Test-JsonlSnapshotComplete $file.FullName
-    & (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths @($file.FullName) | Out-Null
-    # Vault 에만 origin cwd 축을 붙이고, 그 아래 날짜 트리는 앱과 동일하게 유지한다.
-    $projectKey = Get-CodexTransportProjectKey $file.FullName
-    $projectArchive = Join-Path $CodexArchiveDst $projectKey
-    $dateDir = if ($file.Name -match '^rollout-(\d{4})-(\d{2})-(\d{2})T') {
-        Join-Path (Join-Path (Join-Path $projectArchive $Matches[1]) $Matches[2]) $Matches[3]
-    } else { Join-Path $projectArchive 'undated' }
-    $target = Join-Path $dateDir $file.Name
-    Copy-OpenFileSnapshot -Source $file.FullName -Destination $target
-    $uploadedArchived += $target
-}
-if ($uploadedArchived.Count -gt 0) {
-    Write-Host "  [archive] 이 PC에만 있던 보관 세션 $($uploadedArchived.Count) 건을 Codex/archive 로 보존했습니다(활성 복원 아님)." -ForegroundColor DarkCyan
-}
+Write-Host "  [Codex] Active $($codexResult.ActiveIds.Count) / 삭제 $($codexResult.DeletedIds.Count) / 30일 보관 $($codexResult.ArchivedIds.Count)" -ForegroundColor DarkCyan
 
 # 3d) GitHub 파일당 한도(100MiB) 방어.
 #     Codex 세션은 텍스트 반복률이 높으므로 한도에 근접한 JSONL만 gzip 운반물로 교체한다.
@@ -269,101 +232,6 @@ if ($archivedCount -gt 0) {
     Write-Host "            되돌리려면: Launchers\Restore-ArchivedSession.ps1 <세션ID 또는 검색어>" -ForegroundColor DarkGray
 }
 
-# 3f) Codex 세션 아카이브. 신호가 둘이고, 둘 다 '로컬에 있는가' 와 무관하다.
-#       명시적: 로컬 archived_sessions 에 실제 원문이 있음 = 사용자가 앱에서 보관한 것.
-#               나이와 무관하게 항상 우선한다.
-#       노화:   원문 안의 '마지막 이벤트 timestamp' 가 보존 기간을 넘김.
-#
-#     로컬 부재는 노화 신호가 아니다. Claude Code 는 자체 보존 기간이 있어 부재가 노화를 뜻하지만
-#     Codex 에는 그런 정책이 없다. Codex 에서 파일이 사라지는 건 사용자가 지웠을 때뿐이라, 부재를
-#     노화로 읽으면 영구삭제한 대화를 아카이브로 되살린다(9건이 그렇게 잘못 분류됐다).
-#     시작일도 근거가 못 된다 — 오래전에 시작해 지금도 이어가는 대화를 노후로 오판한다.
-#     mtime·복사 시각·미커밋 git 상태도 호스트마다 달라 쓰지 않는다.
-#
-#     아카이브는 기억을 지우는 곳이 아니라, 활성 컨텍스트에서만 내리고 원문은 남겨두는 곳이다.
-$codexArchivedIds = Get-CodexRolloutIds $CodexArchivedSrc
-$codexLocalActive = Get-CodexRolloutIds $CodexSrc
-$codexAgeCutoff = (Get-Date).ToUniversalTime().AddDays(-$Config.ActiveWindowDays)
-$codexArchivedCount = 0
-$codexAgedCount = 0
-$codexUndatable = 0
-foreach ($file in @(Get-ChildItem -LiteralPath $CodexDst -File -Recurse -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -like '*.jsonl' -or $_.Name -like '*.jsonl.gz' })) {
-    $sessionId = Get-CodexSessionId $file.Name
-    if (-not $sessionId) { continue }
-    $relative = 'Codex/sessions' + $file.FullName.Substring($CodexDst.Length).Replace('\', '/')
-
-    $isExplicit = $codexArchivedIds.ContainsKey($sessionId)
-    $isAged = $false
-    if (-not $isExplicit) {
-        $lastActivity = Get-JsonlLastActivity $file.FullName
-        if ($null -eq $lastActivity) { $codexUndatable++ }   # 판정 불가 → 건드리지 않는다
-        else { $isAged = $lastActivity -lt $codexAgeCutoff }
-    }
-    if (-not $isExplicit -and -not $isAged) { continue }
-
-    Move-ToTransportArchive -RepoRoot $RepoRoot -RelativePath $relative `
-        -ActiveRoot 'Codex/sessions' -ArchiveRoot 'Codex/archive' | Out-Null
-
-    # 저장소에서만 내리면 이 PC 활성 집합에는 원문이 남아 다음 Push 때 다시 올라오고,
-    # 사이드바에도 계속 뜬다. 목적이 활성 컨텍스트 축소이므로 로컬도 같이 내린다(삭제 아님).
-    if (-not $isExplicit -and $codexLocalActive.ContainsKey($sessionId)) {
-        $localOriginal = $codexLocalActive[$sessionId]
-        New-Item -ItemType Directory -Force -Path $CodexArchivedSrc | Out-Null
-        $localTarget = Join-Path $CodexArchivedSrc $localOriginal.Name
-        if (Test-Path -LiteralPath $localTarget) { Remove-Item -LiteralPath $localOriginal.FullName -Force }
-        else { Move-Item -LiteralPath $localOriginal.FullName -Destination $localTarget -Force }
-    }
-    if ($isExplicit) { $codexArchivedCount++ } else { $codexAgedCount++ }
-}
-if ($codexUndatable -gt 0) {
-    Write-Warning "마지막 활동 시각을 읽지 못한 Codex 세션 $codexUndatable 건은 노화 판정에서 제외했습니다."
-}
-if ($codexArchivedCount -gt 0) {
-    Write-Host "  [archive] 앱에서 보관된 Codex 세션 $codexArchivedCount 건을 Codex/archive 로 옮겼습니다(삭제 아님)." -ForegroundColor DarkCyan
-}
-if ($codexAgedCount -gt 0) {
-    Write-Host "  [archive] 보존 기간($($Config.ActiveWindowDays)일)이 지난 Codex 세션 $codexAgedCount 건을 Codex/archive 로 옮겼습니다(삭제 아님)." -ForegroundColor DarkCyan
-}
-
-# 3g) 목록 인덱스를 계층에 맞춘다. 옮기는 것은 '원문이 실제로 archive 계층에 있는' 항목뿐이다.
-#     원문이 어디에도 없는 항목(unresolved)은 지우지도, archive_index 로 확정하지도 않는다.
-#     이 호스트에 원문이 없다는 사실만으로는 판정할 수 없다 — 상대 PC 에 있을 수 있고, 실제로
-#     019fc765 를 그렇게 잘못 지웠다. 경고만 남기고 활성 인덱스에 보류한다.
-$CodexArchiveIdxRepo = Join-Path $RepoRoot 'Codex\archive_index.jsonl'
-$repoArchivedIds = Get-CodexRolloutIds $CodexArchiveDst
-$repoActiveIds   = Get-CodexRolloutIds $CodexDst
-$split = Split-CodexSessionIndex -IndexPath $CodexIdxRepo -ActiveIds $repoActiveIds -ArchivedIds $repoArchivedIds
-if ($split.Archived.Count -gt 0) {
-    $archiveLines = @()
-    if (Test-Path -LiteralPath $CodexArchiveIdxRepo) {
-        $archiveLines = @(Get-Content -LiteralPath $CodexArchiveIdxRepo -Encoding UTF8 | Where-Object { $_.Trim() })
-    }
-    $seen = @{}
-    $merged = @()
-    foreach ($line in ($archiveLines + $split.Archived)) {
-        if ($line -match '"id"\s*:\s*"([^"]+)"') { if ($seen.ContainsKey($Matches[1])) { continue }; $seen[$Matches[1]] = $true }
-        $merged += $line
-    }
-    Write-CodexIndexLines -Path $CodexArchiveIdxRepo -Lines $merged
-}
-# unresolved 는 활성 인덱스에 그대로 둔다(자동 판단 금지).
-$retainedActive = @($split.Active + $split.Orphan)
-if ($split.Archived.Count -gt 0) {
-    Write-CodexIndexLines -Path $CodexIdxRepo -Lines $retainedActive
-    Write-CodexIndexLines -Path $CodexIdxLocal -Lines $retainedActive
-    Write-Host ("  [archive] 목록 인덱스: 활성 {0} / 보관 이관 {1}" -f $split.Active.Count, $split.Archived.Count) -ForegroundColor DarkCyan
-}
-if ($split.Orphan.Count -gt 0) {
-    Write-Warning "원문을 찾지 못한 목록 항목 $($split.Orphan.Count) 건은 판정을 보류했습니다(자동 삭제·자동 아카이브 안 함):"
-    foreach ($line in $split.Orphan) {
-        $unresolvedId = if ($line -match '"id"\s*:\s*"([^"]+)"') { $Matches[1] } else { '<id 없음>' }
-        $unresolvedTitle = if ($line -match '"thread_name"\s*:\s*"([^"]*)"') { $Matches[1] } else { '' }
-        Write-Warning ("  {0}  {1}" -f $unresolvedId, $unresolvedTitle)
-    }
-    Write-Warning '  상대 PC 에 원문이 있을 수 있습니다. 처리하려면 명시적으로 지시해 주세요.'
-}
-
 # 4) 이번 Push에서 실제로 변경·추가된 운반물만 찾는다. 이미 커밋되어 변경 없는 수백 MiB의
 #    JSONL을 매번 다시 읽지 않는다. 스캐너 코드(패턴 포함)가 바뀐 첫 실행이나 -Full에서는
 #    gzip까지 전체 재검사하며, 성공한 스캐너 해시를 저장해 다음 Push부터 증분으로 돌아간다.
@@ -398,7 +266,7 @@ if ($runFullSecretScan) {
     foreach ($archiveScanRoot in @((Join-Path $RepoRoot 'Claude\archive'), $CodexArchiveDst)) {
         if (Test-Path -LiteralPath $archiveScanRoot) { $scanPaths += $archiveScanRoot }
     }
-    foreach ($indexPath in @($CodexIdxRepo, $CodexArchiveIdxRepo, $CodexProjectsRepo)) {
+    foreach ($indexPath in @($CodexIdxRepo, $CodexProjectsRepo)) {
         if (Test-Path -LiteralPath $indexPath) { $scanPaths += $indexPath }
     }
     $reason = if ($FullSecretScan) { '-Full requested' } else { 'scanner patterns changed or no completed full scan exists' }
@@ -438,27 +306,9 @@ foreach ($relativePath in $changed) {
 if ($KeepBaton) { $ThisHost | Set-Content -Encoding ASCII $LockFile }
 else            { 'NONE'    | Set-Content -Encoding ASCII $LockFile }
 
-# 7) commit & push (성공 확인)
-git -C $RepoRoot add -A
-git -C $RepoRoot diff --cached --quiet
-if ($LASTEXITCODE -ne 0) {                       # 변경 있을 때만 커밋
-    git -C $RepoRoot commit -q -m "push from $ThisHost @ $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
-    if ($LASTEXITCODE -ne 0) { throw 'commit 실패.' }
-}
-$pushed = $false
-for ($try = 1; $try -le 3 -and -not $pushed; $try++) {
-    git -C $RepoRoot push
-    if ($LASTEXITCODE -eq 0) { $pushed = $true; break }
-    # 원격이 앞서감(상대가 Push) → 막지 말고 머지로 합류 후 재시도.
-    # 세션 jsonl 은 UUID가 달라 합집합으로 머지되고, 충돌나는 단일 파일은 이 호스트 것이 우선(-X ours).
-    Write-Warning "원격이 앞서 있어 머지로 합류 후 재시도합니다 (시도 $try/3)."
-    git -C $RepoRoot pull --no-rebase --no-edit -X ours
-    if ($LASTEXITCODE -ne 0) { throw 'git 머지 실패 — 충돌 파일을 수동 확인하세요(git status).' }
-    git -C $RepoRoot add -A
-    git -C $RepoRoot diff --cached --quiet
-    if ($LASTEXITCODE -ne 0) { git -C $RepoRoot commit -q -m "merge push from $ThisHost @ $(Get-Date -Format 'yyyy-MM-dd HH:mm')" }
-}
-if (-not $pushed) { throw 'git push가 계속 거부됨 — 네트워크/원격 확인 필요.' }
+# 7) commit & push. 거부되면 자동 merge하지 않으며 로컬 정리도 하지 않는다.
+Publish-AgentSessionVault -RepoRoot $RepoRoot -Message "push from $ThisHost @ $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
+Complete-CodexFinishState -RepoRoot $RepoRoot -Config $Config -Result $codexResult
 
 if ($KeepBaton) {
     Write-Host "[OK] Push 완료 ($ThisHost). baton 유지 — 다른 PC는 Pull 시 -Force 필요." -ForegroundColor Yellow
