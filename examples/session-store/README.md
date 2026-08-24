@@ -4,9 +4,10 @@ This directory contains synthetic placeholders only. It demonstrates the current
 AgentSessionVault; it is not a second specification.
 
 ```text
-Claude/projects/<cwd-key>/*.jsonl
-Claude/archive/<cwd-key>/*.jsonl
-ClaudeApp/claude-code-sessions/**/*.json
+Claude/sessions/<cwd-key>/<session-id>.jsonl
+Claude/sessions/<cwd-key>/<session-id>.entry.json
+Claude/archive/<cwd-key>/<session-id>.jsonl
+Claude/archive/<cwd-key>/<session-id>.entry.json
 Codex/session_index.jsonl
 Codex/session_projects.jsonl
 Codex/sessions/<cwd-key>/YYYY/MM/DD/*.jsonl[.gz]

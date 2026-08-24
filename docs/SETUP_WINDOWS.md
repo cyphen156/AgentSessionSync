@@ -27,13 +27,11 @@ Codex는 `sessions`, `archived_sessions`, 세션 인덱스를 함께 확인합�
 ```powershell
 cd C:\Project\MultiAgent\AgentSessionVault
 .\Launchers\Initialize-AgentSessionSync.ps1 `
-  -ProjectRoot 'C:\Project\MyProject' `
   -EnableSessionPush
 ```
 
-머신별 설정과 바로가기는 Git에 넣지 않습니다. `ProjectRoot`는 Start/Finish에서 선택적으로 Git
-동기화할 프로젝트 하나를 가리킬 뿐, 대화 전송 범위를 제한하지 않습니다. 대화는 앱 전체 단위로
-동기화합니다.
+머신별 설정과 바로가기는 Git에 넣지 않습니다. 대화는 프로젝트별이 아니라 앱 전체 단위로
+동기화합니다. 프로젝트 소스 동기화는 이 도구의 범위가 아닙니다.
 
 ## 5. 등록 앱과 바로가기를 확인합니다
 

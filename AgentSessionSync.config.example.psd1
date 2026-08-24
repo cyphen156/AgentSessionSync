@@ -1,16 +1,4 @@
 @{
-    # Anchor project for Start/Finish. This does NOT limit which conversations are
-    # transported: the transport unit is the agent app index, so every folder under
-    # ~/.claude/projects and ~/.codex/sessions travels regardless of this value.
-    ProjectRoot = 'C:\Projects\MyProject'
-
-    # Optional: also git pull/push the target project from Start/Finish.
-    SyncProjectGit = $false
-
-    # Legacy. Worktree session folders are always transported now; kept for
-    # backward-compatible config files.
-    IncludeClaudeWorktrees = $true
-
     # Active window in days. Age comes from the last valid conversation record,
     # not file mtime or Git history. Aged sessions move to the Vault archive tier.
     ActiveWindowDays = 30

@@ -10,34 +10,17 @@ if (-not $agents) { throw 'No enabled agents found in Agents.' }
 $timeout = [int]$config.GracefulCloseTimeoutSeconds
 Assert-CurrentProcessOutsideAgentTrees $agents
 
-Write-Host "[1/4] Closing all registered agent process trees..." -ForegroundColor Cyan
+Write-Host "[1/3] Closing all registered agent process trees..." -ForegroundColor Cyan
 foreach ($agent in ($agents | Sort-Object Order -Descending)) {
     Stop-AgentGracefully $agent $timeout
 }
-Write-Host '[2/4] Verifying all registered agents are closed...' -ForegroundColor Cyan
+Write-Host '[2/3] Verifying all registered agents are closed...' -ForegroundColor Cyan
 Assert-AllAgentsClosed $agents
 # The process tree is gone, but the kernel can release the final session-file handle
 # slightly later. Settle briefly before reading the files.
 Start-Sleep -Seconds 1
 
-if ($config.SyncProjectGit) {
-    Assert-GitRepository $config.ProjectRoot
-    Write-Host '[3/4] Commit and push target project' -ForegroundColor Cyan
-    & git -C $config.ProjectRoot add -A
-    if ($LASTEXITCODE -ne 0) { throw 'Target project add failed.' }
-    & git -C $config.ProjectRoot diff --cached --quiet
-    if ($LASTEXITCODE -ne 0) {
-        $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
-        & git -C $config.ProjectRoot commit -m "sync from $env:COMPUTERNAME @ $stamp"
-        if ($LASTEXITCODE -ne 0) { throw 'Target project commit failed.' }
-    }
-    & git -C $config.ProjectRoot push
-    if ($LASTEXITCODE -ne 0) { throw 'Target project push failed; sessions were not pushed.' }
-} else {
-    Write-Host '[3/4] Target project Git sync disabled' -ForegroundColor DarkGray
-}
-
-Write-Host '[4/4] Snapshot and push Claude/Codex sessions' -ForegroundColor Cyan
+Write-Host '[3/3] Snapshot and push Claude/Codex sessions' -ForegroundColor Cyan
 & (Join-Path $PSScriptRoot 'Push-Sessions.ps1')
 if ($LASTEXITCODE -ne 0) { throw 'Session push failed.' }
 Write-Host '[DONE] All agents closed and sessions pushed.' -ForegroundColor Green

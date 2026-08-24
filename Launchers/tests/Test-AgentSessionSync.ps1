@@ -1,51 +1,56 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()] param()
 $ErrorActionPreference = 'Stop'
-
 $launchers = Split-Path -Parent $PSScriptRoot
 . (Join-Path $launchers 'AgentSessionSync.Common.ps1')
 . (Join-Path $launchers 'CodexSessionState.Common.ps1')
 
-$testRoot = Join-Path ([IO.Path]::GetTempPath()) ('AgentSessionSync-Contract-' + [guid]::NewGuid().ToString('N'))
+$root = Join-Path ([IO.Path]::GetTempPath()) ('CodexSessionPlan-' + [guid]::NewGuid().ToString('N'))
 $oldLocalAppData = $env:LOCALAPPDATA
-
-function Write-TestRollout {
-    param([string]$Path, [string]$Id, [string]$Timestamp, [string]$Cwd = 'C:\Project\Demo')
+$passed = 0
+function Assert-True([bool]$Condition, [string]$Message) {
+    if (-not $Condition) { throw "ASSERT FAILED [#$($script:passed + 1)]: $Message" }
+    $script:passed++
+}
+function Write-Rollout([string]$Path, [string]$Id, [string]$Cwd, [string]$Timestamp) {
     New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
-    $meta = [ordered]@{
-        timestamp = $Timestamp
-        type = 'session_meta'
-        payload = [ordered]@{ id = $Id; session_id = $Id; cwd = $Cwd }
-    } | ConvertTo-Json -Compress
-    $event = [ordered]@{
-        timestamp = $Timestamp
-        type = 'event_msg'
-        payload = [ordered]@{ type = 'user_message' }
-    } | ConvertTo-Json -Compress
-    @($meta, $event) | Set-Content -LiteralPath $Path -Encoding UTF8
+    $meta = [ordered]@{ type='session_meta';payload=[ordered]@{id=$Id;session_id=$Id;cwd=$Cwd};timestamp=$Timestamp } | ConvertTo-Json -Compress
+    $message = [ordered]@{ type='event_msg';payload=[ordered]@{type='message'};timestamp=$Timestamp } | ConvertTo-Json -Compress
+    @($meta,$message) | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+function New-Context([string]$Repo, $Config, [bool]$AllowAncestor = $false) {
+    [pscustomobject]@{ SchemaVersion=1;RepoRoot=$Repo;Config=$Config;VaultCommit=(Get-AgentSessionVaultHead $Repo);NowUtc=[DateTime]::UtcNow;AllowCheckpointAncestor=$AllowAncestor }
+}
+function Apply-PlanOperations($Plans, [string]$Property, [string]$Repo, [string]$TxnRoot, [string]$PlanRoot) {
+    $map = Get-AgentSessionRootMap -Plans $Plans -RepoRoot $Repo
+    Assert-AgentSessionPlans -Plans $Plans -RootMap $map -ExpectedVaultCommit ([string]$Plans[0].ExpectedVaultCommit) -PlanRoot $PlanRoot -OperationProperties @($Property)
+    $transaction = Start-AgentSessionFileTransaction -RootMap $map -TransactionRoot $TxnRoot
+    try {
+        $operations = @($Plans | ForEach-Object { $_.$Property })
+        Add-AgentSessionOperations -Transaction $transaction -Operations @(Get-AgentSessionOrderedOperations $operations) -RepoRoot $Repo
+        Complete-AgentSessionFileTransaction $transaction
+    } catch {
+        if (-not $transaction.Completed) { Undo-AgentSessionFileTransaction $transaction }
+        throw
+    }
 }
 
 try {
-    $repo = Join-Path $testRoot 'Vault'
-    $remote = Join-Path $testRoot 'Remote.git'
-    $codexA = Join-Path $testRoot 'CodexA'
-    $codexB = Join-Path $testRoot 'CodexB'
-    $env:LOCALAPPDATA = Join-Path $testRoot 'LocalA'
-    New-Item -ItemType Directory -Path $repo, $codexA, $codexB, $env:LOCALAPPDATA -Force | Out-Null
-
+    $repo = Join-Path $root 'Vault'
+    $remote = Join-Path $root 'Remote.git'
+    $codexHome = Join-Path $root 'CodexHome'
+    $env:LOCALAPPDATA = Join-Path $root 'LocalAppData'
+    New-Item -ItemType Directory -Path $repo, $codexHome, $env:LOCALAPPDATA -Force | Out-Null
+    $cwd = 'C:\Project\Demo'
+    $key = ConvertTo-SessionPathKey $cwd
     $fresh = [DateTime]::UtcNow.ToString('o')
-    $ids = @{
-        Deleted = '01a00000-0000-7000-8000-000000000001'
-        Held = '01a00000-0000-7000-8000-000000000002'
-        Aged = '01a00000-0000-7000-8000-000000000003'
-        New = '01a00000-0000-7000-8000-000000000004'
-    }
-    $activeRoot = Join-Path $repo 'Codex\sessions\C--Project-Demo\2026\08\24'
-    Write-TestRollout (Join-Path $activeRoot 'rollout-deleted.jsonl') $ids.Deleted $fresh
-    Write-TestRollout (Join-Path $activeRoot 'rollout-held-page1.jsonl') $ids.Held $fresh
-    Write-TestRollout (Join-Path $activeRoot 'rollout-held-page2.jsonl') $ids.Held $fresh
-    Write-TestRollout (Join-Path $activeRoot 'rollout-aged.jsonl') $ids.Aged '2026-06-01T00:00:00Z'
-
+    $stale = '2026-05-01T00:00:00.000Z'
+    $idA = '11111111-1111-4111-8111-111111111111'
+    $idB = '22222222-2222-4222-8222-222222222222'
+    $idC = '33333333-3333-4333-8333-333333333333'
+    Write-Rollout (Join-Path $repo "Codex\sessions\$key\2026\08\25\rollout-a.jsonl") $idA $cwd $fresh
+    [ordered]@{id=$idA;title='A'} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $repo 'Codex\session_index.jsonl') -Encoding UTF8
+    'NONE' | Set-Content -LiteralPath (Join-Path $repo 'ACTIVE_HOST.txt') -Encoding ASCII
     & git -C $repo init -q
     & git -C $repo config user.email test@example.com
     & git -C $repo config user.name Test
@@ -55,63 +60,80 @@ try {
     & git -C $repo remote add origin $remote
     & git -C $repo push -qu origin HEAD
 
-    $configA = [pscustomobject]@{ CodexHome = $codexA; ActiveWindowDays = 30 }
-    [void](Invoke-CodexStartState -RepoRoot $repo -Config $configA)
-    $local = Get-CodexSessionGroups (Join-Path $codexA 'sessions')
-    if ($local.Count -ne 3 -or $local[$ids.Held].Files.Count -ne 2) {
-        throw 'Start did not group and materialize every page by canonical ID.'
-    }
+    $config = [pscustomobject]@{ CodexHome=$codexHome;ClaudeHome=(Join-Path $root 'ClaudeHome');ActiveWindowDays=30;TransportFileLimitBytes=99614720 }
 
-    'pending' | Set-Content -LiteralPath (Join-Path $repo 'pending-test.txt') -Encoding ASCII
-    & git -C $repo add pending-test.txt
-    & git -C $repo commit -qm 'pending previous finish'
-    $retriedPending = Prepare-AgentSessionVaultMutation -RepoRoot $repo
-    if (-not $retriedPending) { throw 'A local-only pending commit was not retried.' }
+    # First Start rejects any pre-existing local session without a checkpoint.
+    Write-Rollout (Join-Path $codexHome 'sessions\2026\08\25\residue.jsonl') '99999999-9999-4999-8999-999999999999' $cwd $fresh
+    $guard = $false
+    try { [void](New-CodexStartPlan -Context (New-Context $repo $config) -PlanRoot (Join-Path $root 'GuardPlan')) } catch { $guard = $true }
+    Assert-True $guard 'first Start rejects residual Codex state'
+    Remove-Item -LiteralPath (Join-Path $codexHome 'sessions') -Recurse -Force
 
-    Remove-CodexGroupFiles $local[$ids.Deleted]
-    $held = (Get-CodexSessionGroups (Join-Path $codexA 'sessions'))[$ids.Held]
-    $nativeArchive = Join-Path $codexA 'archived_sessions'
-    New-Item -ItemType Directory -Path $nativeArchive -Force | Out-Null
-    foreach ($file in $held.Files) { Move-Item $file.FullName (Join-Path $nativeArchive $file.Name) }
-    Write-TestRollout (Join-Path $codexA 'sessions\2026\08\24\rollout-new.jsonl') $ids.New $fresh
+    $startRoot = Join-Path $root 'StartPlan'
+    New-Item -ItemType Directory -Path $startRoot -Force | Out-Null
+    $context = New-Context $repo $config
+    $start = New-CodexStartPlan -Context $context -PlanRoot $startRoot
+    Assert-True (-not (& git -C $repo status --porcelain)) 'Start planning does not mutate the Vault'
+    Apply-PlanOperations @($start) LocalOperations $repo (Join-Path $root 'StartTxn') $startRoot
+    $checkpointRoot = Join-Path $root 'StartCheckpoint'
+    New-Item -ItemType Directory -Path $checkpointRoot -Force | Out-Null
+    $checkpoint = New-CodexCheckpointPlan -Context $context -State $start.Result -PublishedCommit $context.VaultCommit -PlanRoot $checkpointRoot
+    Apply-PlanOperations @($checkpoint) LocalOperations $repo (Join-Path $root 'CheckpointTxn') $checkpointRoot
+    Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).ContainsKey($idA)) 'Start materializes Vault Active locally'
+    Assert-True ((Read-CodexCheckpoint $repo).ActiveIds -contains $idA) 'Start checkpoint records the active ID'
 
-    $result = Invoke-CodexFinishCollect -RepoRoot $repo -Config $configA -AllowCheckpointAncestor:$retriedPending
+    # A is deleted. B is a two-page live thread. C is a stale new thread.
+    Remove-Item -LiteralPath (Join-Path $codexHome 'sessions') -Recurse -Force
+    Write-Rollout (Join-Path $codexHome 'sessions\2026\08\25\rollout-b-page1.jsonl') $idB $cwd $fresh
+    Write-Rollout (Join-Path $codexHome 'sessions\2026\08\25\rollout-b-page2.jsonl') $idB $cwd $fresh
+    Write-Rollout (Join-Path $codexHome 'archived_sessions\2026\05\01\rollout-c.jsonl') $idC $cwd $stale
+    @(
+        ([ordered]@{id=$idB;title='B'} | ConvertTo-Json -Compress),
+        ([ordered]@{id=$idC;title='C'} | ConvertTo-Json -Compress)
+    ) | Set-Content -LiteralPath (Join-Path $codexHome 'session_index.jsonl') -Encoding UTF8
+
+    $finishRoot = Join-Path $root 'FinishPlan'
+    New-Item -ItemType Directory -Path $finishRoot -Force | Out-Null
+    $context = New-Context $repo $config
+    $finish = New-CodexFinishPlan -Context $context -PlanRoot $finishRoot
+    Assert-True (-not (& git -C $repo status --porcelain)) 'Finish planning does not mutate the Vault'
+    Assert-True ($finish.Result.DeletedIds -contains $idA) 'missing native Codex session is deleted'
+    Assert-True ($finish.Result.ActiveIds -contains $idB) 'live multi-page thread remains active'
+    Assert-True ($finish.Result.ArchivedIds -contains $idC) 'stale thread passing through the app archive is preserved in the Vault archive'
+    Assert-True (@($finish.VaultOperations | Group-Object { "$($_.TargetRoot)|$($_.RelativePath)" } | Where-Object Count -gt 1).Count -eq 0) 'Finish emits one operation per target'
+
+    Apply-PlanOperations @($finish) VaultOperations $repo (Join-Path $root 'FinishVaultTxn') $finishRoot
+    $commit = Commit-AgentSessionVault -RepoRoot $repo -Message finish
+    $published = Push-AgentSessionVault $repo
+    Assert-True ($commit -eq $published) 'Finish commit is verified at the remote'
+    Apply-PlanOperations @($finish) LocalOperations $repo (Join-Path $root 'FinishLocalTxn') $finishRoot
+    $publishedContext = [pscustomobject]@{SchemaVersion=1;RepoRoot=$repo;Config=$config;VaultCommit=$published;NowUtc=$context.NowUtc;AllowCheckpointAncestor=$false}
+    $checkpointRoot = Join-Path $root 'FinishCheckpoint'
+    New-Item -ItemType Directory -Path $checkpointRoot -Force | Out-Null
+    $checkpoint = New-CodexCheckpointPlan -Context $publishedContext -State $finish.Result -PublishedCommit $published -PlanRoot $checkpointRoot
+    Apply-PlanOperations @($checkpoint) LocalOperations $repo (Join-Path $root 'FinishCheckpointTxn') $checkpointRoot
     $tiers = Get-CodexTierInventory $repo
-    if ($tiers.Active.ContainsKey($ids.Deleted)) { throw 'A finally deleted session remained in Vault Active.' }
-    if (-not $tiers.Active.ContainsKey($ids.Held)) { throw 'Native archived_sessions was treated as a Vault state signal.' }
-    if (-not $tiers.Active.ContainsKey($ids.New)) { throw 'A local-only new session was lost.' }
-    if (-not $tiers.Archived.ContainsKey($ids.Aged)) { throw 'An aged session was not moved to Vault Archived.' }
+    Assert-True (-not $tiers.Active.ContainsKey($idA)) 'deleted thread is absent from both final active state'
+    Assert-True ($tiers.Active.ContainsKey($idB) -and $tiers.Active[$idB].Files.Count -eq 2) 'multi-page thread is grouped and preserved'
+    Assert-True ($tiers.Archived.ContainsKey($idC)) 'aged thread exists only in archive'
+    Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).Keys.Count -eq 1) 'post-publish local cleanup leaves the final active set'
+    Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'archived_sessions')).Count -eq 0) 'post-publish cleanup removes the app archive copy'
 
-    & git -C $repo add -A
-    & git -C $repo commit -qm finish
-    Complete-CodexFinishState -RepoRoot $repo -Config $configA -Result $result
+    # Restore is also a plan and does not mutate until the common transaction applies it.
+    $restoreRoot = Join-Path $root 'RestorePlan'
+    New-Item -ItemType Directory -Path $restoreRoot -Force | Out-Null
+    $restoreContext = New-Context $repo $config
+    $restore = New-CodexRestorePlan -Context $restoreContext -PlanRoot $restoreRoot -SessionId $idC
+    Assert-True ((Get-CodexTierInventory $repo).Archived.ContainsKey($idC)) 'Restore planning leaves Vault archive untouched'
+    Apply-PlanOperations @($restore) VaultOperations $repo (Join-Path $root 'RestoreVaultTxn') $restoreRoot
+    $restoreCommit = Commit-AgentSessionVault -RepoRoot $repo -Message restore
+    [void](Push-AgentSessionVault $repo)
+    Apply-PlanOperations @($restore) LocalOperations $repo (Join-Path $root 'RestoreLocalTxn') $restoreRoot
+    Assert-True ((Get-CodexTierInventory $repo).Active.ContainsKey($idC)) 'Restore moves the final Vault state to active'
+    Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).ContainsKey($idC)) 'Restore materializes the session locally after publish'
 
-    $env:LOCALAPPDATA = Join-Path $testRoot 'LocalB'
-    New-Item -ItemType Directory -Path $env:LOCALAPPDATA -Force | Out-Null
-    $configB = [pscustomobject]@{ CodexHome = $codexB; ActiveWindowDays = 30 }
-    [void](Invoke-CodexStartState -RepoRoot $repo -Config $configB)
-    $received = Get-CodexSessionGroups (Join-Path $codexB 'sessions')
-    if ($received.ContainsKey($ids.Deleted) -or $received.ContainsKey($ids.Aged)) {
-        throw 'Deleted or Vault Archived data was materialized on the second PC.'
-    }
-    if (-not $received.ContainsKey($ids.Held) -or -not $received.ContainsKey($ids.New)) {
-        throw 'Vault Active did not materialize on the second PC.'
-    }
-
-    $beforeRestore = Get-CodexTierInventory $repo
-    Move-CodexVaultGroup -RepoRoot $repo -Group $beforeRestore.Archived[$ids.Aged] -SourceRoot (Join-Path $repo 'Codex\archive') -TargetRoot (Join-Path $repo 'Codex\sessions')
-    Publish-AgentSessionVault -RepoRoot $repo -Message ('sessions: restore ' + $ids.Aged)
-    [void](Invoke-CodexStartState -RepoRoot $repo -Config $configB)
-    $afterRestore = Get-CodexTierInventory $repo
-    $receivedAfterRestore = Get-CodexSessionGroups (Join-Path $codexB 'sessions')
-    if (-not $afterRestore.Active.ContainsKey($ids.Aged) -or $afterRestore.Archived.ContainsKey($ids.Aged) -or
-        -not $receivedAfterRestore.ContainsKey($ids.Aged)) {
-        throw 'Restore did not commit an exclusive Archived-to-Active transition and materialize it locally.'
-    }
-
-    Write-Host '[PASS] Codex Active, Archived, Deleted, Restore, native archive existence, pending push retry, new-session preservation, and multi-page grouping.' -ForegroundColor Green
-}
-finally {
+    Write-Host "[PASS] Codex session plans: $passed assertions" -ForegroundColor Green
+} finally {
     $env:LOCALAPPDATA = $oldLocalAppData
-    if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
+    if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
 }

@@ -1,4 +1,5 @@
 ﻿Set-StrictMode -Version Latest
+
 $ErrorActionPreference = 'Stop'
 
 function Expand-AgentSessionSyncPath {
@@ -7,9 +8,9 @@ function Expand-AgentSessionSyncPath {
     return [IO.Path]::GetFullPath($expanded).TrimEnd('\', '/')
 }
 
-function ConvertTo-ClaudeProjectKey {
-    param([Parameter(Mandatory)][string]$ProjectRoot)
-    $fullPath = (Expand-AgentSessionSyncPath $ProjectRoot).TrimEnd('\', '/')
+function ConvertTo-SessionPathKey {
+    param([Parameter(Mandatory)][string]$Path)
+    $fullPath = (Expand-AgentSessionSyncPath $Path).TrimEnd('\', '/')
     return ($fullPath -replace '[:\\/\s]', '-')
 }
 
@@ -20,20 +21,12 @@ function Get-AgentSessionSyncConfig {
         throw "Local configuration is missing: $path`nRun Initialize-AgentSessionSync.ps1 first."
     }
     $raw = Import-PowerShellDataFile -LiteralPath $path
-    if (-not $raw.ProjectRoot) { throw 'ProjectRoot is required in AgentSessionSync.config.psd1.' }
     $userHome = [Environment]::GetFolderPath('UserProfile')
     $claudeHome = if ($raw.ClaudeHome) { Expand-AgentSessionSyncPath $raw.ClaudeHome } else { Join-Path $userHome '.claude' }
     $codexHome = if ($raw.CodexHome) { Expand-AgentSessionSyncPath $raw.CodexHome } else { Join-Path $userHome '.codex' }
-    $projectRoot = Expand-AgentSessionSyncPath $raw.ProjectRoot
-    $key = ConvertTo-ClaudeProjectKey $projectRoot
     [pscustomobject]@{
-        ProjectRoot = $projectRoot
-        SyncProjectGit = [bool]$raw.SyncProjectGit
-        IncludeClaudeWorktrees = if ($null -eq $raw.IncludeClaudeWorktrees) { $true } else { [bool]$raw.IncludeClaudeWorktrees }
         ClaudeHome = $claudeHome
         CodexHome = $codexHome
-        ClaudeProjectKey = $key
-        ClaudeProjectPattern = if ($raw.IncludeClaudeWorktrees) { "$key*" } else { $key }
         ActiveWindowDays = if ($raw.ContainsKey('ActiveWindowDays') -and $raw['ActiveWindowDays']) {
             [int]$raw['ActiveWindowDays']
         } else { 30 }
@@ -205,227 +198,6 @@ function Expand-JsonlTransportFile {
     }
 }
 
-function Expand-CompressedJsonlTree {
-    param(
-        [Parameter(Mandatory)][string]$SourceRoot,
-        [Parameter(Mandatory)][string]$DestinationRoot
-    )
-    $expanded = 0
-    if (-not (Test-Path -LiteralPath $SourceRoot)) { return $expanded }
-    $resolvedSourceRoot = (Resolve-Path -LiteralPath $SourceRoot).Path.TrimEnd('\', '/')
-    foreach ($file in @(Get-ChildItem -LiteralPath $resolvedSourceRoot -Filter '*.jsonl.gz' -File -Recurse -ErrorAction SilentlyContinue)) {
-        $relative = $file.FullName.Substring($resolvedSourceRoot.Length).TrimStart('\', '/')
-        $target = Join-Path $DestinationRoot $relative.Substring(0, $relative.Length - '.gz'.Length)
-        if (Expand-JsonlTransportFile -Source $file.FullName -Destination $target) { $expanded++ }
-    }
-    return $expanded
-}
-
-function Get-TransportRecentPaths {
-    <#
-      최근 $Days 안에 이 저장소에서 내용이 실제로 바뀐 전송 경로 집합.
-      폴더 이름 변경은 내용 변경이 아니므로 -M 으로 rename 을 걸러낸다(그러지 않으면
-      전송 레이아웃을 한 번 바꾼 날 모든 파일이 "최근"으로 잡힌다).
-      상대 PC 가 방금 올린 세션을 아카이브로 잘못 내리지 않게 하는 안전장치다.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$RepoRoot,
-        [Parameter(Mandatory)][int]$Days,
-        [Parameter(Mandatory)][string]$PathSpec
-    )
-    $set = @{}
-    $lines = @(& git -C $RepoRoot log --since="$Days days ago" --format='' --name-status -M --diff-filter=AM -- $PathSpec)
-    foreach ($line in $lines) {
-        if ($line -match '^[AM]\S*\s+(.+)$') { $set[$Matches[1].Trim()] = $true }
-    }
-    return $set
-}
-
-function Get-ClaudeDeletionMarkers {
-    # 앱이 대화를 지우면 deleted_<appSessionId> 파일을 남긴다. 이것이 "이 대화는 폐기했다"는
-    # 사용자의 명시적 선언이고, 이 도구가 쓸 수 있는 유일한 삭제 신호다.
-    param([Parameter(Mandatory)][string]$RegistryRoot)
-    $ids = @{}
-    if (-not (Test-Path -LiteralPath $RegistryRoot)) { return $ids }
-    Get-ChildItem -LiteralPath $RegistryRoot -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like 'deleted_*' } |
-        ForEach-Object { $ids[($_.Name -replace '^deleted_', '')] = $true }
-    return $ids
-}
-
-function Copy-ClaudeDeletionMarkers {
-    # 마커도 운반한다. 마커가 없으면 한쪽에서 지운 대화가 반대편 Pull 때 되살아난다.
-    param(
-        [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$Destination
-    )
-    $copied = 0
-    if (-not (Test-Path -LiteralPath $Source)) { return $copied }
-    $sourceRoot = (Resolve-Path -LiteralPath $Source).Path.TrimEnd('\', '/')
-    foreach ($file in @(Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -like 'deleted_*' })) {
-        $relative = $file.FullName.Substring($sourceRoot.Length).TrimStart('\', '/')
-        $target = Join-Path $Destination $relative
-        if (Test-Path -LiteralPath $target) { continue }
-        # 세션 트리는 GUID 두 단계가 겹쳐 경로가 길다. 프로바이더를 거치지 않는 .NET 호출로
-        # 디렉터리를 만들고 복사한다(PowerShell 프로바이더 경로는 여기서 한계에 먼저 걸린다).
-        [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath ([IO.Path]::GetDirectoryName($target))))
-        [IO.File]::Copy((ConvertTo-ExtendedPath $file.FullName), (ConvertTo-ExtendedPath $target), $true)
-        $copied++
-    }
-    return $copied
-}
-
-function Remove-TombstonedLocalEntries {
-    <#
-      마커가 붙은 목록 항목을 이 PC에서도 실제로 치운다.
-      머지에서 "복사하지 않음"만으로는 부족하다. 그 대화를 원래 갖고 있던 PC에서는
-      로컬 항목이 그대로 남아 삭제가 반영되지 않기 때문이다.
-
-      목록 항목은 메타데이터일 뿐이고 대화 원문(transcript)은 건드리지 않는다.
-      저장소 히스토리에도 그대로 남아 있으므로 되돌릴 수 있다.
-    #>
-    param([Parameter(Mandatory)][string]$RegistryRoot)
-    $removed = 0
-    if (-not (Test-Path -LiteralPath $RegistryRoot)) { return $removed }
-    $markers = Get-ClaudeDeletionMarkers $RegistryRoot
-    if ($markers.Count -eq 0) { return $removed }
-    foreach ($file in @(Get-ChildItem -LiteralPath $RegistryRoot -Filter 'local_*.json' -File -Recurse -ErrorAction SilentlyContinue)) {
-        $appId = $file.BaseName -replace '^local_', ''
-        if (-not $markers.ContainsKey($appId)) { continue }
-        Remove-Item -LiteralPath $file.FullName -Force
-        $removed++
-    }
-    return $removed
-}
-
-function Remove-TombstonedTransportEntries {
-    # 폐기된 목록 항목은 저장소 활성 레지스트리에서도 뺀다. 항목은 아카이브 가치가 없다
-    # (원문은 Claude/projects · Claude/archive 에 따로 보존되고, git 히스토리에도 남는다).
-    param(
-        [Parameter(Mandatory)][string]$RepoRoot,
-        [Parameter(Mandatory)][string]$RegistryDestination,
-        [Parameter(Mandatory)][hashtable]$Markers
-    )
-    $removed = 0
-    if (-not (Test-Path -LiteralPath $RegistryDestination)) { return $removed }
-    foreach ($file in @(Get-ChildItem -LiteralPath $RegistryDestination -Filter 'local_*.json' -File -Recurse -ErrorAction SilentlyContinue)) {
-        $appId = $file.BaseName -replace '^local_', ''
-        if (-not $Markers.ContainsKey($appId)) { continue }
-        Remove-Item -LiteralPath $file.FullName -Force
-        $removed++
-    }
-    return $removed
-}
-
-function Move-ToTransportArchive {
-    <#
-      활성 폴더에서 archive 폴더로 옮기기만 한다. 삭제하지 않는다.
-      Pull 은 활성 폴더만 복원하므로 앱이 보는 표면에서는 사라지지만 원문은 저장소에 남고
-      Restore-ArchivedSession.ps1 로 언제든 되돌릴 수 있다.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$RepoRoot,
-        [Parameter(Mandatory)][string]$RelativePath,
-        [Parameter(Mandatory)][string]$ActiveRoot,
-        [Parameter(Mandatory)][string]$ArchiveRoot
-    )
-    $targetRelative = $ArchiveRoot + $RelativePath.Substring($ActiveRoot.Length)
-    $sourceFull = Join-Path $RepoRoot ($RelativePath.Replace('/', '\'))
-    $targetFull = Join-Path $RepoRoot ($targetRelative.Replace('/', '\'))
-    $targetDir = Split-Path -Parent $targetFull
-    [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $targetDir))
-    if ([IO.File]::Exists((ConvertTo-ExtendedPath $targetFull))) { [IO.File]::Delete((ConvertTo-ExtendedPath $targetFull)) }
-
-    if (@(& git -C $RepoRoot ls-files -- $RelativePath)) {
-        & git -C $RepoRoot mv -- $RelativePath $targetRelative
-        if ($LASTEXITCODE -ne 0) { throw "archive 이동 실패: $RelativePath" }
-    } else {
-        [IO.File]::Move((ConvertTo-ExtendedPath $sourceFull), (ConvertTo-ExtendedPath $targetFull))
-    }
-    return $targetRelative
-}
-
-function Get-CodexSessionMeta {
-    <# File names may end in a page ID. Identity comes from session_meta. #>
-    param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { throw "Codex rollout does not exist: $Path" }
-    $rawStream = $null; $gzipStream = $null; $reader = $null
-    try {
-        $rawStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $Path), [IO.FileMode]::Open,
-            [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-        if ($Path -like '*.gz') {
-            $gzipStream = [IO.Compression.GZipStream]::new($rawStream, [IO.Compression.CompressionMode]::Decompress, $true)
-            $reader = [IO.StreamReader]::new($gzipStream, [Text.Encoding]::UTF8, $true)
-        } else {
-            $reader = [IO.StreamReader]::new($rawStream, [Text.Encoding]::UTF8, $true)
-        }
-        while ($null -ne ($line = $reader.ReadLine())) {
-            if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            $record = $null
-            try { $record = $line | ConvertFrom-Json } catch { continue }
-            if ($null -eq $record -or [string]$record.type -ne 'session_meta' -or $null -eq $record.payload) { continue }
-            $id = [string]$record.payload.id
-            $sessionId = [string]$record.payload.session_id
-            if ($id -and $sessionId -and -not [string]::Equals($id, $sessionId, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "Codex session_meta IDs disagree in $Path (id=$id, session_id=$sessionId)"
-            }
-            $canonical = if ($id) { $id } else { $sessionId }
-            if ([string]::IsNullOrWhiteSpace($canonical)) { throw "Codex session_meta has no canonical ID: $Path" }
-            return [pscustomobject]@{ Id = $canonical; Cwd = [string]$record.payload.cwd }
-        }
-        throw "Codex rollout has no readable session_meta record: $Path"
-    } finally {
-        if ($reader) { $reader.Dispose() }
-        if ($gzipStream) { $gzipStream.Dispose() }
-        if ($rawStream) { $rawStream.Dispose() }
-    }
-}
-
-function Get-CodexSessionId {
-    param([Parameter(Mandatory)][string]$Path)
-    return (Get-CodexSessionMeta $Path).Id
-}
-
-function Get-CodexRolloutIds {
-    param([Parameter(Mandatory)][string]$Root)
-    $ids = @{}
-    if (-not (Test-Path -LiteralPath $Root)) { return $ids }
-    foreach ($file in @(Get-ChildItem -LiteralPath $Root -File -Recurse -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -like '*.jsonl' -or $_.Name -like '*.jsonl.gz' })) {
-        $id = Get-CodexSessionId $file.FullName
-        if (-not $id) { continue }
-        if ($ids.ContainsKey($id) -and
-            -not [string]::Equals($ids[$id].FullName, $file.FullName, [StringComparison]::OrdinalIgnoreCase)) {
-            $knownCanonical = $ids[$id].FullName -replace '\.gz$', ''
-            $fileCanonical = $file.FullName -replace '\.gz$', ''
-            if ([string]::Equals($knownCanonical, $fileCanonical, [StringComparison]::OrdinalIgnoreCase)) {
-                # Push가 최신 raw 스냅숏을 만든 뒤 gzip 단계에서 기존 .gz를 교체하기 전의
-                # 정상 과도기다. 같은 cwd/date/file의 두 표현만 허용하고 raw를 우선한다.
-                if ($file.Name -like '*.jsonl') { $ids[$id] = $file }
-                continue
-            }
-            $knownCwd = [string](Get-CodexSessionMeta $ids[$id].FullName).Cwd
-            $newCwd = [string](Get-CodexSessionMeta $file.FullName).Cwd
-            if ([string]::Equals($knownCwd, $newCwd, [StringComparison]::OrdinalIgnoreCase)) {
-                # 같은 canonical thread의 page 파일이다. 호출자는 ID 존재만 확인한다.
-                continue
-            }
-            throw "같은 Codex 세션 ID가 둘 이상의 경로에 있습니다: $id`n  $($ids[$id].FullName)`n  $($file.FullName)"
-        }
-        $ids[$id] = $file
-    }
-    return $ids
-}
-
-function Get-CodexSessionOriginCwd {
-    <# rollout 의 첫 session_meta.payload.cwd 를 읽는다. 파일 위치나 현재 호스트 cwd 는
-       세션의 출처가 아니므로 사용하지 않는다. raw/gzip 모두 스트리밍으로 처리한다. #>
-    param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    return (Get-CodexSessionMeta $Path).Cwd
-}
-
 function Copy-OpenFileSnapshot {
     <# 실행 중인 append-only JSONL도 FileShare.ReadWrite로 현재까지의 바이트를 복사한다. #>
     param(
@@ -454,117 +226,6 @@ function Copy-OpenFileSnapshot {
         if ($input) { $input.Dispose() }
         if ([IO.File]::Exists((ConvertTo-ExtendedPath $temporary))) { [IO.File]::Delete((ConvertTo-ExtendedPath $temporary)) }
     }
-}
-
-function Get-CodexTransportProjectKey {
-    param([Parameter(Mandatory)][string]$Path)
-    $cwd = Get-CodexSessionOriginCwd $Path
-    if ([string]::IsNullOrWhiteSpace($cwd)) { return '_no-cwd' }
-    try { return ConvertTo-ClaudeProjectKey $cwd }
-    catch { return '_no-cwd' }
-}
-
-function Get-CodexNativeRelativePath {
-    <#
-      새 Vault 경로: <cwd-key>/YYYY/MM/DD/file
-      구 Vault 경로: YYYY/MM/DD/file
-      로컬 앱에는 두 경우 모두 YYYY/MM/DD/file 로 복원한다.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$TransportRoot,
-        [Parameter(Mandatory)][string]$Path
-    )
-    $root = [IO.Path]::GetFullPath($TransportRoot).TrimEnd('\', '/')
-    $full = [IO.Path]::GetFullPath($Path)
-    $relative = $full.Substring($root.Length).TrimStart('\', '/')
-    $parts = @($relative -split '[\\/]')
-    if ($parts.Count -lt 2) { throw "Codex 전송 경로 형식을 판정할 수 없습니다: $Path" }
-    if ($parts[0] -match '^\d{4}$' -or $parts[0] -eq 'undated') { return $relative }
-    if ($parts.Count -lt 3) { throw "cwd-key 뒤 날짜 경로가 없습니다: $Path" }
-    return ($parts[1..($parts.Count - 1)] -join [IO.Path]::DirectorySeparatorChar)
-}
-
-function Copy-CodexNativeTreeToTransport {
-    param(
-        [Parameter(Mandatory)][string]$SourceRoot,
-        [Parameter(Mandatory)][string]$DestinationRoot
-    )
-    $copied = 0
-    if (-not (Test-Path -LiteralPath $SourceRoot)) { return $copied }
-    $source = (Resolve-Path -LiteralPath $SourceRoot).Path.TrimEnd('\', '/')
-    foreach ($file in @(Get-ChildItem -LiteralPath $source -File -Recurse -Filter '*.jsonl' -ErrorAction SilentlyContinue)) {
-        $nativeRelative = $file.FullName.Substring($source.Length).TrimStart('\', '/')
-        $key = Get-CodexTransportProjectKey $file.FullName
-        $target = Join-Path (Join-Path $DestinationRoot $key) $nativeRelative
-        Copy-OpenFileSnapshot -Source $file.FullName -Destination $target
-        $copied++
-    }
-    return $copied
-}
-
-function Copy-CodexTransportTreeToNative {
-    param(
-        [Parameter(Mandatory)][string]$SourceRoot,
-        [Parameter(Mandatory)][string]$DestinationRoot
-    )
-    $stats = [ordered]@{ Raw = 0; Expanded = 0 }
-    if (-not (Test-Path -LiteralPath $SourceRoot)) { return [pscustomobject]$stats }
-    Get-CodexRolloutIds $SourceRoot | Out-Null
-    foreach ($file in @(Get-ChildItem -LiteralPath $SourceRoot -File -Recurse -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -like '*.jsonl' -or $_.Name -like '*.jsonl.gz' })) {
-        $nativeRelative = Get-CodexNativeRelativePath -TransportRoot $SourceRoot -Path $file.FullName
-        if ($file.Name -like '*.jsonl.gz') { $nativeRelative = $nativeRelative.Substring(0, $nativeRelative.Length - '.gz'.Length) }
-        $target = Join-Path $DestinationRoot $nativeRelative
-        if ($file.Name -like '*.jsonl.gz') {
-            if (Expand-JsonlTransportFile -Source $file.FullName -Destination $target) { $stats.Expanded++ }
-            continue
-        }
-        $sourceTime = $file.LastWriteTimeUtc
-        if (Test-Path -LiteralPath $target) {
-            $targetTime = [IO.File]::GetLastWriteTimeUtc((ConvertTo-ExtendedPath $target))
-            if ($targetTime -ge $sourceTime) { continue }
-        }
-        [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath ([IO.Path]::GetDirectoryName($target))))
-        [IO.File]::Copy((ConvertTo-ExtendedPath $file.FullName), (ConvertTo-ExtendedPath $target), $true)
-        [IO.File]::SetLastWriteTimeUtc((ConvertTo-ExtendedPath $target), $sourceTime)
-        $stats.Raw++
-    }
-    return [pscustomobject]$stats
-}
-
-function Move-CodexLegacyTransportTree {
-    <# 날짜로 바로 시작하는 구 Vault 경로를 rollout 내부 cwd 키 아래로 git mv 한다. #>
-    param(
-        [Parameter(Mandatory)][string]$RepoRoot,
-        [Parameter(Mandatory)][string]$TreeRelative
-    )
-    $tree = Join-Path $RepoRoot ($TreeRelative.Replace('/', '\'))
-    $moved = 0
-    if (-not (Test-Path -LiteralPath $tree)) { return $moved }
-    foreach ($file in @(Get-ChildItem -LiteralPath $tree -File -Recurse -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -like '*.jsonl' -or $_.Name -like '*.jsonl.gz' })) {
-        $relativeInside = $file.FullName.Substring($tree.Length).TrimStart('\', '/')
-        $first = ($relativeInside -split '[\\/]')[0]
-        if ($first -notmatch '^\d{4}$' -and $first -ne 'undated') { continue }
-        $key = Get-CodexTransportProjectKey $file.FullName
-        $targetInside = Join-Path $key $relativeInside
-        $targetFull = Join-Path $tree $targetInside
-        if (Test-Path -LiteralPath $targetFull) {
-            throw "Codex 레거시 경로 마이그레이션 대상이 이미 있습니다: $targetFull"
-        }
-        [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath ([IO.Path]::GetDirectoryName($targetFull))))
-        $sourceRelative = ($TreeRelative.TrimEnd('/') + '/' + $relativeInside.Replace('\', '/'))
-        $targetRelative = ($TreeRelative.TrimEnd('/') + '/' + $targetInside.Replace('\', '/'))
-        if (@(& git -C $RepoRoot ls-files -- $sourceRelative)) {
-            & git -C $RepoRoot mv -- $sourceRelative $targetRelative
-            if ($LASTEXITCODE -ne 0) { throw "Codex cwd-key 마이그레이션 실패: $sourceRelative" }
-        } else {
-            [IO.File]::Move((ConvertTo-ExtendedPath $file.FullName), (ConvertTo-ExtendedPath $targetFull))
-        }
-        $moved++
-    }
-    Get-CodexRolloutIds $tree | Out-Null
-    return $moved
 }
 
 function Get-JsonlLastActivity {
@@ -611,117 +272,374 @@ function Get-JsonlLastActivity {
     return $state.Latest
 }
 
-function Split-CodexSessionIndex {
-    <#
-      Codex 목록 인덱스를 세 갈래로 나눈다.
-        active  : 활성 rollout 이 있는 항목
-        archived: 보관된 rollout 이 있는 항목 — 지우지 않고 archive 인덱스로 옮긴다
-        orphan  : 어디에도 원문이 없는 항목 — 목록에만 남은 껍데기
-      인덱스는 Sync-CodexIndex.ps1 이 id 기준 union 으로 합치므로, 보관 항목을 활성
-      인덱스에서 그냥 지우면 상대 PC 에서 되살아난다. 옮겨 담아야 한다.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$IndexPath,
-        [Parameter(Mandatory)][hashtable]$ActiveIds,
-        [Parameter(Mandatory)][hashtable]$ArchivedIds
-    )
-    $result = @{ Active = @(); Archived = @(); Orphan = @() }
-    if (-not (Test-Path -LiteralPath $IndexPath)) { return $result }
-    foreach ($line in (Get-Content -LiteralPath $IndexPath -Encoding UTF8)) {
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        $id = $null
-        if ($line -match '"id"\s*:\s*"([^"]+)"') { $id = $Matches[1] }
-        if (-not $id) { continue }
-        if ($ActiveIds.ContainsKey($id))        { $result.Active   += $line }
-        elseif ($ArchivedIds.ContainsKey($id))  { $result.Archived += $line }
-        else                                    { $result.Orphan   += $line }
-    }
-    return $result
-}
-
-function Write-CodexIndexLines {
-    param([Parameter(Mandatory)][string]$Path, [string[]]$Lines = @())
-    $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    $body = if ($Lines.Count) { ($Lines -join "`n") + "`n" } else { '' }
-    [IO.File]::WriteAllText($Path, $body, (New-Object System.Text.UTF8Encoding($false)))
-}
-
-function Test-ClaudeAppEntryBound {
-    # 앱 목록 항목이 트랜스크립트와 연결되어 있는지(= cliSessionId 보유) 판정한다.
-    # 앱은 트랜스크립트를 못 찾으면 이 필드를 떼어내고 transcriptUnavailable 을 찍는다.
+function Get-AgentSessionFileSha256 {
     param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return $false }
-    $text = [IO.File]::ReadAllText((ConvertTo-ExtendedPath $Path), [Text.Encoding]::UTF8)
-    return [regex]::IsMatch($text, '"cliSessionId"\s*:\s*"[^"]+"')
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "File not found: $Path" }
+    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-function Merge-ClaudeAppRegistry {
-    <#
-    .SYNOPSIS
-      앱 대화목록 레지스트리(local_*.json)를 항목 단위로 머지한다.
-    .NOTES
-      robocopy 통짜 복사는 last-writer-wins 이다. 트랜스크립트가 없는 PC에서 앱이
-      cliSessionId 를 떼어낸 항목을 만들면, 그 손상본이 상대 PC의 멀쩡한 항목까지
-      덮어써 연결이 영구히 사라진다. Codex 인덱스가 Sync-CodexIndex.ps1 로 union
-      머지를 하는 것과 같은 이유로, 이 다리도 항목 단위 규칙이 필요하다.
+function Write-AgentSessionUtf8File {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][AllowEmptyString()][string]$Content)
+    $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
+    [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $parent))
+    $encoding = New-Object Text.UTF8Encoding($true)
+    [IO.File]::WriteAllText((ConvertTo-ExtendedPath $Path), $Content, $encoding)
+}
 
-        삭제 마커 보유     -> 건너뜀(폐기 선언 존중)
-        대상에 없음        -> 복사
-        원본만 바인딩 보유 -> 복사(복구)
-        대상만 바인딩 보유 -> 건너뜀(보호)
-        그 외              -> 원본이 더 최신일 때만 복사(robocopy /XO 와 동일)
-    #>
+function New-AgentSessionPlanRoot {
+    param([string]$Prefix = 'AgentSessionSync-Plan')
+    $root = Join-Path ([IO.Path]::GetTempPath()) ($Prefix + '-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    [IO.Path]::GetFullPath($root)
+}
+
+function New-AgentSessionStagedSnapshot {
     param(
         [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$Destination,
-        [hashtable]$Tombstones = @{}
+        [Parameter(Mandatory)][string]$PlanRoot,
+        [Parameter(Mandatory)][string]$Name
     )
-    $stats = [ordered]@{ New = 0; Repaired = 0; Protected = 0; Updated = 0; Unchanged = 0; Tombstoned = 0 }
-    if (-not (Test-Path -LiteralPath $Source)) { return $stats }
-    $sourceRoot = (Resolve-Path -LiteralPath $Source).Path.TrimEnd('\', '/')
+    $safeName = $Name -replace '[^A-Za-z0-9._-]', '_'
+    $target = Join-Path $PlanRoot ($safeName + '-' + [guid]::NewGuid().ToString('N'))
+    Copy-OpenFileSnapshot -Source $Source -Destination $target
+    [pscustomobject]@{ Path = $target; Sha256 = Get-AgentSessionFileSha256 $target }
+}
 
-    foreach ($file in @(Get-ChildItem -LiteralPath $sourceRoot -Filter 'local_*.json' -File -Recurse -ErrorAction SilentlyContinue)) {
-        $appId = $file.BaseName -replace '^local_', ''
-        if ($Tombstones.ContainsKey($appId)) { $stats.Tombstoned++; continue }
-        $relative = $file.FullName.Substring($sourceRoot.Length).TrimStart('\', '/')
-        $target = Join-Path $Destination $relative
-        [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath ([IO.Path]::GetDirectoryName($target))))
+function New-AgentSessionPutOperation {
+    param(
+        [Parameter(Mandatory)][string]$TargetRoot,
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)][ValidateSet('StagedFile', 'VaultFile')][string]$SourceKind,
+        [string]$SourcePath = '',
+        [string]$SourceRelativePath = '',
+        [Parameter(Mandatory)][string]$SourceSha256,
+        [string]$SourceCommit = ''
+    )
+    [pscustomobject]@{
+        Kind = 'Put'
+        TargetRoot = $TargetRoot
+        RelativePath = $RelativePath.Replace('\', '/')
+        SourceKind = $SourceKind
+        SourcePath = $SourcePath
+        SourceRelativePath = $SourceRelativePath.Replace('\', '/')
+        SourceSha256 = $SourceSha256.ToLowerInvariant()
+        SourceCommit = $SourceCommit
+    }
+}
 
-        if (-not (Test-Path -LiteralPath $target)) {
-            [IO.File]::Copy((ConvertTo-ExtendedPath $file.FullName), (ConvertTo-ExtendedPath $target), $true)
-            $stats.New++
+function New-AgentSessionDeleteOperation {
+    param([Parameter(Mandatory)][string]$TargetRoot, [Parameter(Mandatory)][string]$RelativePath)
+    [pscustomobject]@{
+        Kind = 'Delete'
+        TargetRoot = $TargetRoot
+        RelativePath = $RelativePath.Replace('\', '/')
+        SourceKind = ''
+        SourcePath = ''
+        SourceRelativePath = ''
+        SourceSha256 = ''
+        SourceCommit = ''
+    }
+}
+
+function Test-AgentSessionSafeRelativePath {
+    param([Parameter(Mandatory)][string]$RelativePath)
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or [IO.Path]::IsPathRooted($RelativePath)) { return $false }
+    $normalized = $RelativePath.Replace('\', '/')
+    if ($normalized.StartsWith('/') -or $normalized.EndsWith('/')) { return $false }
+    foreach ($segment in $normalized.Split('/')) {
+        if (-not $segment -or $segment -eq '.' -or $segment -eq '..') { return $false }
+    }
+    return $true
+}
+
+function Resolve-AgentSessionOperationTarget {
+    param([Parameter(Mandatory)]$Operation, [Parameter(Mandatory)][hashtable]$RootMap)
+    if (-not $RootMap.ContainsKey([string]$Operation.TargetRoot)) {
+        throw "Unknown TargetRoot: $($Operation.TargetRoot)"
+    }
+    if (-not (Test-AgentSessionSafeRelativePath ([string]$Operation.RelativePath))) {
+        throw "Unsafe relative path: $($Operation.RelativePath)"
+    }
+    $root = [IO.Path]::GetFullPath([string]$RootMap[[string]$Operation.TargetRoot]).TrimEnd('\', '/')
+    $target = [IO.Path]::GetFullPath((Join-Path $root ([string]$Operation.RelativePath -replace '/', '\')))
+    if (-not $target.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Operation target escapes its root: $target"
+    }
+    $target
+}
+
+function Assert-AgentSessionPlans {
+    param(
+        [Parameter(Mandatory)][array]$Plans,
+        [Parameter(Mandatory)][hashtable]$RootMap,
+        [Parameter(Mandatory)][string]$ExpectedVaultCommit,
+        [Parameter(Mandatory)][string]$PlanRoot,
+        [string[]]$OperationProperties = @('VaultOperations', 'LocalOperations')
+    )
+    $planRootFull = [IO.Path]::GetFullPath($PlanRoot).TrimEnd('\', '/')
+    $keys = @{}
+    foreach ($plan in $Plans) {
+        if ([int]$plan.SchemaVersion -ne 1) { throw "Unsupported plan schema: $($plan.SchemaVersion)" }
+        if (-not [string]::Equals([string]$plan.ExpectedVaultCommit, $ExpectedVaultCommit, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Plan commit mismatch: $($plan.Agent) $($plan.ExpectedVaultCommit)"
+        }
+        foreach ($property in $OperationProperties) {
+            if (-not ($plan.PSObject.Properties.Name -contains $property)) { continue }
+            foreach ($operation in @($plan.$property)) {
+                if ([string]$operation.Kind -notin @('Put', 'Delete')) { throw "Unsupported operation kind: $($operation.Kind)" }
+                [void](Resolve-AgentSessionOperationTarget -Operation $operation -RootMap $RootMap)
+                $key = ([string]$operation.TargetRoot).ToLowerInvariant() + '|' + ([string]$operation.RelativePath).Replace('\', '/').ToLowerInvariant()
+                if ($keys.ContainsKey($key)) { throw "Duplicate operation target: $key" }
+                $keys[$key] = $true
+                if ([string]$operation.Kind -eq 'Put') {
+                    if ([string]$operation.SourceKind -notin @('StagedFile', 'VaultFile')) { throw "Unsupported Put source: $($operation.SourceKind)" }
+                    if ([string]$operation.SourceKind -eq 'StagedFile') {
+                        $stagedPath = [IO.Path]::GetFullPath([string]$operation.SourcePath)
+                        if (-not $stagedPath.StartsWith($planRootFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                            throw "Staged source is outside PlanRoot: $stagedPath"
+                        }
+                        if (-not (Test-Path -LiteralPath $stagedPath -PathType Leaf)) { throw "Missing staged source: $stagedPath" }
+                    } else {
+                        if (-not (Test-AgentSessionSafeRelativePath ([string]$operation.SourceRelativePath))) { throw "Unsafe Vault source: $($operation.SourceRelativePath)" }
+                        if (-not [string]::Equals([string]$operation.SourceCommit, $ExpectedVaultCommit, [StringComparison]::OrdinalIgnoreCase)) {
+                            throw "VaultFile source commit mismatch: $($operation.SourceRelativePath)"
+                        }
+                    }
+                    if ([string]$operation.SourceSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Put operation has an invalid SHA-256.' }
+                }
+            }
+        }
+    }
+}
+
+function Get-AgentSessionOrderedOperations {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][array]$Operations)
+    @($Operations | Where-Object Kind -eq 'Put') + @($Operations | Where-Object Kind -eq 'Delete')
+}
+
+function Get-AgentSessionRootMap {
+    param(
+        [Parameter(Mandatory)][array]$Plans,
+        [Parameter(Mandatory)][string]$RepoRoot
+    )
+    $checkpointRoot = Join-Path $env:LOCALAPPDATA 'AgentSessionSync\State'
+    $map = @{ Vault = [IO.Path]::GetFullPath($RepoRoot); CheckpointRoot = [IO.Path]::GetFullPath($checkpointRoot) }
+    foreach ($plan in $Plans) {
+        if (-not ($plan.PSObject.Properties.Name -contains 'RootBindings') -or -not $plan.RootBindings) { continue }
+        foreach ($name in $plan.RootBindings.Keys) {
+            $binding = [string]$plan.RootBindings[$name]
+            if (-not [IO.Path]::IsPathRooted($binding)) { throw "RootBinding must be absolute: $name" }
+            $path = [IO.Path]::GetFullPath($binding).TrimEnd('\', '/')
+            if ($map.ContainsKey([string]$name) -and -not [string]::Equals([string]$map[[string]$name], $path, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Conflicting RootBinding: $name"
+            }
+            $map[[string]$name] = $path
+        }
+    }
+    $map
+}
+
+function Start-AgentSessionFileTransaction {
+    param([Parameter(Mandatory)][hashtable]$RootMap, [string]$TransactionRoot = '')
+    if (-not $TransactionRoot) { $TransactionRoot = New-AgentSessionPlanRoot -Prefix 'AgentSessionSync-Txn' }
+    $backup = Join-Path $TransactionRoot 'backup'
+    New-Item -ItemType Directory -Path $backup -Force | Out-Null
+    [pscustomobject]@{
+        RootMap = $RootMap
+        TransactionRoot = [IO.Path]::GetFullPath($TransactionRoot)
+        BackupRoot = [IO.Path]::GetFullPath($backup)
+        Records = New-Object 'Collections.Generic.List[object]'
+        AppliedKeys = @{}
+        Completed = $false
+    }
+}
+
+function Assert-AgentSessionVaultFileSource {
+    param(
+        [Parameter(Mandatory)]$Operation,
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [switch]$RequireCleanTree
+    )
+    $head = ([string](& git -C $RepoRoot rev-parse HEAD)).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($head, [string]$Operation.SourceCommit, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Vault HEAD changed before apply: $($Operation.SourceRelativePath)"
+    }
+    if ($RequireCleanTree) {
+        $dirty = @(& git -C $RepoRoot status --porcelain)
+        if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Vault working tree is not clean while applying a VaultFile source.' }
+    }
+    $source = [IO.Path]::GetFullPath((Join-Path $RepoRoot ([string]$Operation.SourceRelativePath -replace '/', '\')))
+    $repoFull = [IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
+    if (-not $source.StartsWith($repoFull + '\', [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Invalid VaultFile source: $($Operation.SourceRelativePath)"
+    }
+    $source
+}
+
+function Assert-AgentSessionVaultSources {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Operations,
+        [Parameter(Mandatory)][string]$RepoRoot
+    )
+    $vaultFileOperations = @($Operations | Where-Object { $_.Kind -eq 'Put' -and $_.SourceKind -eq 'VaultFile' })
+    if ($vaultFileOperations.Count -eq 0) { return }
+
+    $dirty = @(& git -C $RepoRoot status --porcelain)
+    if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Vault working tree is not clean before applying VaultFile sources.' }
+    foreach ($operation in $vaultFileOperations) {
+        $source = Assert-AgentSessionVaultFileSource -Operation $operation -RepoRoot $RepoRoot
+        $actualHash = Get-AgentSessionFileSha256 $source
+        if (-not [string]::Equals($actualHash, [string]$operation.SourceSha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "VaultFile source changed after planning: $source"
+        }
+    }
+}
+
+function Add-AgentSessionOperations {
+    param(
+        [Parameter(Mandatory)]$Transaction,
+        [Parameter(Mandatory)][AllowEmptyCollection()][array]$Operations,
+        [Parameter(Mandatory)][string]$RepoRoot
+    )
+    foreach ($operation in $Operations) {
+        $target = Resolve-AgentSessionOperationTarget -Operation $operation -RootMap $Transaction.RootMap
+        $key = ([string]$operation.TargetRoot).ToLowerInvariant() + '|' + ([string]$operation.RelativePath).Replace('\', '/').ToLowerInvariant()
+        if ($Transaction.AppliedKeys.ContainsKey($key)) { throw "Operation target already applied: $key" }
+
+        $recordIndex = $Transaction.Records.Count
+        $existed = Test-Path -LiteralPath $target -PathType Leaf
+        $backupPath = Join-Path $Transaction.BackupRoot ($recordIndex.ToString('D6') + '.bak')
+        if ($existed) {
+            [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath ([IO.Path]::GetDirectoryName($backupPath))))
+            [IO.File]::Copy((ConvertTo-ExtendedPath $target), (ConvertTo-ExtendedPath $backupPath), $true)
+        }
+        [void]$Transaction.Records.Add([pscustomobject]@{ Target = $target; Existed = $existed; Backup = $backupPath })
+        $Transaction.AppliedKeys[$key] = $true
+
+        if ([string]$operation.Kind -eq 'Delete') {
+            if ($existed) { [IO.File]::Delete((ConvertTo-ExtendedPath $target)) }
             continue
         }
 
-        $sourceBound = Test-ClaudeAppEntryBound $file.FullName
-        $targetBound = Test-ClaudeAppEntryBound $target
-        if ($sourceBound -and -not $targetBound) {
-            [IO.File]::Copy((ConvertTo-ExtendedPath $file.FullName), (ConvertTo-ExtendedPath $target), $true)
-            $stats.Repaired++
-        } elseif ($targetBound -and -not $sourceBound) {
-            $stats.Protected++
-        } elseif ($file.LastWriteTimeUtc -gt (Get-Item -LiteralPath $target).LastWriteTimeUtc) {
-            [IO.File]::Copy((ConvertTo-ExtendedPath $file.FullName), (ConvertTo-ExtendedPath $target), $true)
-            $stats.Updated++
-        } else {
-            $stats.Unchanged++
+        $source = if ([string]$operation.SourceKind -eq 'VaultFile') {
+            Assert-AgentSessionVaultFileSource -Operation $operation -RepoRoot $RepoRoot
+        } else { [string]$operation.SourcePath }
+        $actualHash = Get-AgentSessionFileSha256 $source
+        if (-not [string]::Equals($actualHash, [string]$operation.SourceSha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Put source changed after planning: $source"
+        }
+        $parent = [IO.Path]::GetDirectoryName($target)
+        [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $parent))
+        $temporary = Join-Path $parent ('.assync-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            [IO.File]::Copy((ConvertTo-ExtendedPath $source), (ConvertTo-ExtendedPath $temporary), $true)
+            if (-not [string]::Equals((Get-AgentSessionFileSha256 $temporary), [string]$operation.SourceSha256, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Put target snapshot verification failed: $target"
+            }
+            if (Test-Path -LiteralPath $target) { [IO.File]::Delete((ConvertTo-ExtendedPath $target)) }
+            [IO.File]::Move((ConvertTo-ExtendedPath $temporary), (ConvertTo-ExtendedPath $target))
+        } finally {
+            if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
         }
     }
-    return $stats
 }
 
-function Write-ClaudeAppRegistryStats {
+function Undo-AgentSessionFileTransaction {
+    param([Parameter(Mandatory)]$Transaction)
+    for ($index = $Transaction.Records.Count - 1; $index -ge 0; $index--) {
+        $record = $Transaction.Records[$index]
+        if ($record.Existed) {
+            $parent = [IO.Path]::GetDirectoryName([string]$record.Target)
+            [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $parent))
+            [IO.File]::Copy((ConvertTo-ExtendedPath ([string]$record.Backup)), (ConvertTo-ExtendedPath ([string]$record.Target)), $true)
+        } elseif (Test-Path -LiteralPath ([string]$record.Target) -PathType Leaf) {
+            [IO.File]::Delete((ConvertTo-ExtendedPath ([string]$record.Target)))
+        }
+    }
+    $Transaction.Completed = $true
+}
+
+function Complete-AgentSessionFileTransaction {
+    param([Parameter(Mandatory)]$Transaction)
+    $Transaction.Completed = $true
+}
+
+function Get-AgentSessionVaultHead {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    $head = ([string](& git -C $RepoRoot rev-parse HEAD)).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $head) { throw 'Vault HEAD를 읽을 수 없습니다.' }
+    $head
+}
+
+function Assert-AgentSessionCheckpointAtHead {
     param(
-        [Parameter(Mandatory)]$Stats,
-        [Parameter(Mandatory)][string]$Label
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)]$Checkpoint,
+        [switch]$AllowAncestor
     )
-    Write-Host ("  [{0}] 앱 목록 항목: 신규 {1} / 복구 {2} / 보호 {3} / 갱신 {4} / 유지 {5} / 폐기 {6}" -f `
-        $Label, $Stats.New, $Stats.Repaired, $Stats.Protected, $Stats.Updated, $Stats.Unchanged, $Stats.Tombstoned) -ForegroundColor DarkCyan
-    if ($Stats.Protected -gt 0) {
-        Write-Host "    (보호 = 상대편 항목이 트랜스크립트 연결을 잃은 상태라 덮어쓰지 않음)" -ForegroundColor DarkGray
+    $head = Get-AgentSessionVaultHead $RepoRoot
+    if (-not $Checkpoint.Exists) { throw '이 PC의 checkpoint가 없습니다. Start를 먼저 실행하세요.' }
+    if ([string]::Equals([string]$Checkpoint.Commit, $head, [StringComparison]::OrdinalIgnoreCase)) { return }
+    if ($AllowAncestor) {
+        & git -C $RepoRoot merge-base --is-ancestor ([string]$Checkpoint.Commit) $head
+        if ($LASTEXITCODE -eq 0) { return }
     }
-    if ($Stats.Tombstoned -gt 0) {
-        Write-Host "    (폐기 = 삭제 마커가 있어 목록에 되살리지 않음. 원문 transcript 는 보존)" -ForegroundColor DarkGray
+    throw '이 PC의 checkpoint가 현재 Vault HEAD와 다릅니다. Start를 먼저 실행하세요.'
+}
+
+function Prepare-AgentSessionVaultMutation {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    $dirty = @(& git -C $RepoRoot status --porcelain)
+    if ($LASTEXITCODE -ne 0) { throw 'Vault working tree 상태를 확인할 수 없습니다.' }
+    if ($dirty) { throw 'Vault working tree에 미커밋 변경이 있습니다.' }
+    & git -C $RepoRoot fetch --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Vault 원격 상태를 확인할 수 없습니다.' }
+    $head = Get-AgentSessionVaultHead $RepoRoot
+    $upstream = ([string](& git -C $RepoRoot rev-parse '@{upstream}')).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Vault upstream을 확인할 수 없습니다.' }
+    if ([string]::Equals($head, $upstream, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    & git -C $RepoRoot merge-base --is-ancestor $upstream $head
+    if ($LASTEXITCODE -eq 0) {
+        & git -C $RepoRoot push
+        if ($LASTEXITCODE -ne 0) { throw '미전송 Vault commit Push가 거부됐습니다. 자동 merge하지 않습니다.' }
+        & git -C $RepoRoot fetch --quiet
+        $verified = ([string](& git -C $RepoRoot rev-parse '@{upstream}')).Trim()
+        if (-not [string]::Equals($head, $verified, [StringComparison]::OrdinalIgnoreCase)) { throw '미전송 commit의 원격 반영을 확인하지 못했습니다.' }
+        return $true
     }
+    & git -C $RepoRoot merge-base --is-ancestor $head $upstream
+    if ($LASTEXITCODE -eq 0) { throw '원격 Vault가 앞서 있습니다. Start를 먼저 실행하세요.' }
+    throw '로컬과 원격 Vault가 분기됐습니다. 자동 merge하지 않습니다.'
+}
+
+function Commit-AgentSessionVault {
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string]$Message)
+    & git -C $RepoRoot add -A
+    if ($LASTEXITCODE -ne 0) { throw 'Vault git add에 실패했습니다.' }
+    & git -C $RepoRoot diff --cached --quiet
+    if ($LASTEXITCODE -ne 0) {
+        & git -C $RepoRoot commit -q -m $Message
+        if ($LASTEXITCODE -ne 0) { throw 'Vault commit에 실패했습니다.' }
+    }
+    Get-AgentSessionVaultHead $RepoRoot
+}
+
+function Push-AgentSessionVault {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    & git -C $RepoRoot push
+    if ($LASTEXITCODE -ne 0) { throw 'Vault push가 거부됐습니다. 로컬 commit은 재시도를 위해 유지됩니다.' }
+    & git -C $RepoRoot fetch --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Push 후 원격 확인 fetch에 실패했습니다.' }
+    $head = Get-AgentSessionVaultHead $RepoRoot
+    $upstream = ([string](& git -C $RepoRoot rev-parse '@{upstream}')).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not [string]::Equals($head, $upstream, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Push 후 HEAD와 원격 branch가 일치하지 않습니다.'
+    }
+    $head
+}
+
+function Publish-AgentSessionVault {
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string]$Message)
+    [void](Commit-AgentSessionVault -RepoRoot $RepoRoot -Message $Message)
+    Push-AgentSessionVault -RepoRoot $RepoRoot
 }

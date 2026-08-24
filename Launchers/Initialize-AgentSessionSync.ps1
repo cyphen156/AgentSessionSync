@@ -1,20 +1,14 @@
 ﻿[CmdletBinding()]
-param(
-    [Parameter(Mandatory)][string]$ProjectRoot,
-    [switch]$EnableProjectGitSync,
-    [switch]$EnableSessionPush
-)
+param([switch]$EnableSessionPush)
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $configPath = Join-Path $repoRoot 'AgentSessionSync.config.psd1'
-$escapedProject = [IO.Path]::GetFullPath($ProjectRoot).Replace("'", "''")
 $body = @"
 @{
-    ProjectRoot = '$escapedProject'
-    SyncProjectGit = `$$($EnableProjectGitSync.IsPresent.ToString().ToLower())
-    IncludeClaudeWorktrees = `$$true
     ClaudeHome = ''
     CodexHome = ''
+    ActiveWindowDays = 30
+    TransportFileLimitBytes = 99614720
     SessionDataPushEnabled = `$$($EnableSessionPush.IsPresent.ToString().ToLower())
     GracefulCloseTimeoutSeconds = 8
 }

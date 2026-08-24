@@ -28,7 +28,7 @@ AgentSessionSync는 여러 Windows PC에서 Claude와 Codex의 대화를 이어 
 
 | 상태 | Vault | 로컬 앱 저장소 |
 |---|---|---|
-| Active | `Claude/projects`, `Codex/sessions` | 존재 |
+| Active | `Claude/sessions`, `Codex/sessions` | 존재 |
 | Archived | `Claude/archive`, `Codex/archive` | 활성 저장소에서 제거 |
 | Deleted | 현재 트리에 없음 | 제거 |
 
@@ -56,8 +56,8 @@ Vault의 Archived 상태를 결정하는 신호나 보관 장소가 아닙니다
 1. 등록된 앱에 정상 종료를 요청하고 완전히 닫혔는지 확인합니다.
 2. 종료되지 않으면 강제 종료하지 않고 중단합니다.
 3. 앱 형식과 현재 로컬 원문을 다시 검사합니다.
-4. 체크포인트의 Vault Active 집합 `P`와 현재 로컬 존재 집합 `C`를 비교합니다.
-5. `P - C`는 최종 삭제로 처리하여 Vault 최신 트리에서 제거합니다.
+4. 각 앱 adapter가 앱별 삭제 신호와 현재 로컬 존재 집합을 판정합니다.
+5. 최종 삭제로 확인된 대화만 Vault 최신 트리에서 제거합니다.
 6. 현재 활성 저장소에 새로 나타난 ID는 Vault Archived를 먼저 조회합니다.
    - Archived에 있으면 Active로 이동합니다.
    - 없으면 신규 대화로 추가합니다.
@@ -79,9 +79,10 @@ commit/push로 확정합니다.
 .\Launchers\Restore-ArchivedSession.ps1 <세션-ID-일부>
 ```
 
-복원 실행 중 앱이 열려 있으면 정상 종료를 요청합니다. 제한시간 안에 닫히지 않으면 Vault를
-변경하지 않고 중단하며 강제 종료하지 않습니다. Push가 확인된 뒤 로컬 파일을 배치하고 앱을 다시
-실행합니다.
+복원 상태를 Vault에 commit/push한 뒤 앱이 열려 있으면 정상 종료를 요청합니다. 제한시간 안에
+닫히지 않으면 강제 종료하거나 로컬 파일을 쓰지 않습니다. 이때 Vault의 Active 전환은 이미
+유효하며 다음 Start가 로컬 배치를 완료합니다. 정상 종료가 확인되면 로컬 파일을 배치하고 앱을
+다시 실행합니다.
 
 복원은 데이터와 Vault 상태 전환을 보장하지만 Codex 사이드바의 즉시 표시는 보장하지 않습니다.
 표시되지 않으면 앱을 다시 실행하고, 그래도 표시되지 않으면 앱을 업데이트한 뒤 Start를 다시
@@ -115,7 +116,6 @@ private Vault를 두 PC에 clone하고 각 PC에서 초기화합니다.
 git clone https://github.com/<YOU>/<PRIVATE-SESSION-VAULT>.git C:\Project\MultiAgent\AgentSessionVault
 cd C:\Project\MultiAgent\AgentSessionVault
 .\Launchers\Initialize-AgentSessionSync.ps1 `
-  -ProjectRoot 'C:\Project\MyProject' `
   -EnableSessionPush
 ```
 
@@ -131,9 +131,10 @@ cd C:\Project\MultiAgent\AgentSessionVault
 `examples/session-store`는 실제 대화가 아닌 합성 placeholder입니다.
 
 ```text
-Claude/projects/<cwd-key>/*.jsonl
+Claude/sessions/<cwd-key>/<session-id>.jsonl
+Claude/sessions/<cwd-key>/<session-id>.entry.json
 Claude/archive/<cwd-key>/*.jsonl
-ClaudeApp/claude-code-sessions/**/*.json
+Claude/archive/<cwd-key>/*.entry.json
 Codex/session_index.jsonl
 Codex/session_projects.jsonl
 Codex/sessions/<cwd-key>/YYYY/MM/DD/*.jsonl[.gz]
