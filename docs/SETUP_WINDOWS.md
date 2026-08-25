@@ -22,6 +22,10 @@ git clone https://github.com/<YOU>/<PRIVATE-REPO>.git C:\Project\MultiAgent\Agen
 Codex는 `sessions`, `archived_sessions`, 세션 인덱스를 함께 확인합니다. 앱 DB를 직접 수정하지
 않습니다.
 
+Claude는 `~/.claude/projects`의 원문뿐 아니라 앱 목록의 `local_*.json`과 `deleted_*` 마커까지
+비어 있어야 합니다. 삭제 마커만 남아 있어도 이전 설치의 삭제 판정을 안전하게 복구할 수 없으므로
+첫 Start를 중단합니다.
+
 ## 4. PC별 설정을 만듭니다
 
 ```powershell
@@ -48,3 +52,6 @@ Finish 또는 Restore가 앱을 정상 종료하지 못하면 강제 종료하�
 같은 명령을 다시 실행하세요.
 
 Push가 거부되면 자동 merge하지 않습니다. 한 PC의 변경을 먼저 정리한 뒤 다시 실행합니다.
+
+지원 앱은 Claude와 Codex입니다. 다른 에이전트를 자동 등록하는 구조는 제공하지 않습니다. 필요하면
+MIT 라이선스에 따라 별도 포크에서 저장 형식과 삭제 판정을 구현해야 합니다.

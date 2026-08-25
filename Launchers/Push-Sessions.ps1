@@ -73,7 +73,8 @@ try {
         if (Test-Path -LiteralPath $path) { & (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths @($path) -IncludeCompressed }
     }
     foreach ($operation in @($plans | ForEach-Object { $_.VaultOperations }) | Where-Object {
-        $_.Kind -eq 'Put' -and $_.TargetRoot -eq 'Vault' -and $_.RelativePath -like '*.jsonl'
+        $_.Kind -eq 'Put' -and $_.TargetRoot -eq 'Vault' -and $_.RelativePath -like '*.jsonl' -and
+        ($_.RelativePath -match '^(Codex|Claude)/(sessions|archive)/')
     }) {
         Test-JsonlSnapshotComplete (Resolve-AgentSessionOperationTarget -Operation $operation -RootMap $rootMap)
     }

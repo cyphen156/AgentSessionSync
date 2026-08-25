@@ -5,8 +5,8 @@ AgentSessionSync는 여러 Windows PC에서 Claude와 Codex의 대화를 이어 
 
 이 도구는 대화 세션만 다룹니다. 프로젝트 소스, 워크벤치 상태, 에이전트 메모리는 동기화하지 않습니다.
 
-아래 상태 전이와 테스트의 이번 개정 범위는 Codex입니다. Claude의 원문과 앱 목록 매핑은 Claude 측
-검수·개정에서 별도로 확정하며, Codex 판정을 Claude 데이터에 추측 적용하지 않습니다.
+지원 대상은 Claude와 Codex입니다. 이 저장소는 등록형 에이전트 프레임워크로 일반화하지 않습니다.
+다른 에이전트가 필요하면 MIT 라이선스에 따라 포크에서 직접 추가할 수 있습니다.
 
 ## 보장하는 동작
 
@@ -69,7 +69,11 @@ Vault의 Archived 상태를 결정하는 신호나 보관 장소가 아닙니다
 Codex에서 `C`는 `sessions ∪ archived_sessions`입니다. 보관함에 있는 동안에는 아직 삭제된 것이
 아니며, 보관함에서 최종 삭제되어 두 위치 모두에서 사라졌을 때만 삭제로 판정합니다.
 
-## Codex Restore
+Claude는 원문 파일의 부재를 삭제로 해석하지 않습니다. 앱이 만든 `deleted_<appSessionId>` 마커를
+마지막 checkpoint의 `appSessionId ↔ canonicalId` 매핑으로 해석한 경우에만 최종 삭제합니다.
+해석할 수 없는 마커가 있으면 삭제나 업로드를 추측하지 않고 Finish 전체를 중단합니다.
+
+## Restore
 
 `Restore-ArchivedSession.ps1`은 선택한 대화를 Vault Archived에서 Active로 즉시 이동하고 별도
 commit/push로 확정합니다.
@@ -84,7 +88,7 @@ commit/push로 확정합니다.
 유효하며 다음 Start가 로컬 배치를 완료합니다. 정상 종료가 확인되면 로컬 파일을 배치하고 앱을
 다시 실행합니다.
 
-복원은 데이터와 Vault 상태 전환을 보장하지만 Codex 사이드바의 즉시 표시는 보장하지 않습니다.
+복원은 데이터와 Vault 상태 전환을 보장하지만 앱 사이드바의 즉시 표시는 보장하지 않습니다.
 표시되지 않으면 앱을 다시 실행하고, 그래도 표시되지 않으면 앱을 업데이트한 뒤 Start를 다시
 실행합니다. `restoredAt` 같은 별도 유예 필드는 만들지 않습니다.
 
@@ -100,6 +104,15 @@ commit/push로 확정합니다.
 Codex 데이터 형식은 Start와 Finish마다 원문에서 다시 확인합니다. 앱이 열린 뒤 업데이트될 수
 있으므로 Start의 판정 결과를 Finish에서 재사용하지 않습니다. 오래된 지원 형식은 adapter로 읽을
 수 있지만, 알 수 없는 형식을 추측해서 변환하지 않습니다.
+
+## Claude 판정 기준
+
+- canonical ID는 원문 모든 레코드의 `sessionId`를 확인해 판정합니다. 서로 다른 ID가 섞이면 중단합니다.
+- 목록 항목은 `local_<appSessionId>.json`의 `cliSessionId`로 원문과 연결합니다.
+- Vault에서는 `<session-id>.jsonl`과 `<session-id>.entry.json`을 한 쌍으로 보관합니다.
+- 로컬 목록 항목이 없어도 Vault sidecar가 있으면 기존 쌍을 유지하고, 다음 Start에서 항목을 복원합니다.
+- 한 원문에 목록 항목이 둘 이상 연결되거나 sidecar의 경로·ID·스키마가 맞지 않으면 중단합니다.
+- 마지막 활동 시각은 timestamp가 있는 마지막 레코드에서 읽으며 파일 mtime은 사용하지 않습니다.
 
 ## Git 실패 처리
 
@@ -147,7 +160,12 @@ Codex/archive/<cwd-key>/YYYY/MM/DD/*.jsonl[.gz]
 
 ```powershell
 .\Launchers\tests\Test-AgentLauncher.ps1
+.\Launchers\tests\Test-PlanEngine.ps1
 .\Launchers\tests\Test-AgentSessionSync.ps1
+.\Launchers\tests\Test-ClaudeSessionState.ps1
+.\Launchers\tests\Test-AgentSessionIntegration.ps1
 ```
 
-테스트는 임시 Git 저장소와 임시 프로필을 사용하며 실제 사용자 세션을 수정하지 않아야 합니다.
+마지막 통합 테스트는 Codex와 Claude가 한 번의 Publish를 공유하는지, 한쪽 실패 시 전체가 무변경인지,
+Restore 뒤 두 checkpoint가 함께 전진하는지를 확인합니다. 모든 테스트는 임시 Git 저장소와 임시
+프로필을 사용하며 실제 사용자 세션을 수정하지 않아야 합니다.

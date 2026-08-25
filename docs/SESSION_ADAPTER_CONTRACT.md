@@ -4,6 +4,9 @@ This document defines the runtime boundary between the AgentSessionSync orchestr
 the shared transaction engine, and each application adapter. Legacy transport layouts
 are migration inputs only; they are not part of the runtime contract.
 
+The supported adapters are Claude and Codex. This is an internal boundary for those two
+implementations, not a plugin discovery API or a promise of registration-based expansion.
+
 ## Dependency boundary
 
 - `AgentSessionSync.Common.ps1` owns configuration, Git coordination, path validation,
