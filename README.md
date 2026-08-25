@@ -97,7 +97,7 @@ commit/push로 확정합니다.
 
 ## Codex 판정 기준
 
-- canonical ID는 파일명이 아니라 첫 `session_meta.payload.id` 또는 `session_id`에서 읽습니다.
+- canonical ID는 파일명이 아니라 첫 `session_meta`에서 읽습니다. `session_id`가 있으면 thread ID로 우선하고, 최신 형식처럼 없으면 `id`를 사용합니다.
 - 같은 thread의 여러 page 파일은 canonical ID 하나로 묶습니다.
 - 마지막 활동 시각은 모든 page의 최상위 레코드 중 timestamp가 있는 마지막 레코드로 판정합니다.
 - 파일 mtime, 파일명 날짜, Git commit 시각은 활동 시각으로 쓰지 않습니다.

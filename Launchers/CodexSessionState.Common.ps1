@@ -17,14 +17,15 @@ function Get-CodexSessionMeta {
             if ($null -eq $record -or [string]$record.type -ne 'session_meta' -or $null -eq $record.payload) { continue }
             $idProperty = $record.payload.PSObject.Properties['id']
             $sessionIdProperty = $record.payload.PSObject.Properties['session_id']
+            $cwdProperty = $record.payload.PSObject.Properties['cwd']
             $id = if ($null -ne $idProperty) { [string]$idProperty.Value } else { '' }
             $sessionId = if ($null -ne $sessionIdProperty) { [string]$sessionIdProperty.Value } else { '' }
-            if ($id -and $sessionId -and -not [string]::Equals($id,$sessionId,[StringComparison]::OrdinalIgnoreCase)) {
-                throw "Codex session_meta IDs disagree in $Path"
-            }
-            $canonical = if ($id) { $id } else { $sessionId }
+            $cwd = if ($null -ne $cwdProperty) { [string]$cwdProperty.Value } else { '' }
+            # Older desktop rollouts use id for a page and session_id for the
+            # canonical thread. Current rollouts may expose only id.
+            $canonical = if ($sessionId) { $sessionId } else { $id }
             if (-not $canonical) { throw "Codex session_meta has no canonical ID: $Path" }
-            return [pscustomobject]@{Id=$canonical;Cwd=[string]$record.payload.cwd}
+            return [pscustomobject]@{Id=$canonical;Cwd=$cwd}
         }
         throw "Codex rollout has no readable session_meta: $Path"
     } finally {

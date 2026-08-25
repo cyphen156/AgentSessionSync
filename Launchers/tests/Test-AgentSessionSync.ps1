@@ -12,10 +12,10 @@ function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "ASSERT FAILED [#$($script:passed + 1)]: $Message" }
     $script:passed++
 }
-function Write-Rollout([string]$Path, [string]$Id, [string]$Cwd, [string]$Timestamp, [switch]$IdOnly) {
+function Write-Rollout([string]$Path, [string]$Id, [string]$Cwd, [string]$Timestamp, [switch]$IdOnly, [string]$SessionId = '') {
     New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
     $payload = [ordered]@{id=$Id;cwd=$Cwd}
-    if (-not $IdOnly) { $payload.session_id = $Id }
+    if (-not $IdOnly) { $payload.session_id = if ($SessionId) { $SessionId } else { $Id } }
     $meta = [ordered]@{ type='session_meta';payload=$payload;timestamp=$Timestamp } | ConvertTo-Json -Compress
     $message = [ordered]@{ type='event_msg';payload=[ordered]@{type='message'};timestamp=$Timestamp } | ConvertTo-Json -Compress
     @($meta,$message) | Set-Content -LiteralPath $Path -Encoding UTF8
@@ -54,6 +54,11 @@ try {
     $idOnlyPath = Join-Path $root 'IdOnly\rollout-id-only.jsonl'
     Write-Rollout $idOnlyPath $idOnly $cwd $fresh -IdOnly
     Assert-True ((Get-CodexSessionMeta $idOnlyPath).Id -eq $idOnly) 'session_meta accepts payload.id when session_id is absent under StrictMode'
+    $pageId = '55555555-5555-4555-8555-555555555555'
+    $threadId = '66666666-6666-4666-8666-666666666666'
+    $legacyPagePath = Join-Path $root 'LegacyPage\rollout-page.jsonl'
+    Write-Rollout $legacyPagePath $pageId $cwd $fresh -SessionId $threadId
+    Assert-True ((Get-CodexSessionMeta $legacyPagePath).Id -eq $threadId) 'session_meta prefers session_id as the canonical thread when id identifies a page'
     Write-Rollout (Join-Path $repo "Codex\sessions\$key\2026\08\25\rollout-a.jsonl") $idA $cwd $fresh
     [ordered]@{id=$idA;title='A'} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $repo 'Codex\session_index.jsonl') -Encoding UTF8
     'NONE' | Set-Content -LiteralPath (Join-Path $repo 'ACTIVE_HOST.txt') -Encoding ASCII
