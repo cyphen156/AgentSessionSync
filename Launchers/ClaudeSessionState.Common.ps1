@@ -377,11 +377,18 @@ function New-ClaudePlanObject {
 }
 
 function New-ClaudeEntryArtifact {
-    <# 사이드카에서 앱이 읽을 원본 항목 JSON 을 풀어 PlanRoot 에 만든다. #>
+    <#
+      사이드카에서 앱이 읽을 원본 항목 JSON 을 풀어 PlanRoot 에 만든다.
+
+      이 산출물만은 BOM 없이 써야 한다. 읽는 쪽이 우리가 아니라 Claude 앱의
+      LocalSessionManager.loadSessions() 이고, 그것은 readFile(utf-8) 결과를 곧바로
+      JSON.parse 에 넘긴다. BOM 이 있으면 parse 가 던지고, 앱은 그 예외를 warn 으로
+      삼킨 뒤 항목을 통째로 버린다. 파일은 멀쩡히 있는데 사이드바에만 안 보인다.
+    #>
     param([Parameter(Mandatory)][string]$SidecarPath, [Parameter(Mandatory)][string]$CanonicalId, [Parameter(Mandatory)][string]$PlanRoot)
     $sidecar = Read-ClaudeSidecar -Path $SidecarPath -CanonicalId $CanonicalId
     $path = Join-Path $PlanRoot ('claude-entry-' + [guid]::NewGuid().ToString('N') + '.json')
-    Write-AgentSessionUtf8File -Path $path -Content ($sidecar.Entry | ConvertTo-Json -Depth 40)
+    Write-AgentSessionUtf8File -Path $path -Content ($sidecar.Entry | ConvertTo-Json -Depth 40) -NoBom
     [pscustomobject]@{ RelativePath = $sidecar.RelativePath; Path = $path; Sha256 = Get-AgentSessionFileSha256 $path }
 }
 

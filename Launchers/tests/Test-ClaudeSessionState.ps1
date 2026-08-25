@@ -38,6 +38,11 @@ function Write-TestEntry {
     Write-AgentSessionUtf8File -Path $path -Content $content
 }
 
+function Test-Utf8Bom {
+    param([byte[]]$Bytes)
+    return ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF)
+}
+
 function Write-TestSidecar {
     param([string]$Path, [string]$AppSessionId, [string]$CanonicalId)
     $content = [pscustomobject]@{
@@ -322,6 +327,49 @@ try {
     $tripped = $false
     try { [void](Read-ClaudeSidecar -Path $badSidecar -CanonicalId $ids.Held) } catch { $tripped = $true }
     Assert-True $tripped '지원하지 않는 사이드카 스키마는 거부해야 한다'
+
+    # --- 10b) 앱이 읽는 목록 항목은 BOM 없는 UTF-8 이어야 한다 ---
+    # 앱은 readFile(utf-8) 결과를 JSON.parse 에 그대로 넘긴다. 선행 BOM 이면 parse 가
+    # 던지고 앱은 그 항목을 조용히 버린다. 파일 개수·해시가 다 맞아도 사이드바에서만
+    # 사라지므로, 산출물의 바이트를 직접 본다.
+    $encodeSidecar = Join-Path $testRoot 'encoding.entry.json'
+    Write-TestSidecar -Path $encodeSidecar -AppSessionId $apps.Held -CanonicalId $ids.Held
+    $encodeArtifact = New-ClaudeEntryArtifact -SidecarPath $encodeSidecar -CanonicalId $ids.Held -PlanRoot $planRoot
+
+    $artifactBytes = [IO.File]::ReadAllBytes($encodeArtifact.Path)
+    Assert-True ($artifactBytes.Length -ge 3) '항목 산출물이 비어 있으면 안 된다'
+    Assert-True (-not (Test-Utf8Bom $artifactBytes)) `
+        '앱이 읽는 목록 항목에 UTF-8 BOM 이 있으면 안 된다 (앱의 JSON.parse 가 던진다)'
+    Assert-True ($artifactBytes[0] -eq 0x7B) '항목 산출물은 여는 중괄호로 시작해야 한다'
+
+    # 엄격 UTF-8 디코딩: 잘못된 바이트열이면 여기서 던진다.
+    $strict = [Text.UTF8Encoding]::new($false, $true)
+    $decoded = $null
+    $decodeFailed = $false
+    try { $decoded = $strict.GetString($artifactBytes) } catch { $decodeFailed = $true }
+    Assert-True (-not $decodeFailed) '항목 산출물은 엄격 UTF-8 로 디코딩돼야 한다'
+    Assert-True ($decoded[0] -eq '{') '엄격 디코딩 결과의 첫 문자가 U+FEFF 면 안 된다'
+
+    $reparsed = $null
+    $parseFailed = $false
+    try { $reparsed = $decoded | ConvertFrom-Json } catch { $parseFailed = $true }
+    Assert-True (-not $parseFailed) '항목 산출물은 JSON 으로 파싱돼야 한다'
+    Assert-True ($reparsed.cliSessionId -eq $ids.Held) '파싱된 항목이 원문 ID 를 그대로 보존해야 한다'
+
+    # BOM 을 뺀 것이 한글 보존을 깨뜨리지 않는지 확인한다. BOM 은 애초에 그 목적이었다.
+    $koreanPath = Join-Path $testRoot 'korean-nobom.json'
+    Write-AgentSessionUtf8File -Path $koreanPath -Content '{"title":"통합 포트폴리오 구현 계획"}' -NoBom
+    $koreanBytes = [IO.File]::ReadAllBytes($koreanPath)
+    Assert-True ($koreanBytes[0] -eq 0x7B) '-NoBom 은 BOM 을 쓰지 않아야 한다'
+    Assert-True ((($strict.GetString($koreanBytes)) | ConvertFrom-Json).title -eq '통합 포트폴리오 구현 계획') `
+        'BOM 없이도 한글이 왕복해야 한다'
+
+    # 기본 호출은 BOM 을 유지한다. 우리가 -Encoding 없이 다시 읽는 설정·사이드카·
+    # checkpoint 는 PowerShell 5.1 에서 BOM 이 없으면 CP949 로 오독된다.
+    $defaultPath = Join-Path $testRoot 'default-bom.json'
+    Write-AgentSessionUtf8File -Path $defaultPath -Content '{"title":"기본값"}'
+    $defaultBytes = [IO.File]::ReadAllBytes($defaultPath)
+    Assert-True (Test-Utf8Bom $defaultBytes) '-NoBom 없는 기본 호출은 기존대로 BOM 을 유지해야 한다'
 
     # --- 11) 원문 정체성 검증 ---
     $mixed = Join-Path $testRoot 'mixed.jsonl'

@@ -279,10 +279,24 @@ function Get-AgentSessionFileSha256 {
 }
 
 function Write-AgentSessionUtf8File {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][AllowEmptyString()][string]$Content)
+    <#
+      기본값은 BOM 있는 UTF-8 이다. Windows PowerShell 5.1 은 -Encoding 없이 읽을 때
+      BOM 없는 UTF-8 을 CP949 로 오독하므로, 우리가 다시 읽는 설정·사이드카·checkpoint
+      에는 BOM 이 필요하다.
+
+      -NoBom 은 그 반대편을 위한 것이다. 외부 런타임이 읽는 산출물에는 BOM 을 붙이면
+      안 된다. 특히 Node 의 JSON.parse 는 선행 BOM 에서 예외를 던지므로, Claude 앱이
+      읽는 목록 항목에 BOM 이 붙으면 앱이 그 항목을 조용히 버리고 사이드바에서 사라진다.
+      호출부는 "누가 이 파일을 읽는가" 로 선택해야 한다.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
+        [switch]$NoBom
+    )
     $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
     [void][IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $parent))
-    $encoding = New-Object Text.UTF8Encoding($true)
+    $encoding = New-Object Text.UTF8Encoding(-not $NoBom)
     [IO.File]::WriteAllText((ConvertTo-ExtendedPath $Path), $Content, $encoding)
 }
 
