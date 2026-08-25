@@ -12,9 +12,11 @@ function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "ASSERT FAILED [#$($script:passed + 1)]: $Message" }
     $script:passed++
 }
-function Write-Rollout([string]$Path, [string]$Id, [string]$Cwd, [string]$Timestamp) {
+function Write-Rollout([string]$Path, [string]$Id, [string]$Cwd, [string]$Timestamp, [switch]$IdOnly) {
     New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
-    $meta = [ordered]@{ type='session_meta';payload=[ordered]@{id=$Id;session_id=$Id;cwd=$Cwd};timestamp=$Timestamp } | ConvertTo-Json -Compress
+    $payload = [ordered]@{id=$Id;cwd=$Cwd}
+    if (-not $IdOnly) { $payload.session_id = $Id }
+    $meta = [ordered]@{ type='session_meta';payload=$payload;timestamp=$Timestamp } | ConvertTo-Json -Compress
     $message = [ordered]@{ type='event_msg';payload=[ordered]@{type='message'};timestamp=$Timestamp } | ConvertTo-Json -Compress
     @($meta,$message) | Set-Content -LiteralPath $Path -Encoding UTF8
 }
@@ -48,6 +50,10 @@ try {
     $idA = '11111111-1111-4111-8111-111111111111'
     $idB = '22222222-2222-4222-8222-222222222222'
     $idC = '33333333-3333-4333-8333-333333333333'
+    $idOnly = '44444444-4444-4444-8444-444444444444'
+    $idOnlyPath = Join-Path $root 'IdOnly\rollout-id-only.jsonl'
+    Write-Rollout $idOnlyPath $idOnly $cwd $fresh -IdOnly
+    Assert-True ((Get-CodexSessionMeta $idOnlyPath).Id -eq $idOnly) 'session_meta accepts payload.id when session_id is absent under StrictMode'
     Write-Rollout (Join-Path $repo "Codex\sessions\$key\2026\08\25\rollout-a.jsonl") $idA $cwd $fresh
     [ordered]@{id=$idA;title='A'} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $repo 'Codex\session_index.jsonl') -Encoding UTF8
     'NONE' | Set-Content -LiteralPath (Join-Path $repo 'ACTIVE_HOST.txt') -Encoding ASCII

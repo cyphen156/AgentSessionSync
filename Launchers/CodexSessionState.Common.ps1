@@ -15,8 +15,10 @@ function Get-CodexSessionMeta {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
             try { $record = $line | ConvertFrom-Json } catch { continue }
             if ($null -eq $record -or [string]$record.type -ne 'session_meta' -or $null -eq $record.payload) { continue }
-            $id = [string]$record.payload.id
-            $sessionId = [string]$record.payload.session_id
+            $idProperty = $record.payload.PSObject.Properties['id']
+            $sessionIdProperty = $record.payload.PSObject.Properties['session_id']
+            $id = if ($null -ne $idProperty) { [string]$idProperty.Value } else { '' }
+            $sessionId = if ($null -ne $sessionIdProperty) { [string]$sessionIdProperty.Value } else { '' }
             if ($id -and $sessionId -and -not [string]::Equals($id,$sessionId,[StringComparison]::OrdinalIgnoreCase)) {
                 throw "Codex session_meta IDs disagree in $Path"
             }
