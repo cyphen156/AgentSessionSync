@@ -72,6 +72,13 @@ function Add-DiagnosticError([string] $Stage, [string] $Message) {
     }
 }
 
+function Get-AppServerResponseError($Response) {
+    if ($null -eq $Response) { return $null }
+    $property = $Response.PSObject.Properties['error']
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
 function ConvertTo-CoreVersion([string] $Text) {
     if ($Text -match '(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)') {
         return [version]::new(
@@ -337,9 +344,10 @@ try {
         $process.StandardInput.WriteLine($initialize)
 
         $initializeResponse = Read-AppServerResponse 1
-        if ($initializeResponse.error) {
-            $report.appServer.initializeError = [string]$initializeResponse.error.message
-            throw "Codex app-server initialize failed: $($initializeResponse.error.message)"
+        $initializeError = Get-AppServerResponseError $initializeResponse
+        if ($null -ne $initializeError) {
+            $report.appServer.initializeError = [string]$initializeError.message
+            throw "Codex app-server initialize failed: $($initializeError.message)"
         }
         $process.StandardInput.WriteLine((@{ method = 'initialized'; params = @{} } | ConvertTo-Json -Compress))
 
@@ -356,8 +364,9 @@ try {
         } | ConvertTo-Json -Compress -Depth 8
         $process.StandardInput.WriteLine($beforeRequest)
         $beforeResponse = Read-AppServerResponse 2
-        if ($beforeResponse.error) {
-            throw "Codex state-only thread/list failed: $($beforeResponse.error.message)"
+        $beforeError = Get-AppServerResponseError $beforeResponse
+        if ($null -ne $beforeError) {
+            throw "Codex state-only thread/list failed: $($beforeError.message)"
         }
 
         $beforeIds = Get-ThreadIdsFromListResponse $beforeResponse
@@ -379,11 +388,12 @@ try {
             $process.StandardInput.WriteLine($readRequest)
             try {
                 $readResponse = Read-AppServerResponse $requestId
-                if ($readResponse.error) {
+                $readError = Get-AppServerResponseError $readResponse
+                if ($null -ne $readError) {
                     $report.visibility.repairFailed += [ordered]@{
                         id = $threadId
-                        code = $readResponse.error.code
-                        message = [string]$readResponse.error.message
+                        code = $readError.code
+                        message = [string]$readError.message
                     }
                 } else {
                     $report.visibility.repairSucceeded += $threadId
@@ -413,8 +423,9 @@ try {
         } | ConvertTo-Json -Compress -Depth 8
         $process.StandardInput.WriteLine($afterRequest)
         $afterResponse = Read-AppServerResponse $afterRequestId
-        if ($afterResponse.error) {
-            throw "Codex post-repair thread/list failed: $($afterResponse.error.message)"
+        $afterError = Get-AppServerResponseError $afterResponse
+        if ($null -ne $afterError) {
+            throw "Codex post-repair thread/list failed: $($afterError.message)"
         }
 
         $afterIds = Get-ThreadIdsFromListResponse $afterResponse
