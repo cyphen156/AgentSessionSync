@@ -122,6 +122,17 @@ function Assert-CurrentProcessOutsideAgentTrees {
     }
 }
 
+function Stop-AgentProcessTree {
+    <#
+      Best effort by design. The caller's retry deadline decides when to give up;
+      one taskkill failure must not abort the remaining verified retries.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+    $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+    & $taskkill /PID $ProcessId /T /F | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
 function Initialize-AgentWindowApi {
     if (-not ('AgentSessionSync.NativeMethods' -as [type])) {
         Add-Type -TypeDefinition @'
@@ -183,7 +194,8 @@ function Send-AgentCloseRequests {
 function Stop-AgentGracefully {
     param(
         [Parameter(Mandatory)]$Agent,
-        [Parameter(Mandatory)][int]$TimeoutSeconds
+        [Parameter(Mandatory)][int]$TimeoutSeconds,
+        [switch]$ForceProcessTree
     )
     $processes = @(Get-AgentProcessTree $Agent)
     if (-not $processes) {
@@ -214,7 +226,36 @@ function Stop-AgentGracefully {
         } while ((Get-Date) -lt $deadline)
     }
 
-    throw "$($Agent.Name) did not close within $TimeoutSeconds seconds. The operation was cancelled without force-terminating the app."
+    if (-not $ForceProcessTree) {
+        throw "$($Agent.Name) did not close within $TimeoutSeconds seconds. The operation was cancelled without force-terminating the app."
+    }
+
+    if ($windowCount -eq 0) {
+        Write-Host "[$($Agent.Name)] No top-level window; terminating the registered process tree." -ForegroundColor Yellow
+    } else {
+        Write-Warning "$($Agent.Name) still has registered app processes after the close request. Terminating the complete process tree."
+    }
+    $forceDeadline = (Get-Date).AddSeconds(10)
+    do {
+        $snapshot = @(Get-SystemProcessSnapshot)
+        $processes = @(Get-AgentProcessTree -Agent $Agent -Snapshot $snapshot)
+        if (-not $processes) { break }
+        $treeIds = New-Object 'Collections.Generic.HashSet[int]'
+        foreach ($process in $processes) { [void]$treeIds.Add([int]$process.Id) }
+        $parentOf = @{}
+        foreach ($row in $snapshot) { $parentOf[[int]$row.ProcessId] = [int]$row.ParentProcessId }
+        # taskkill /T already includes descendants. Invoke it only for roots in the
+        # freshly revalidated registered tree, never for remembered or child PIDs.
+        foreach ($processId in @($treeIds)) {
+            if ($parentOf.ContainsKey($processId) -and $treeIds.Contains($parentOf[$processId])) { continue }
+            [void](Stop-AgentProcessTree $processId)
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $forceDeadline)
+    if (Get-AgentProcessTree $Agent) {
+        throw "$($Agent.Name) is still running after process-tree termination. Push was cancelled."
+    }
+    Write-Host "[$($Agent.Name)] Complete process tree terminated and verified." -ForegroundColor Yellow
 }
 
 function Assert-AllAgentsClosed {

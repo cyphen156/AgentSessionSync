@@ -251,7 +251,16 @@ function Get-JsonlLastActivity {
         if ([string]::IsNullOrWhiteSpace($line)) { return }
         try { $record = $line | ConvertFrom-Json } catch { return }
         if ($null -eq $record -or $record.PSObject.Properties.Name -notcontains 'timestamp') { return }
-        try { $state.Latest = ([datetimeoffset]([string]$record.timestamp)).UtcDateTime } catch {}
+        try {
+            $timestamp = $record.timestamp
+            if ($timestamp -is [datetimeoffset]) {
+                $state.Latest = $timestamp.UtcDateTime
+            } elseif ($timestamp -is [datetime]) {
+                $state.Latest = $timestamp.ToUniversalTime()
+            } else {
+                $state.Latest = ([datetimeoffset]([string]$timestamp)).UtcDateTime
+            }
+        } catch {}
     }
 
     if ($Path -like '*.gz') {

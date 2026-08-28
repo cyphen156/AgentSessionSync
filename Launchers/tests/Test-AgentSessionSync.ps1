@@ -12,12 +12,22 @@ function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "ASSERT FAILED [#$($script:passed + 1)]: $Message" }
     $script:passed++
 }
-function Write-Rollout([string]$Path, [string]$Id, [string]$Cwd, [string]$Timestamp, [switch]$IdOnly, [string]$SessionId = '') {
+function Write-Rollout([string]$Path, [string]$Id, [string]$Cwd, [string]$Timestamp, [switch]$IdOnly,
+        [string]$SessionId = '', [string]$BasePageId = '', [Nullable[int64]]$BaseEndByte = $null,
+        [Nullable[int64]]$BaseEndOrdinal = $null) {
     New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
     $payload = [ordered]@{id=$Id;cwd=$Cwd}
     if (-not $IdOnly) { $payload.session_id = if ($SessionId) { $SessionId } else { $Id } }
-    $meta = [ordered]@{ type='session_meta';payload=$payload;timestamp=$Timestamp } | ConvertTo-Json -Compress
-    $message = [ordered]@{ type='event_msg';payload=[ordered]@{type='message'};timestamp=$Timestamp } | ConvertTo-Json -Compress
+    if ($BasePageId) {
+        $payload.history_mode = 'paginated'
+        $payload.history_base = [ordered]@{
+            thread_id=$BasePageId
+            end_byte_offset=[int64]$BaseEndByte
+            end_ordinal_exclusive=[int64]$BaseEndOrdinal
+        }
+    }
+    $meta = [ordered]@{ type='session_meta';payload=$payload;timestamp=$Timestamp;ordinal=0 } | ConvertTo-Json -Compress
+    $message = [ordered]@{ type='event_msg';payload=[ordered]@{type='message'};timestamp=$Timestamp;ordinal=1 } | ConvertTo-Json -Compress
     @($meta,$message) | Set-Content -LiteralPath $Path -Encoding UTF8
 }
 function New-Context([string]$Repo, $Config, [bool]$AllowAncestor = $false) {
@@ -60,6 +70,13 @@ try {
     Write-Rollout $legacyPagePath $pageId $cwd $fresh -SessionId $threadId
     Assert-True ((Get-CodexSessionMeta $legacyPagePath).Id -eq $threadId) 'session_meta prefers session_id as the canonical thread when id identifies a page'
     Write-Rollout (Join-Path $repo "Codex\sessions\$key\2026\08\25\rollout-a.jsonl") $idA $cwd $fresh
+    $duplicateDir = Join-Path $repo "Codex\sessions\$key\2026\08\24"
+    New-Item -ItemType Directory -Path $duplicateDir -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repo "Codex\sessions\$key\2026\08\25\rollout-a.jsonl") -Destination (Join-Path $duplicateDir 'rollout-a.jsonl')
+    $duplicateRejected = $false
+    try { [void](Get-CodexSessionGroups (Join-Path $repo 'Codex\sessions')) } catch { $duplicateRejected = $true }
+    Assert-True $duplicateRejected 'duplicate logical rollout filename in different paths was accepted'
+    Remove-Item -LiteralPath $duplicateDir -Recurse -Force
     [ordered]@{id=$idA;title='A'} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $repo 'Codex\session_index.jsonl') -Encoding UTF8
     'NONE' | Set-Content -LiteralPath (Join-Path $repo 'ACTIVE_HOST.txt') -Encoding ASCII
     & git -C $repo init -q
@@ -93,10 +110,37 @@ try {
     Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).ContainsKey($idA)) 'Start materializes Vault Active locally'
     Assert-True ((Read-CodexCheckpoint $repo).ActiveIds -contains $idA) 'Start checkpoint records the active ID'
 
+    # Start must not replace a local append-only continuation with a stale Vault prefix. Replacing
+    # the prefix invalidates Codex thread_history byte offsets and hides every projected turn after
+    # the stale boundary.
+    $localA = Join-Path $codexHome 'sessions\2026\08\25\rollout-a.jsonl'
+    $localLengthBeforeSuffix = (Get-Item -LiteralPath $localA).Length
+    Add-Content -LiteralPath $localA -Value '{"type":"event_msg","payload":{"type":"local_suffix"},"timestamp":"2026-08-25T00:00:01.000Z"}' -Encoding UTF8
+    $suffixLength = (Get-Item -LiteralPath $localA).Length
+    $appendStartRoot = Join-Path $root 'AppendStartPlan'
+    New-Item -ItemType Directory -Path $appendStartRoot -Force | Out-Null
+    $appendStart = New-CodexStartPlan -Context (New-Context $repo $config) -PlanRoot $appendStartRoot
+    Assert-True (@($appendStart.LocalOperations | Where-Object RelativePath -eq 'sessions/2026/08/25/rollout-a.jsonl').Count -eq 0) 'Start does not overwrite a local append-only suffix with the Vault prefix'
+    Assert-True (@($appendStart.Warnings).Count -eq 1) 'Start reports the preserved local append-only suffix'
+    Apply-PlanOperations @($appendStart) LocalOperations $repo (Join-Path $root 'AppendStartTxn') $appendStartRoot
+    Assert-True ((Get-Item -LiteralPath $localA).Length -eq $suffixLength -and $suffixLength -gt $localLengthBeforeSuffix) 'Start preserves the complete local append-only rollout'
+
+    $divergent = [IO.File]::ReadAllBytes($localA)
+    $divergent[0] = if ($divergent[0] -eq 123) { 91 } else { 123 }
+    [IO.File]::WriteAllBytes($localA, $divergent)
+    $divergenceRejected = $false
+    try { [void](New-CodexStartPlan -Context (New-Context $repo $config) -PlanRoot (Join-Path $root 'DivergentStartPlan')) } catch { $divergenceRejected = $true }
+    Assert-True $divergenceRejected 'Start refuses a non-append rollout divergence instead of overwriting local history'
+
     # A is deleted. B is a two-page live thread. C is a stale new thread.
     Remove-Item -LiteralPath (Join-Path $codexHome 'sessions') -Recurse -Force
-    Write-Rollout (Join-Path $codexHome 'sessions\2026\08\25\rollout-b-page1.jsonl') $idB $cwd $fresh
-    Write-Rollout (Join-Path $codexHome 'sessions\2026\08\25\rollout-b-page2.jsonl') $idB $cwd $fresh
+    $idBPage2 = '77777777-7777-4777-8777-777777777777'
+    $idBRootPath = Join-Path $codexHome "sessions\2026\08\25\rollout-2026-08-25T00-00-00-$idB.jsonl"
+    Write-Rollout $idBRootPath $idB $cwd $fresh
+    $idBRootBytes = [IO.File]::ReadAllBytes($idBRootPath)
+    $idBFirstBoundary = [Array]::IndexOf($idBRootBytes, [byte]10) + 1
+    Write-Rollout (Join-Path $codexHome "sessions\2026\08\25\rollout-2026-08-25T00-01-00-${idB}_$idBPage2.jsonl") $idBPage2 $cwd $fresh `
+        -SessionId $idB -BasePageId $idB -BaseEndByte $idBFirstBoundary -BaseEndOrdinal 1
     Write-Rollout (Join-Path $codexHome 'archived_sessions\2026\05\01\rollout-c.jsonl') $idC $cwd $stale
     @(
         ([ordered]@{id=$idB;title='B'} | ConvertTo-Json -Compress),

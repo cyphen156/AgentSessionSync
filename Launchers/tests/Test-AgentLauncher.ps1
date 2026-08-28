@@ -46,21 +46,41 @@ try {
     }
 
     $script:testProcessRunning = $true
-    $fakeProcess = [pscustomobject]@{
+    $rootProcess = [pscustomobject]@{
         Id = 4242
         MainWindowHandle = 123
         Path = $hiddenPackageProcess.Path
     }
+    $childProcess = [pscustomobject]@{
+        Id = 4243
+        MainWindowHandle = 0
+        Path = 'C:\Tools\child.exe'
+    }
     $script:closeRequestWindow = $null
+    $script:terminatedRoots = New-Object 'Collections.Generic.List[int]'
     function Send-AgentCloseRequest {
         param([IntPtr]$WindowHandle)
         $script:closeRequestWindow = [long]$WindowHandle
         return $true
     }
     function Get-AgentProcessTree {
-        if ($script:testProcessRunning) { @($fakeProcess) } else { @() }
+        if ($script:testProcessRunning) { @($rootProcess, $childProcess) } else { @() }
     }
     function Get-AgentTopLevelWindows { @([IntPtr]123) }
+    function Get-SystemProcessSnapshot {
+        @(
+            [pscustomobject]@{ProcessId=4242;ParentProcessId=100;Name='TestAgent.exe';ExecutablePath=$hiddenPackageProcess.Path},
+            [pscustomobject]@{ProcessId=4243;ParentProcessId=4242;Name='child.exe';ExecutablePath='C:\Tools\child.exe'}
+        )
+    }
+    function Stop-AgentProcessTree {
+        param([int]$ProcessId)
+        [void]$script:terminatedRoots.Add($ProcessId)
+        $script:testProcessRunning = $false
+        return $true
+    }
+
+    # Restore and other callers retain the non-forcing contract.
     $closeRejected = $false
     try {
         Stop-AgentGracefully ([pscustomobject]@{ Name = 'TestAgent'; ProcessNames = @('TestAgent') }) 0
@@ -74,7 +94,14 @@ try {
         throw 'A lingering process was force-terminated instead of cancelling the operation.'
     }
 
-    Write-Host "[PASS] Loaded $($agents.Count) agents, validated shortcuts, and rejected force termination." -ForegroundColor Green
+    # Finish explicitly authorizes the verified registered root-tree fallback.
+    Stop-AgentGracefully ([pscustomobject]@{ Name = 'TestAgent'; ProcessNames = @('TestAgent') }) 0 -ForceProcessTree
+    if ($script:testProcessRunning) { throw 'The lingering registered process tree was not terminated.' }
+    if ($script:terminatedRoots.Count -ne 1 -or $script:terminatedRoots[0] -ne 4242) {
+        throw "Process-tree fallback did not target only the registered root: $($script:terminatedRoots -join ',')"
+    }
+
+    Write-Host "[PASS] Loaded $($agents.Count) agents, validated shortcuts, preserved non-force callers, and terminated only the registered root tree for Finish." -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }

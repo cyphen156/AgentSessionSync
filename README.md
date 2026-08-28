@@ -57,7 +57,8 @@ Vault의 Archived 상태를 결정하는 신호나 보관 장소가 아닙니다
 ## Finish
 
 1. 등록된 앱에 정상 종료를 요청하고 완전히 닫혔는지 확인합니다.
-2. 종료되지 않으면 강제 종료하지 않고 중단합니다.
+2. 트레이 상주 프로세스가 남으면 새로 확인한 등록 앱 루트만 `taskkill /T /F`로 종료하고,
+   전체 프로세스 트리가 사라진 경우에만 계속합니다.
 3. 앱 형식과 현재 로컬 원문을 다시 검사합니다.
 4. 각 앱 adapter가 앱별 삭제 신호와 현재 로컬 존재 집합을 판정합니다.
 5. 최종 삭제로 확인된 대화만 Vault 최신 트리에서 제거합니다.
@@ -99,6 +100,8 @@ commit/push로 확정합니다.
 
 - canonical ID는 파일명이 아니라 첫 `session_meta`에서 읽습니다. `session_id`가 있으면 thread ID로 우선하고, 최신 형식처럼 없으면 `id`를 사용합니다.
 - 같은 thread의 여러 page 파일은 canonical ID 하나로 묶습니다.
+- continuation의 `history_base`는 predecessor page 존재 여부뿐 아니라 `end_byte_offset`의 JSONL 행 경계와
+  `end_ordinal_exclusive`도 검사합니다. 길이만 충분하고 내용이 바뀐 predecessor는 허용하지 않습니다.
 - 마지막 활동 시각은 모든 page의 최상위 레코드 중 timestamp가 있는 마지막 레코드로 판정합니다.
 - 파일 mtime, 파일명 날짜, Git commit 시각은 활동 시각으로 쓰지 않습니다.
 - `state_5.sqlite`를 복사하거나 직접 수정하지 않습니다.
@@ -167,6 +170,7 @@ Codex/archive/<cwd-key>/YYYY/MM/DD/*.jsonl[.gz]
 .\Launchers\tests\Test-AgentSessionSync.ps1
 .\Launchers\tests\Test-ClaudeSessionState.ps1
 .\Launchers\tests\Test-AgentSessionIntegration.ps1
+.\Launchers\tests\Test-CodexStateContract.ps1
 ```
 
 마지막 통합 테스트는 Codex와 Claude가 한 번의 Publish를 공유하는지, 한쪽 실패 시 전체가 무변경인지,

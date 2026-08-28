@@ -18,6 +18,7 @@ function Get-CodexSessionMeta {
             $idProperty = $record.payload.PSObject.Properties['id']
             $sessionIdProperty = $record.payload.PSObject.Properties['session_id']
             $cwdProperty = $record.payload.PSObject.Properties['cwd']
+            $historyBaseProperty = $record.payload.PSObject.Properties['history_base']
             $id = if ($null -ne $idProperty) { [string]$idProperty.Value } else { '' }
             $sessionId = if ($null -ne $sessionIdProperty) { [string]$sessionIdProperty.Value } else { '' }
             $cwd = if ($null -ne $cwdProperty) { [string]$cwdProperty.Value } else { '' }
@@ -25,7 +26,28 @@ function Get-CodexSessionMeta {
             # canonical thread. Current rollouts may expose only id.
             $canonical = if ($sessionId) { $sessionId } else { $id }
             if (-not $canonical) { throw "Codex session_meta has no canonical ID: $Path" }
-            return [pscustomobject]@{Id=$canonical;Cwd=$cwd}
+            $logicalName = [IO.Path]::GetFileName($Path) -replace '\.gz$', '' -replace '\.jsonl$', ''
+            $uuidPattern = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+            $pageId = if ($logicalName -match "_($uuidPattern)$") { [string]$Matches[1] } elseif ($id) { $id } else { $canonical }
+            $historyBaseThreadId = ''
+            $historyBaseEndByte = $null
+            $historyBaseEndOrdinal = $null
+            if ($null -ne $historyBaseProperty -and $null -ne $historyBaseProperty.Value) {
+                $baseThreadProperty = $historyBaseProperty.Value.PSObject.Properties['thread_id']
+                $baseByteProperty = $historyBaseProperty.Value.PSObject.Properties['end_byte_offset']
+                $baseOrdinalProperty = $historyBaseProperty.Value.PSObject.Properties['end_ordinal_exclusive']
+                if ($null -ne $baseThreadProperty) { $historyBaseThreadId = [string]$baseThreadProperty.Value }
+                if ($null -ne $baseByteProperty) { $historyBaseEndByte = [int64]$baseByteProperty.Value }
+                if ($null -ne $baseOrdinalProperty) { $historyBaseEndOrdinal = [int64]$baseOrdinalProperty.Value }
+            }
+            return [pscustomobject]@{
+                Id = $canonical
+                PageId = $pageId
+                Cwd = $cwd
+                HistoryBaseThreadId = $historyBaseThreadId
+                HistoryBaseEndByte = $historyBaseEndByte
+                HistoryBaseEndOrdinal = $historyBaseEndOrdinal
+            }
         }
         throw "Codex rollout has no readable session_meta: $Path"
     } finally {
@@ -50,6 +72,151 @@ function Write-CodexIndexLines {
     Write-AgentSessionUtf8File -Path $Path -Content $content
 }
 
+function Get-CodexLogicalFileLength {
+    param([Parameter(Mandatory)][string]$Path)
+    $info = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($Path -notlike '*.gz') { return [int64]$info.Length }
+
+    $rawStream = $null
+    $gzipStream = $null
+    try {
+        $rawStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $Path), [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $gzipStream = [IO.Compression.GZipStream]::new($rawStream, [IO.Compression.CompressionMode]::Decompress, $false)
+        $buffer = New-Object byte[] 65536
+        [int64]$length = 0
+        while (($read = $gzipStream.Read($buffer, 0, $buffer.Length)) -gt 0) { $length += $read }
+        return $length
+    } finally {
+        if ($gzipStream) { $gzipStream.Dispose() }
+        if ($rawStream) { $rawStream.Dispose() }
+    }
+}
+
+function Assert-CodexHistoryBoundary {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int64]$EndByte,
+        [Nullable[int64]]$EndOrdinalExclusive = $null
+    )
+    if ($EndByte -lt 0) { throw "Codex history_base 바이트 경계가 음수입니다: $Path ($EndByte)" }
+
+    $rawStream = $null
+    $gzipStream = $null
+    try {
+        $rawStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $Path), [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        [byte[]]$lastCompleteLine = $null
+        [byte[]]$nextCompleteLine = $null
+
+        if ($Path -notlike '*.gz') {
+            if ($rawStream.Length -lt $EndByte) {
+                throw "Codex predecessor rollout이 요구 바이트 경계보다 짧습니다: $Path ($($rawStream.Length) < $EndByte)"
+            }
+            if ($EndByte -gt 0) {
+                [void]$rawStream.Seek($EndByte - 1, [IO.SeekOrigin]::Begin)
+                if ($rawStream.ReadByte() -ne 10) {
+                    throw "Codex history_base 바이트 위치가 JSONL 레코드 경계가 아닙니다: $Path ($EndByte)"
+                }
+                [int64]$lineStart = 0
+                [int64]$scanEnd = $EndByte - 2
+                $scanBuffer = New-Object byte[] 65536
+                $found = $false
+                while ($scanEnd -ge 0 -and -not $found) {
+                    $scanStart = [Math]::Max([int64]0, $scanEnd - $scanBuffer.Length + 1)
+                    $scanCount = [int]($scanEnd - $scanStart + 1)
+                    [void]$rawStream.Seek($scanStart, [IO.SeekOrigin]::Begin)
+                    $actual = $rawStream.Read($scanBuffer, 0, $scanCount)
+                    for ($i = $actual - 1; $i -ge 0; $i--) {
+                        if ($scanBuffer[$i] -eq 10) { $lineStart = $scanStart + $i + 1; $found = $true; break }
+                    }
+                    $scanEnd = $scanStart - 1
+                }
+                $lineLength = [int](($EndByte - 1) - $lineStart)
+                $lastCompleteLine = New-Object byte[] $lineLength
+                [void]$rawStream.Seek($lineStart, [IO.SeekOrigin]::Begin)
+                if ($lineLength -gt 0) { [void]$rawStream.Read($lastCompleteLine, 0, $lineLength) }
+            }
+            if ($rawStream.Length -gt $EndByte) {
+                [void]$rawStream.Seek($EndByte, [IO.SeekOrigin]::Begin)
+                $nextBuffer = [IO.MemoryStream]::new()
+                try {
+                    while (($value = $rawStream.ReadByte()) -ge 0 -and $value -ne 10) { $nextBuffer.WriteByte([byte]$value) }
+                    $nextCompleteLine = $nextBuffer.ToArray()
+                } finally { $nextBuffer.Dispose() }
+            }
+        } else {
+            $gzipStream = [IO.Compression.GZipStream]::new($rawStream, [IO.Compression.CompressionMode]::Decompress, $true)
+            $buffer = New-Object byte[] 65536
+            $currentLine = [IO.MemoryStream]::new()
+            try {
+                [int64]$position = 0
+                while ($position -lt $EndByte) {
+                    $wanted = [int][Math]::Min([int64]$buffer.Length, $EndByte - $position)
+                    $read = $gzipStream.Read($buffer, 0, $wanted)
+                    if ($read -le 0) { throw "Codex predecessor rollout이 요구 바이트 경계보다 짧습니다: $Path ($position < $EndByte)" }
+                    $segmentStart = 0
+                    while ($segmentStart -lt $read) {
+                        $newline = [Array]::IndexOf($buffer, [byte]10, $segmentStart, $read - $segmentStart)
+                        if ($newline -lt 0) { $currentLine.Write($buffer, $segmentStart, $read - $segmentStart); break }
+                        if ($newline -gt $segmentStart) { $currentLine.Write($buffer, $segmentStart, $newline - $segmentStart) }
+                        $lastCompleteLine = $currentLine.ToArray()
+                        $currentLine.SetLength(0)
+                        $segmentStart = $newline + 1
+                    }
+                    $position += $read
+                }
+                if ($EndByte -gt 0 -and $currentLine.Length -ne 0) {
+                    throw "Codex history_base 바이트 위치가 JSONL 레코드 경계가 아닙니다: $Path ($EndByte)"
+                }
+                $nextBuffer = [IO.MemoryStream]::new()
+                try {
+                    $done = $false
+                    while (-not $done -and ($read = $gzipStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                        $newline = [Array]::IndexOf($buffer, [byte]10, 0, $read)
+                        if ($newline -ge 0) { if ($newline -gt 0) { $nextBuffer.Write($buffer, 0, $newline) }; $done = $true }
+                        else { $nextBuffer.Write($buffer, 0, $read) }
+                    }
+                    if ($nextBuffer.Length -gt 0) { $nextCompleteLine = $nextBuffer.ToArray() }
+                } finally { $nextBuffer.Dispose() }
+            } finally { $currentLine.Dispose() }
+        }
+
+        $lastOrdinal = $null
+        if ($EndByte -gt 0) {
+            if ($null -eq $lastCompleteLine) { throw "Codex history_base 앞에 완전한 JSONL 레코드가 없습니다: $Path ($EndByte)" }
+            try {
+                $lastText = [Text.Encoding]::UTF8.GetString($lastCompleteLine).TrimStart([char]0xFEFF).TrimEnd("`r")
+                $lastRecord = $lastText | ConvertFrom-Json
+                $lastOrdinalProperty = $lastRecord.PSObject.Properties['ordinal']
+                if ($null -ne $lastOrdinalProperty) { $lastOrdinal = [int64]$lastOrdinalProperty.Value }
+            } catch { throw "Codex history_base 직전 JSONL 레코드를 읽을 수 없습니다: $Path ($EndByte)" }
+        }
+
+        $nextOrdinal = $null
+        if ($null -ne $nextCompleteLine -and $nextCompleteLine.Length -gt 0) {
+            try {
+                $nextText = [Text.Encoding]::UTF8.GetString($nextCompleteLine).TrimStart([char]0xFEFF).TrimEnd("`r")
+                $nextRecord = $nextText | ConvertFrom-Json
+                $nextOrdinalProperty = $nextRecord.PSObject.Properties['ordinal']
+                if ($null -ne $nextOrdinalProperty) { $nextOrdinal = [int64]$nextOrdinalProperty.Value }
+            } catch { throw "Codex history_base 직후 JSONL 레코드를 읽을 수 없습니다: $Path ($EndByte)" }
+        }
+
+        if ($null -ne $EndOrdinalExclusive) {
+            if ($EndByte -gt 0 -and ($null -eq $lastOrdinal -or $lastOrdinal -ne ($EndOrdinalExclusive - 1))) {
+                throw "Codex history_base 직전 ordinal이 일치하지 않습니다: $Path ($lastOrdinal != $($EndOrdinalExclusive - 1))"
+            }
+            if ($null -ne $nextOrdinal -and $nextOrdinal -ne $EndOrdinalExclusive) {
+                throw "Codex history_base 직후 ordinal이 일치하지 않습니다: $Path ($nextOrdinal != $EndOrdinalExclusive)"
+            }
+        }
+    } finally {
+        if ($gzipStream) { $gzipStream.Dispose() }
+        if ($rawStream) { $rawStream.Dispose() }
+    }
+}
+
 function Get-CodexSessionGroups {
     param([Parameter(Mandatory)][string]$Root)
     $groups = @{}
@@ -60,6 +227,15 @@ function Get-CodexSessionGroups {
         $raw = @($_.Group | Where-Object Name -like '*.jsonl' | Select-Object -First 1)
         if ($raw) { $raw[0] } else { $_.Group[0] }
     })
+    $logicalFiles = @{}
+    foreach ($file in $files) {
+        $logicalName = $file.Name -replace '\.gz$', ''
+        if ($logicalFiles.ContainsKey($logicalName)) {
+            throw ("Codex rollout 논리 파일명이 여러 경로에 중복되어 있습니다: $logicalName`n" +
+                "$($logicalFiles[$logicalName])`n$($file.FullName)")
+        }
+        $logicalFiles[$logicalName] = $file.FullName
+    }
     foreach ($file in $files) {
         $meta = Get-CodexSessionMeta $file.FullName
         $cwdKey = if ([string]::IsNullOrWhiteSpace($meta.Cwd)) { '_no-cwd' } else { ConvertTo-SessionPathKey $meta.Cwd }
@@ -68,11 +244,37 @@ function Get-CodexSessionGroups {
                 Id = [string]$meta.Id
                 CwdKey = $cwdKey
                 Files = New-Object 'Collections.Generic.List[object]'
+                Pages = @{}
+                HistoryBases = New-Object 'Collections.Generic.List[object]'
             }
         } elseif (-not [string]::Equals($groups[$meta.Id].CwdKey, $cwdKey, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Codex canonical ID가 서로 다른 cwd를 가리킵니다: $($meta.Id)"
         }
+        if ($groups[$meta.Id].Pages.ContainsKey($meta.PageId)) {
+            throw "Codex page ID가 여러 rollout에 중복되어 있습니다: $($meta.PageId)"
+        }
+        $groups[$meta.Id].Pages[$meta.PageId] = $file
+        if ($meta.HistoryBaseThreadId) {
+            [void]$groups[$meta.Id].HistoryBases.Add([pscustomobject]@{
+                PageId = $meta.PageId
+                BasePageId = $meta.HistoryBaseThreadId
+                BaseEndByte = $meta.HistoryBaseEndByte
+                BaseEndOrdinal = $meta.HistoryBaseEndOrdinal
+            })
+        }
         [void]$groups[$meta.Id].Files.Add($file)
+    }
+    foreach ($group in $groups.Values) {
+        foreach ($historyBase in $group.HistoryBases) {
+            if (-not $group.Pages.ContainsKey($historyBase.BasePageId)) {
+                throw "Codex continuation의 predecessor rollout이 없습니다: $($historyBase.PageId) -> $($historyBase.BasePageId)"
+            }
+            if ($null -ne $historyBase.BaseEndByte) {
+                $baseFile = $group.Pages[$historyBase.BasePageId]
+                Assert-CodexHistoryBoundary -Path $baseFile.FullName -EndByte ([int64]$historyBase.BaseEndByte) `
+                    -EndOrdinalExclusive $historyBase.BaseEndOrdinal
+            }
+        }
     }
     return $groups
 }
@@ -187,6 +389,36 @@ function New-CodexVaultFileOperation {
         -SourceRelativePath $sourceRelative -SourceCommit $Commit -SourceSha256 (Get-AgentSessionFileSha256 $SourcePath)
 }
 
+function Test-CodexFileHasPrefix {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$PrefixPath
+    )
+    $pathInfo = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $prefixInfo = Get-Item -LiteralPath $PrefixPath -ErrorAction Stop
+    if ($prefixInfo.Length -gt $pathInfo.Length) { return $false }
+
+    $pathStream = $null; $prefixStream = $null
+    try {
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $pathStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $pathInfo.FullName), [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $prefixStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $prefixInfo.FullName), [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $pathBuffer = New-Object byte[] 65536
+        $prefixBuffer = New-Object byte[] 65536
+        while (($prefixRead = $prefixStream.Read($prefixBuffer, 0, $prefixBuffer.Length)) -gt 0) {
+            $pathRead = $pathStream.Read($pathBuffer, 0, $prefixRead)
+            if ($pathRead -ne $prefixRead) { return $false }
+            for ($i = 0; $i -lt $prefixRead; $i++) {
+                if ($pathBuffer[$i] -ne $prefixBuffer[$i]) { return $false }
+            }
+        }
+        return $true
+    } finally {
+        if ($prefixStream) { $prefixStream.Dispose() }
+        if ($pathStream) { $pathStream.Dispose() }
+    }
+}
+
 function New-CodexStartPlan {
     param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][string]$PlanRoot)
     $repoRoot = [string]$Context.RepoRoot
@@ -205,6 +437,7 @@ function New-CodexStartPlan {
     }
 
     $operations = New-Object 'Collections.Generic.List[object]'
+    $warnings = New-Object 'Collections.Generic.List[string]'
     $vaultActive = @{}
     foreach ($id in $tiers.Active.Keys) { $vaultActive[$id] = $true }
     if ($checkpoint.Exists) {
@@ -230,15 +463,39 @@ function New-CodexStartPlan {
         }
         foreach ($file in $tiers.Active[$id].Files) {
             $nativeRelative = Get-CodexNativeRelativePath -TransportRoot (Join-Path $repoRoot 'Codex\sessions') -Path $file.FullName
+            $sourcePath = $file.FullName
+            $sourceKind = 'VaultFile'
             if ($file.Name -like '*.jsonl.gz') {
                 $nativeRelative = $nativeRelative.Substring(0, $nativeRelative.Length - 3).Replace('\', '/')
                 $expanded = Join-Path $PlanRoot ('codex-expand-' + [guid]::NewGuid().ToString('N') + '.jsonl')
                 [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded)
-                [void]$operations.Add((New-AgentSessionPutOperation -TargetRoot CodexHome -RelativePath ('sessions/' + $nativeRelative) `
-                    -SourceKind StagedFile -SourcePath $expanded -SourceSha256 (Get-AgentSessionFileSha256 $expanded)))
+                $sourcePath = $expanded
+                $sourceKind = 'StagedFile'
+            }
+
+            $targetRelative = 'sessions/' + $nativeRelative.Replace('\', '/')
+            $targetPath = Join-Path $config.CodexHome ($targetRelative.Replace('/', [IO.Path]::DirectorySeparatorChar))
+            $sourceSha = Get-AgentSessionFileSha256 $sourcePath
+            $shouldPut = $true
+            if (Test-Path -LiteralPath $targetPath -PathType Leaf) {
+                $targetSha = Get-AgentSessionFileSha256 $targetPath
+                if ([string]::Equals($sourceSha, $targetSha, [StringComparison]::OrdinalIgnoreCase)) {
+                    $shouldPut = $false
+                } elseif (Test-CodexFileHasPrefix -Path $targetPath -PrefixPath $sourcePath) {
+                    $shouldPut = $false
+                    [void]$warnings.Add("Codex 로컬 rollout의 append 전용 최신 suffix를 보존합니다: $targetRelative")
+                } elseif (-not (Test-CodexFileHasPrefix -Path $sourcePath -PrefixPath $targetPath)) {
+                    throw "Codex rollout이 append 전용 계보가 아닌 상태로 갈라졌습니다: $targetRelative`n로컬과 Vault 원문을 백업한 뒤 충돌을 정리하세요."
+                }
+            }
+            if (-not $shouldPut) { continue }
+
+            if ($sourceKind -eq 'StagedFile') {
+                [void]$operations.Add((New-AgentSessionPutOperation -TargetRoot CodexHome -RelativePath $targetRelative `
+                    -SourceKind StagedFile -SourcePath $sourcePath -SourceSha256 $sourceSha))
             } else {
                 [void]$operations.Add((New-CodexVaultFileOperation -RepoRoot $repoRoot -Commit $Context.VaultCommit -SourcePath $file.FullName `
-                    -TargetRoot CodexHome -TargetRelative ('sessions/' + $nativeRelative.Replace('\', '/'))))
+                    -TargetRoot CodexHome -TargetRelative $targetRelative))
             }
         }
     }
@@ -250,7 +507,7 @@ function New-CodexStartPlan {
     [void]$operations.Add((New-AgentSessionPutOperation -TargetRoot CodexHome -RelativePath 'session_index.jsonl' -SourceKind StagedFile `
         -SourcePath $indexArtifact.Path -SourceSha256 $indexArtifact.Sha256))
 
-    New-CodexPlanObject -Phase Start -Context $Context -VaultOperations @() -LocalOperations @($operations | ForEach-Object { $_ }) `
+    New-CodexPlanObject -Phase Start -Context $Context -VaultOperations @() -LocalOperations @($operations | ForEach-Object { $_ }) -Warnings @($warnings | ForEach-Object { $_ }) `
         -Result ([pscustomobject]@{ ActiveIds = @($tiers.Active.Keys); DeletedIds = @(); ArchivedIds = @(); RestoredIds = @(); MissingIds = @(); LocalActiveIds = $finalLocalIds })
 }
 
