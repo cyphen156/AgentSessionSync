@@ -45,11 +45,13 @@ Vault의 Archived 상태를 결정하는 신호나 보관 장소가 아닙니다
 ## Start
 
 1. Vault를 `git pull --ff-only`로 갱신합니다.
-2. 지원하는 세션 형식인지 검사합니다.
-3. Vault Active를 로컬 활성 저장소에 배치합니다.
-4. Vault Archived와 최신 트리에서 삭제된 기존 세션을 로컬 활성 저장소에서 제거합니다.
-5. Vault에 아직 없는 로컬 신규 세션은 보존합니다.
-6. 로컬 체크포인트를 갱신하고 등록된 앱을 실행합니다.
+2. baton을 claim하기 전에 세션 형식, 계보, 원본 SHA를 읽기 전용으로 사전 검사합니다.
+3. 사전 검사가 통과한 동일 Vault에서 baton을 claim하고 계획을 다시 검증합니다.
+4. Vault Active를 로컬 활성 저장소에 배치합니다.
+5. Vault Archived와 최신 트리에서 삭제된 기존 세션을 로컬 활성 저장소에서 제거합니다.
+6. Vault에 아직 없는 로컬 신규 세션은 보존합니다.
+7. 로컬 체크포인트를 갱신하고 등록된 앱을 실행합니다. claim 이후 적용이 실패해 로컬 변경이
+   롤백되면, 원격과 로컬이 여전히 해당 claim commit일 때만 이전 baton 값으로 자동 복구합니다.
 
 로컬 체크포인트는 `%LOCALAPPDATA%\AgentSessionSync\State`에 저장합니다. 대화 원문이나 공유 상태가
 아니며, 마지막으로 이 PC에 반영한 Vault commit과 Active ID 집합만 기록합니다.
@@ -69,6 +71,14 @@ Vault의 Archived 상태를 결정하는 신호나 보관 장소가 아닙니다
 8. 마지막 timestamp가 30일 기준을 넘은 Active 대화를 Archived로 이동합니다.
 9. Active/Archived 배타성과 원문 형식을 검증한 뒤 commit/push합니다.
 10. fetch 후 `HEAD == origin`을 확인한 다음에만 로컬 정리와 체크포인트 갱신을 수행합니다.
+
+세션 운송물(`.jsonl`, `.jsonl.gz`, `.entry.json`)은 Git text/EOL 필터를 적용하지 않고 원본
+바이트를 그대로 보존합니다. 큰 Codex JSONL은 raw 길이·SHA-256과 gzip 길이·SHA-256 네 값을
+무결성 metadata에 기록하며, 네 값이 모두 일치할 때만 기존 gzip을 재사용합니다. Start와 Restore는
+압축물과 복원된 raw 양쪽을 이 metadata로 검증합니다.
+
+일반 Finish의 secret scan은 이번 계획에서 새로 쓰거나 바뀐 세션 payload만 검사합니다. 탐지 패턴을
+갱신했거나 전체 재검사가 필요하면 `Push-Sessions.ps1 -FullSecretScan`을 명시적으로 실행합니다.
 
 Codex에서 `C`는 `sessions ∪ archived_sessions`입니다. 보관함에 있는 동안에는 아직 삭제된 것이
 아니며, 보관함에서 최종 삭제되어 두 위치 모두에서 사라졌을 때만 삭제로 판정합니다.

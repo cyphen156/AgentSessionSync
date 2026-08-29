@@ -1,0 +1,5 @@
+# Session payloads are byte transports. Never apply Git text or EOL filters.
+*.jsonl                   -text
+*.jsonl.gz                -text
+*.entry.json              -text
+*.jsonl.gz.integrity.json -text

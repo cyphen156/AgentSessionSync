@@ -90,6 +90,47 @@ try {
 
     $config = [pscustomobject]@{ CodexHome=$codexHome;ClaudeHome=(Join-Path $root 'ClaudeHome');ActiveWindowDays=30;TransportFileLimitBytes=99614720 }
 
+    # Synthetic transport fixtures are written with their intended bytes from the outset.
+    $transportRoot = Join-Path $root 'Transport'
+    New-Item -ItemType Directory -Path $transportRoot -Force | Out-Null
+    $rawTransport = Join-Path $transportRoot 'raw.jsonl'
+    [IO.File]::WriteAllText($rawTransport, "{`"type`":`"event_msg`"}`n", [Text.UTF8Encoding]::new($false))
+    $gzipTransport = Join-Path $transportRoot 'raw.jsonl.gz'
+    Compress-JsonlTransportFile -Source $rawTransport -Destination $gzipTransport
+    $integrityArtifact = New-CompressedJsonlIntegrityArtifact -Raw $rawTransport -Compressed $gzipTransport -PlanRoot $transportRoot -Name 'raw'
+    Assert-True (Test-CompressedJsonlTransportCurrent -Source $rawTransport -Compressed $gzipTransport -IntegrityPath $integrityArtifact.Path) 'gzip cache requires matching raw and gzip SHA-256 plus lengths'
+    $differentRaw = Join-Path $transportRoot 'different.jsonl'
+    [IO.File]::WriteAllText($differentRaw, "{`"type`":`"different`"}`n", [Text.UTF8Encoding]::new($false))
+    Assert-True (-not (Test-CompressedJsonlTransportCurrent -Source $differentRaw -Compressed $gzipTransport -IntegrityPath $integrityArtifact.Path)) 'gzip cache rejects a different raw payload'
+    $expandedTransport = Join-Path $transportRoot 'expanded.jsonl'
+    Assert-True (Expand-JsonlTransportFile -Source $gzipTransport -Destination $expandedTransport -IntegrityPath $integrityArtifact.Path) 'verified gzip expands successfully'
+    Assert-True ((Get-AgentSessionFileSha256 $expandedTransport) -eq (Get-AgentSessionFileSha256 $rawTransport)) 'expanded gzip reproduces the exact raw bytes'
+    $corruptGzip = Join-Path $transportRoot 'corrupt.jsonl.gz'
+    [IO.File]::WriteAllBytes($corruptGzip, [IO.File]::ReadAllBytes($gzipTransport))
+    $corruptBytes = [IO.File]::ReadAllBytes($corruptGzip)
+    $corruptBytes[$corruptBytes.Length - 1] = $corruptBytes[$corruptBytes.Length - 1] -bxor 1
+    [IO.File]::WriteAllBytes($corruptGzip, $corruptBytes)
+    $corruptRejected = $false
+    try { [void](Expand-JsonlTransportFile -Source $corruptGzip -Destination (Join-Path $transportRoot 'corrupt-expanded.jsonl') -IntegrityPath $integrityArtifact.Path) } catch { $corruptRejected = $true }
+    Assert-True $corruptRejected 'gzip restore rejects corrupted compressed bytes before expansion'
+
+    $transportRepo = Join-Path $root 'TransportRepo'
+    $transportClone = Join-Path $root 'TransportClone'
+    New-Item -ItemType Directory -Path $transportRepo -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $launchers) '.gitattributes') -Destination (Join-Path $transportRepo '.gitattributes')
+    [IO.File]::WriteAllBytes((Join-Path $transportRepo 'native-lf.jsonl'), [Text.UTF8Encoding]::new($false).GetBytes("{`"eol`":`"lf`"}`n"))
+    [IO.File]::WriteAllBytes((Join-Path $transportRepo 'native-crlf.jsonl'), [Text.UTF8Encoding]::new($false).GetBytes("{`"eol`":`"crlf`"}`r`n"))
+    [IO.File]::WriteAllBytes((Join-Path $transportRepo 'native.entry.json'), [Text.UTF8Encoding]::new($false).GetBytes("{`"entry`":true}`r`n"))
+    & git -C $transportRepo init -q
+    & git -C $transportRepo config user.email test@example.com
+    & git -C $transportRepo config user.name Test
+    & git -C $transportRepo add -A
+    & git -C $transportRepo commit -qm transport
+    & git -c core.autocrlf=true clone -q $transportRepo $transportClone
+    foreach ($name in @('native-lf.jsonl','native-crlf.jsonl','native.entry.json')) {
+        Assert-True ((Get-AgentSessionFileSha256 (Join-Path $transportRepo $name)) -eq (Get-AgentSessionFileSha256 (Join-Path $transportClone $name))) "Git checkout preserves exact transport bytes: $name"
+    }
+
     # First Start rejects any pre-existing local session without a checkpoint.
     Write-Rollout (Join-Path $codexHome 'sessions\2026\08\25\residue.jsonl') '99999999-9999-4999-8999-999999999999' $cwd $fresh
     $guard = $false
@@ -141,6 +182,7 @@ try {
     $idBFirstBoundary = [Array]::IndexOf($idBRootBytes, [byte]10) + 1
     Write-Rollout (Join-Path $codexHome "sessions\2026\08\25\rollout-2026-08-25T00-01-00-${idB}_$idBPage2.jsonl") $idBPage2 $cwd $fresh `
         -SessionId $idB -BasePageId $idB -BaseEndByte $idBFirstBoundary -BaseEndOrdinal 1
+    [IO.File]::AppendAllText($idBRootPath, (([ordered]@{type='event_msg';payload=[ordered]@{type='synthetic_large';text=('x' * 5000)};timestamp=$fresh;ordinal=2} | ConvertTo-Json -Compress) + "`r`n"), [Text.UTF8Encoding]::new($false))
     Write-Rollout (Join-Path $codexHome 'archived_sessions\2026\05\01\rollout-c.jsonl') $idC $cwd $stale
     @(
         ([ordered]@{id=$idB;title='B'} | ConvertTo-Json -Compress),
@@ -149,6 +191,7 @@ try {
 
     $finishRoot = Join-Path $root 'FinishPlan'
     New-Item -ItemType Directory -Path $finishRoot -Force | Out-Null
+    $config.TransportFileLimitBytes = 1000
     $context = New-Context $repo $config
     $finish = New-CodexFinishPlan -Context $context -PlanRoot $finishRoot
     Assert-True (-not (& git -C $repo status --porcelain)) 'Finish planning does not mutate the Vault'
@@ -173,6 +216,13 @@ try {
     Assert-True ($tiers.Archived.ContainsKey($idC)) 'aged thread exists only in archive'
     Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).Keys.Count -eq 1) 'post-publish local cleanup leaves the final active set'
     Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'archived_sessions')).Count -eq 0) 'post-publish cleanup removes the app archive copy'
+
+    $cachedGzip = Join-Path $repo "Codex\sessions\$key\2026\08\25\rollout-2026-08-25T00-00-00-$idB.jsonl.gz"
+    Assert-True ((Test-Path -LiteralPath $cachedGzip) -and (Test-Path -LiteralPath (Get-CompressedJsonlIntegrityPath $cachedGzip))) 'first Finish publishes gzip with raw and gzip integrity metadata'
+    $secondFinishRoot = Join-Path $root 'SecondFinishPlan'
+    New-Item -ItemType Directory -Path $secondFinishRoot -Force | Out-Null
+    $secondFinish = New-CodexFinishPlan -Context (New-Context $repo $config) -PlanRoot $secondFinishRoot
+    Assert-True (@(Get-ChildItem -LiteralPath $secondFinishRoot -File -Recurse -Filter '*.gz').Count -eq 0) 'unchanged second Finish reuses verified gzip without recompression'
 
     # Restore is also a plan and does not mutate until the common transaction applies it.
     $restoreRoot = Join-Path $root 'RestorePlan'

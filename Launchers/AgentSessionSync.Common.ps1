@@ -114,43 +114,67 @@ function Compress-JsonlTransportFile {
     }
 }
 
-function Test-CompressedJsonlTransportCurrent {
-    <#
-      변경되지 않은 append-only JSONL을 매 Push마다 다시 검사·압축하지 않도록
-      기존 gzip 운반물이 현재 raw 스냅숏과 같은지를 저비용으로 판정한다.
+function Get-CompressedJsonlIntegrityPath {
+    param([Parameter(Mandatory)][string]$Compressed)
+    $Compressed + '.integrity.json'
+}
 
-      Compress-JsonlTransportFile은 gzip의 LastWriteTimeUtc를 원본과 같게 보존한다.
-      gzip footer의 ISIZE는 비압축 원본 길이 modulo 2^32를 담으므로, 두 값이 모두
-      일치하면 이 워크플로의 append-only 계약 아래에서는 기존 운반물을 재사용한다.
-    #>
+function Read-CompressedJsonlIntegrity {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "gzip integrity metadata가 없습니다: $Path" }
+    try { $value = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { throw "gzip integrity metadata를 읽을 수 없습니다: $Path" }
+    foreach ($name in @('schemaVersion','rawLength','rawSha256','gzipLength','gzipSha256')) {
+        if (-not ($value.PSObject.Properties.Name -contains $name)) { throw "gzip integrity metadata 필드가 없습니다: $name ($Path)" }
+    }
+    if ([int]$value.schemaVersion -ne 1 -or [int64]$value.rawLength -lt 0 -or [int64]$value.gzipLength -lt 0 -or
+        [string]$value.rawSha256 -notmatch '^[0-9a-fA-F]{64}$' -or [string]$value.gzipSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "gzip integrity metadata가 유효하지 않습니다: $Path"
+    }
+    [pscustomobject]@{
+        SchemaVersion = 1
+        RawLength = [int64]$value.rawLength
+        RawSha256 = ([string]$value.rawSha256).ToLowerInvariant()
+        GzipLength = [int64]$value.gzipLength
+        GzipSha256 = ([string]$value.gzipSha256).ToLowerInvariant()
+    }
+}
+
+function New-CompressedJsonlIntegrityArtifact {
+    param(
+        [Parameter(Mandatory)][string]$Raw,
+        [Parameter(Mandatory)][string]$Compressed,
+        [Parameter(Mandatory)][string]$PlanRoot,
+        [string]$Name = 'gzip-integrity'
+    )
+    $metadata = [ordered]@{
+        schemaVersion = 1
+        rawLength = [int64](Get-Item -LiteralPath $Raw).Length
+        rawSha256 = Get-AgentSessionFileSha256 $Raw
+        gzipLength = [int64](Get-Item -LiteralPath $Compressed).Length
+        gzipSha256 = Get-AgentSessionFileSha256 $Compressed
+    }
+    $safeName = $Name -replace '[^A-Za-z0-9._-]', '_'
+    $path = Join-Path $PlanRoot ($safeName + '-' + [guid]::NewGuid().ToString('N') + '.integrity.json')
+    Write-AgentSessionUtf8File -Path $path -Content ($metadata | ConvertTo-Json -Depth 3) -NoBom
+    [pscustomobject]@{ Path=$path;Sha256=(Get-AgentSessionFileSha256 $path);Metadata=[pscustomobject]$metadata }
+}
+
+function Test-CompressedJsonlTransportCurrent {
+    <# 기존 gzip은 raw/gzip 길이와 SHA-256 네 값이 모두 맞을 때만 재사용한다. #>
     param(
         [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$Compressed
+        [Parameter(Mandatory)][string]$Compressed,
+        [Parameter(Mandatory)][string]$IntegrityPath
     )
-    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { return $false }
-    if (-not (Test-Path -LiteralPath $Compressed -PathType Leaf)) { return $false }
-
-    $sourceInfo = Get-Item -LiteralPath $Source
-    $compressedInfo = Get-Item -LiteralPath $Compressed
-    if ($sourceInfo.LastWriteTimeUtc -ne $compressedInfo.LastWriteTimeUtc) { return $false }
-    if ($compressedInfo.Length -lt 4) { return $false }
-
-    $stream = $null
-    try {
-        $stream = [IO.File]::OpenRead((ConvertTo-ExtendedPath $Compressed))
-        [void]$stream.Seek(-4, [IO.SeekOrigin]::End)
-        $footer = New-Object byte[] 4
-        if ($stream.Read($footer, 0, 4) -ne 4) { return $false }
-        $storedLength = [BitConverter]::ToUInt32($footer, 0)
-        $expectedLength = [uint32]($sourceInfo.Length % ([int64]4294967296))
-        return $storedLength -eq $expectedLength
-    }
-    catch {
-        return $false
-    }
-    finally {
-        if ($stream) { $stream.Dispose() }
-    }
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf) -or -not (Test-Path -LiteralPath $Compressed -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $IntegrityPath -PathType Leaf)) { return $false }
+    try { $metadata = Read-CompressedJsonlIntegrity $IntegrityPath } catch { return $false }
+    if ((Get-Item -LiteralPath $Source).Length -ne $metadata.RawLength -or
+        (Get-Item -LiteralPath $Compressed).Length -ne $metadata.GzipLength) { return $false }
+    if (-not [string]::Equals((Get-AgentSessionFileSha256 $Source), $metadata.RawSha256, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    if (-not [string]::Equals((Get-AgentSessionFileSha256 $Compressed), $metadata.GzipSha256, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    return $true
 }
 
 function Expand-JsonlTransportFile {
@@ -160,8 +184,18 @@ function Expand-JsonlTransportFile {
     #>
     param(
         [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$Destination
+        [Parameter(Mandatory)][string]$Destination,
+        [string]$IntegrityPath = ''
     )
+    $integrity = $null
+    if ($IntegrityPath) {
+        $integrity = Read-CompressedJsonlIntegrity $IntegrityPath
+        $sourceInfo = Get-Item -LiteralPath $Source
+        if ($sourceInfo.Length -ne $integrity.GzipLength -or
+            -not [string]::Equals((Get-AgentSessionFileSha256 $Source), $integrity.GzipSha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "gzip 운반물 SHA-256 또는 길이가 metadata와 다릅니다: $Source"
+        }
+    }
     $sourceTime = [IO.File]::GetLastWriteTimeUtc((ConvertTo-ExtendedPath $Source))
     if (Test-Path -LiteralPath $Destination) {
         $destinationTime = [IO.File]::GetLastWriteTimeUtc((ConvertTo-ExtendedPath $Destination))
@@ -185,6 +219,10 @@ function Expand-JsonlTransportFile {
         $input.Dispose()
         $input = $null
         Test-JsonlSnapshotComplete $temporary
+        if ($integrity -and ((Get-Item -LiteralPath $temporary).Length -ne $integrity.RawLength -or
+            -not [string]::Equals((Get-AgentSessionFileSha256 $temporary), $integrity.RawSha256, [StringComparison]::OrdinalIgnoreCase))) {
+            throw "gzip 복원 원문의 SHA-256 또는 길이가 metadata와 다릅니다: $Source"
+        }
         if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
         [IO.File]::Move((ConvertTo-ExtendedPath $temporary), (ConvertTo-ExtendedPath $Destination))
         [IO.File]::SetLastWriteTimeUtc((ConvertTo-ExtendedPath $Destination), $sourceTime)
@@ -284,7 +322,17 @@ function Get-JsonlLastActivity {
 function Get-AgentSessionFileSha256 {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "File not found: $Path" }
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = $null
+    $sha = $null
+    try {
+        $stream = [IO.FileStream]::new((ConvertTo-ExtendedPath $Path), [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $sha = [Security.Cryptography.SHA256]::Create()
+        ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        if ($sha) { $sha.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
 }
 
 function Write-AgentSessionUtf8File {

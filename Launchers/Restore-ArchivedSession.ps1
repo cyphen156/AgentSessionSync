@@ -66,9 +66,7 @@ try {
     Assert-AgentSessionVaultSources -Operations @($restorePlan.VaultOperations) -RepoRoot $RepoRoot
     $vaultTransaction = Start-AgentSessionFileTransaction -RootMap $rootMap -TransactionRoot (Join-Path $PlanRoot 'VaultTransaction')
     Add-AgentSessionOperations -Transaction $vaultTransaction -Operations @(Get-AgentSessionOrderedOperations @($restorePlan.VaultOperations)) -RepoRoot $RepoRoot
-    foreach ($path in @((Join-Path $RepoRoot 'Codex'),(Join-Path $RepoRoot 'Claude'))) {
-        if (Test-Path -LiteralPath $path) { & (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths @($path) -IncludeCompressed }
-    }
+    # Restore moves already-scanned Vault payloads; Finish -FullSecretScan remains the explicit rescan path.
     $commit = Commit-AgentSessionVault -RepoRoot $RepoRoot -Message "sessions: restore $($selected.Agent) $($selected.SessionId)"
     $vaultCommitted = $true
     Complete-AgentSessionFileTransaction $vaultTransaction

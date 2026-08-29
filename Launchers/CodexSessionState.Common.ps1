@@ -468,7 +468,8 @@ function New-CodexStartPlan {
             if ($file.Name -like '*.jsonl.gz') {
                 $nativeRelative = $nativeRelative.Substring(0, $nativeRelative.Length - 3).Replace('\', '/')
                 $expanded = Join-Path $PlanRoot ('codex-expand-' + [guid]::NewGuid().ToString('N') + '.jsonl')
-                [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded)
+                $integrityPath = Get-CompressedJsonlIntegrityPath $file.FullName
+                [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded -IntegrityPath $integrityPath)
                 $sourcePath = $expanded
                 $sourceKind = 'StagedFile'
             }
@@ -521,6 +522,14 @@ function Add-CodexDesiredVaultGroup {
         $target = $targetPrefix + $inside
         $sourceRelative = Get-CodexRepoRelativePath -RepoRoot $RepoRoot -Path $file.FullName
         $Desired[$target] = [pscustomobject]@{ SourceKind = 'VaultFile'; SourcePath = $file.FullName; SourceRelativePath = $sourceRelative; SourceCommit = $Commit; Sha256 = Get-AgentSessionFileSha256 $file.FullName; Id = $Group.Id; Tier = $Tier }
+        if ($file.Name -like '*.jsonl.gz') {
+            $integrityPath = Get-CompressedJsonlIntegrityPath $file.FullName
+            if (Test-Path -LiteralPath $integrityPath -PathType Leaf) {
+                $integrityTarget = $target + '.integrity.json'
+                $integrityRelative = Get-CodexRepoRelativePath -RepoRoot $RepoRoot -Path $integrityPath
+                $Desired[$integrityTarget] = [pscustomobject]@{ SourceKind = 'VaultFile'; SourcePath = $integrityPath; SourceRelativePath = $integrityRelative; SourceCommit = $Commit; Sha256 = Get-AgentSessionFileSha256 $integrityPath; Id = $Group.Id; Tier = $Tier }
+            }
+        }
     }
 }
 
@@ -559,18 +568,32 @@ function New-CodexFinishPlan {
         $lastActivity[$id] = Get-CodexGroupLastActivity $localSource.Groups[$id]
         foreach ($file in $localSource.Groups[$id].Files) {
             $nativeRelative = Get-CodexNativeRelativeFromFile -NativeRoot $localSource.Root -File $file
+            $target = 'Codex/sessions/' + $localSource.Groups[$id].CwdKey + '/' + $nativeRelative
+            Test-JsonlSnapshotComplete $file.FullName
+            if ($file.Length -gt [int64]$config.TransportFileLimitBytes) {
+                $gzipTarget = $target + '.gz'
+                $vaultGzip = Join-Path $repoRoot ($gzipTarget.Replace('/', [IO.Path]::DirectorySeparatorChar))
+                $vaultIntegrity = Get-CompressedJsonlIntegrityPath $vaultGzip
+                if (Test-CompressedJsonlTransportCurrent -Source $file.FullName -Compressed $vaultGzip -IntegrityPath $vaultIntegrity) {
+                    $gzipRelative = Get-CodexRepoRelativePath -RepoRoot $repoRoot -Path $vaultGzip
+                    $integrityRelative = Get-CodexRepoRelativePath -RepoRoot $repoRoot -Path $vaultIntegrity
+                    $desired[$gzipTarget] = [pscustomobject]@{ SourceKind = 'VaultFile'; SourcePath = $vaultGzip; SourceRelativePath = $gzipRelative; SourceCommit = $Context.VaultCommit; Sha256 = Get-AgentSessionFileSha256 $vaultGzip; Id = $id; Tier = 'Active' }
+                    $desired[$gzipTarget + '.integrity.json'] = [pscustomobject]@{ SourceKind = 'VaultFile'; SourcePath = $vaultIntegrity; SourceRelativePath = $integrityRelative; SourceCommit = $Context.VaultCommit; Sha256 = Get-AgentSessionFileSha256 $vaultIntegrity; Id = $id; Tier = 'Active' }
+                    continue
+                }
+                $snapshot = New-AgentSessionStagedSnapshot -Source $file.FullName -PlanRoot $PlanRoot -Name ('codex-' + $id)
+                Test-JsonlSnapshotComplete $snapshot.Path
+                $compressed = $snapshot.Path + '.gz'
+                Compress-JsonlTransportFile -Source $snapshot.Path -Destination $compressed
+                if ((Get-Item -LiteralPath $compressed).Length -gt [int64]$config.TransportFileLimitBytes) { throw "Codex gzip transport limit exceeded: $id" }
+                $integrity = New-CompressedJsonlIntegrityArtifact -Raw $snapshot.Path -Compressed $compressed -PlanRoot $PlanRoot -Name ('codex-' + $id)
+                $desired[$gzipTarget] = [pscustomobject]@{ SourceKind = 'StagedFile'; SourcePath = $compressed; SourceRelativePath = ''; SourceCommit = ''; Sha256 = Get-AgentSessionFileSha256 $compressed; Id = $id; Tier = 'Active' }
+                $desired[$gzipTarget + '.integrity.json'] = [pscustomobject]@{ SourceKind = 'StagedFile'; SourcePath = $integrity.Path; SourceRelativePath = ''; SourceCommit = ''; Sha256 = $integrity.Sha256; Id = $id; Tier = 'Active' }
+                continue
+            }
             $snapshot = New-AgentSessionStagedSnapshot -Source $file.FullName -PlanRoot $PlanRoot -Name ('codex-' + $id)
             Test-JsonlSnapshotComplete $snapshot.Path
-            $target = 'Codex/sessions/' + $localSource.Groups[$id].CwdKey + '/' + $nativeRelative
-            $sourcePath = $snapshot.Path
-            if ((Get-Item -LiteralPath $sourcePath).Length -gt [int64]$config.TransportFileLimitBytes) {
-                $compressed = $sourcePath + '.gz'
-                Compress-JsonlTransportFile -Source $sourcePath -Destination $compressed
-                if ((Get-Item -LiteralPath $compressed).Length -gt [int64]$config.TransportFileLimitBytes) { throw "Codex gzip transport limit exceeded: $id" }
-                $sourcePath = $compressed
-                $target += '.gz'
-            }
-            $desired[$target] = [pscustomobject]@{ SourceKind = 'StagedFile'; SourcePath = $sourcePath; SourceRelativePath = ''; SourceCommit = ''; Sha256 = Get-AgentSessionFileSha256 $sourcePath; Id = $id; Tier = 'Active' }
+            $desired[$target] = [pscustomobject]@{ SourceKind = 'StagedFile'; SourcePath = $snapshot.Path; SourceRelativePath = ''; SourceCommit = ''; Sha256 = Get-AgentSessionFileSha256 $snapshot.Path; Id = $id; Tier = 'Active' }
         }
       }
     }
@@ -601,7 +624,7 @@ function New-CodexFinishPlan {
     foreach ($rootRel in @('Codex/sessions','Codex/archive')) {
         $root = Join-Path $repoRoot ($rootRel -replace '/', '\')
         foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -like '*.jsonl' -or $_.Name -like '*.jsonl.gz'
+            $_.Name -like '*.jsonl' -or $_.Name -like '*.jsonl.gz' -or $_.Name -like '*.jsonl.gz.integrity.json'
         })) {
             $relative = Get-CodexRepoRelativePath -RepoRoot $repoRoot -Path $file.FullName
             $current[$relative] = Get-AgentSessionFileSha256 $file.FullName
@@ -661,12 +684,19 @@ function New-CodexRestorePlan {
         if ($tiers.Archived.ContainsKey($SessionId)) {
             [void]$vaultOps.Add((New-CodexVaultFileOperation -RepoRoot $repoRoot -Commit $Context.VaultCommit -SourcePath $file.FullName -TargetRoot Vault -TargetRelative ('Codex/sessions/' + $inside)))
             [void]$vaultOps.Add((New-AgentSessionDeleteOperation -TargetRoot Vault -RelativePath ('Codex/archive/' + $inside)))
+            if ($file.Name -like '*.jsonl.gz') {
+                $integrityPath = Get-CompressedJsonlIntegrityPath $file.FullName
+                if (-not (Test-Path -LiteralPath $integrityPath -PathType Leaf)) { throw "gzip integrity metadata가 없습니다: $integrityPath" }
+                [void]$vaultOps.Add((New-CodexVaultFileOperation -RepoRoot $repoRoot -Commit $Context.VaultCommit -SourcePath $integrityPath -TargetRoot Vault -TargetRelative ('Codex/sessions/' + $inside + '.integrity.json')))
+                [void]$vaultOps.Add((New-AgentSessionDeleteOperation -TargetRoot Vault -RelativePath ('Codex/archive/' + $inside + '.integrity.json')))
+            }
         }
         $nativeRelative = Get-CodexNativeRelativePath -TransportRoot $sourceTierRoot -Path $file.FullName
         if ($file.Name -like '*.jsonl.gz') {
             $nativeRelative = $nativeRelative.Substring(0,$nativeRelative.Length-3).Replace('\','/')
             $expanded = Join-Path $PlanRoot ('codex-restore-' + [guid]::NewGuid().ToString('N') + '.jsonl')
-            [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded)
+            $integrityPath = Get-CompressedJsonlIntegrityPath $file.FullName
+            [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded -IntegrityPath $integrityPath)
             $snapshotPath = $expanded
         } else {
             $snapshot = New-AgentSessionStagedSnapshot -Source $file.FullName -PlanRoot $PlanRoot -Name 'codex-restore'

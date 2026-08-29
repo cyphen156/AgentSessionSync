@@ -69,8 +69,19 @@ try {
     $vaultTransaction = Start-AgentSessionFileTransaction -RootMap $rootMap -TransactionRoot (Join-Path $PlanRoot 'VaultTransaction')
     Add-AgentSessionOperations -Transaction $vaultTransaction -Operations @(Get-AgentSessionOrderedOperations $vaultOperations) -RepoRoot $RepoRoot
 
-    foreach ($path in @((Join-Path $RepoRoot 'Codex'), (Join-Path $RepoRoot 'Claude'))) {
-        if (Test-Path -LiteralPath $path) { & (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths @($path) -IncludeCompressed }
+    if ($FullSecretScan) {
+        foreach ($path in @((Join-Path $RepoRoot 'Codex'), (Join-Path $RepoRoot 'Claude'))) {
+            if (Test-Path -LiteralPath $path) { & (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths @($path) -IncludeCompressed }
+        }
+    } else {
+        $changedPayloads = @($vaultOperations | Where-Object {
+            $_.Kind -eq 'Put' -and $_.TargetRoot -eq 'Vault' -and
+            ($_.RelativePath -like '*.jsonl' -or $_.RelativePath -like '*.jsonl.gz' -or $_.RelativePath -like '*.entry.json') -and
+            ($_.RelativePath -match '^(Codex|Claude)/(sessions|archive)/')
+        } | ForEach-Object { Resolve-AgentSessionOperationTarget -Operation $_ -RootMap $rootMap } | Sort-Object -Unique)
+        if ($changedPayloads) {
+            & (Join-Path $PSScriptRoot 'Test-SessionSecrets.ps1') -Paths $changedPayloads -IncludeCompressed
+        }
     }
     foreach ($operation in @($plans | ForEach-Object { $_.VaultOperations }) | Where-Object {
         $_.Kind -eq 'Put' -and $_.TargetRoot -eq 'Vault' -and $_.RelativePath -like '*.jsonl' -and

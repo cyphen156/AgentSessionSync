@@ -93,6 +93,7 @@ try {
     New-Item -ItemType Directory -Path $repo, $codexHome, $claudeHome, $env:LOCALAPPDATA, $registry -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'Launchers') -Destination (Join-Path $repo 'Launchers') -Recurse
     Copy-Item -LiteralPath (Join-Path $sourceRoot '.gitignore') -Destination (Join-Path $repo '.gitignore')
+    Copy-Item -LiteralPath (Join-Path $sourceRoot '.gitattributes') -Destination (Join-Path $repo '.gitattributes')
     # The sandbox denies both CIM and WMI process enumeration. Override only the
     # copied test launcher so Restore sees the intended "app is not running" state.
     Add-Content -LiteralPath (Join-Path $repo 'Launchers\AgentLauncher.Common.ps1') `
@@ -130,6 +131,22 @@ try {
     $pull = Join-Path $repo 'Launchers\Pull-Sessions.ps1'
     $push = Join-Path $repo 'Launchers\Push-Sessions.ps1'
     $restore = Join-Path $repo 'Launchers\Restore-ArchivedSession.ps1'
+
+    $orphanClaudeId = '99999999-9999-4999-8999-999999999999'
+    $orphanClaudePath = Join-Path $repo "Claude\sessions\$key\$orphanClaudeId.jsonl"
+    Write-ClaudeTranscript $orphanClaudePath $orphanClaudeId $fresh
+    & git -C $repo add -A
+    & git -C $repo commit -qm invalid-preflight-fixture
+    & git -C $repo push -q
+    $preflightHead = ([string](& git -C $repo rev-parse HEAD)).Trim()
+    Invoke-ExpectedFailure { & $pull } 'invalid Start source is rejected before claiming the baton'
+    Assert-True (([string](& git -C $repo rev-parse HEAD)).Trim() -eq $preflightHead) 'failed Start preflight creates no claim commit'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $repo 'ACTIVE_HOST.txt') -Raw).Trim() -eq 'NONE') 'failed Start preflight leaves the baton unclaimed'
+    Remove-Item -LiteralPath $orphanClaudePath -Force
+    & git -C $repo add -A
+    & git -C $repo commit -qm remove-invalid-preflight-fixture
+    & git -C $repo push -q
+
     & $pull
     Assert-True ($LASTEXITCODE -eq 0) 'Start core succeeds against a local remote'
 

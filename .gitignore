@@ -1,6 +1,7 @@
 # Deny by default. Only the public tool and transported session formats are allowed.
 *
 !.gitignore
+!.gitattributes
 !LICENSE
 !README.md
 !docs/
@@ -19,6 +20,7 @@
 !Codex/**/
 !Codex/**/*.jsonl
 !Codex/**/*.jsonl.gz
+!Codex/**/*.jsonl.gz.integrity.json
 !Launchers/
 !Launchers/**
 Launchers/Shortcuts/*.lnk
