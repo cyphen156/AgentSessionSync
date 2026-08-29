@@ -709,10 +709,17 @@ function Prepare-AgentSessionVaultMutation {
     throw 'Vault push가 3회 연속 거부됐습니다. 네트워크와 원격 상태를 확인하세요.'
 }
 
-function Test-AgentSessionFinishPreflight {
+function Test-AgentSessionGzipIntegrity {
+    <#
+      Vault 의 gzip 운반물이 자기 integrity metadata 와 맞는지 확인한다.
+      Start 는 이걸 풀어 로컬에 복원하고 Finish 는 재사용 여부를 판단하므로
+      양쪽 사전검사가 같은 검사를 쓴다.
+
+      metadata 가 없는 legacy gzip 은 실패로 보지 않는다. 경고하고 CRC·JSONL 로만
+      확인한 뒤 통과시키며, metadata 는 다음 Finish 가 만든다.
+    #>
     param([Parameter(Mandatory)][string]$RepoRoot)
-    [void](Prepare-AgentSessionVaultMutation -RepoRoot $RepoRoot)
-    $planRoot = New-AgentSessionPlanRoot -Prefix 'AgentSessionSync-Preflight'
+    $planRoot = New-AgentSessionPlanRoot -Prefix 'AgentSessionSync-Gzip'
     try {
         foreach ($gzip in @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'Codex') -Recurse -File -Filter '*.jsonl.gz' -ErrorAction SilentlyContinue)) {
             $integrityPath = Get-CompressedJsonlIntegrityPath $gzip.FullName
@@ -731,6 +738,88 @@ function Test-AgentSessionFinishPreflight {
     } finally {
         if (Test-Path -LiteralPath $planRoot) { Remove-Item -LiteralPath $planRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
+}
+
+function Test-AgentSessionVaultReadable {
+    <#
+      Vault 를 읽을 수 있는 상태인지만 본다.
+
+      Prepare-AgentSessionVaultMutation 을 쓰지 않는다. 그 함수는 fetch·merge 를 하고
+      미게시 커밋을 push 까지 하므로 사전검사가 부르면 "아무것도 바꾸지 않는다" 가
+      거짓이 된다. 그 준비는 실제 적용 단계(Pull-Sessions / Push-Sessions)가 한다.
+    #>
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    Assert-GitRepository $RepoRoot
+    $dirty = @(& git -C $RepoRoot status --porcelain)
+    if ($LASTEXITCODE -ne 0) { throw 'Vault working tree 상태를 확인할 수 없습니다.' }
+    if ($dirty) { throw 'Vault working tree에 미커밋 변경이 있습니다. 먼저 정리하세요.' }
+}
+
+function Test-AgentSessionPlanPreflight {
+    <#
+      앱별 계획을 실제로 만들어 검증한다. 이게 사전검사의 핵심이다.
+
+      Git 상태와 gzip 만 봐서는 계획 단계 오류를 못 잡는다. 고아 원문, 계보 단절,
+      동일 target 중복 같은 것은 계획을 만들어야 드러나고, 그걸 앱을 다 죽인 뒤에
+      발견하면 이 계약을 만든 사고가 그대로 재현된다.
+
+      계획 생성은 어댑터 계약상 저장소를 바꾸지 않으므로 사전검사에서 불러도 된다.
+
+      현재 HEAD 기준으로만 검증한다. pull 은 하지 않는다. 실제 Start 는 pull·claim
+      이후 계획을 다시 만들므로, 여기서 통과했다고 그 계획까지 보장하지는 않는다.
+      여기서 잡는 것은 지금 이 머신과 이 Vault 의 구조적 오류다.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][ValidateSet('Start', 'Finish')][string]$Phase
+    )
+    foreach ($required in @("New-Codex${Phase}Plan", "New-Claude${Phase}Plan")) {
+        if (-not (Get-Command $required -CommandType Function -ErrorAction SilentlyContinue)) {
+            throw "Session adapter contract is incomplete: $required"
+        }
+    }
+    $head = Get-AgentSessionVaultHead $RepoRoot
+    $context = [pscustomobject]@{
+        SchemaVersion = 1
+        RepoRoot = $RepoRoot
+        Config = $Config
+        VaultCommit = $head
+        NowUtc = [DateTime]::UtcNow
+        AllowCheckpointAncestor = $true
+    }
+    $planRoot = New-AgentSessionPlanRoot -Prefix "AgentSessionSync-${Phase}Preflight"
+    try {
+        $claudeRoot = Join-Path $planRoot 'Claude'
+        $codexRoot = Join-Path $planRoot 'Codex'
+        New-Item -ItemType Directory -Path $claudeRoot, $codexRoot -Force | Out-Null
+        $claudePlan = & "New-Claude${Phase}Plan" -Context $context -PlanRoot $claudeRoot
+        $codexPlan = & "New-Codex${Phase}Plan" -Context $context -PlanRoot $codexRoot
+        $plans = @($claudePlan, $codexPlan)
+        $rootMap = Get-AgentSessionRootMap -Plans $plans -RepoRoot $RepoRoot
+        $properties = if ($Phase -eq 'Start') { @('LocalOperations') } else { @('VaultOperations', 'LocalOperations') }
+        Assert-AgentSessionPlans -Plans $plans -RootMap $rootMap -ExpectedVaultCommit $head `
+            -PlanRoot $planRoot -OperationProperties $properties
+        foreach ($plan in $plans) {
+            foreach ($warning in @($plan.Warnings)) { Write-Warning "[$($plan.Agent) preflight] $warning" }
+        }
+    } finally {
+        if (Test-Path -LiteralPath $planRoot) { Remove-Item -LiteralPath $planRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Test-AgentSessionStartPreflight {
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)]$Config)
+    Test-AgentSessionVaultReadable -RepoRoot $RepoRoot
+    Test-AgentSessionGzipIntegrity -RepoRoot $RepoRoot
+    Test-AgentSessionPlanPreflight -RepoRoot $RepoRoot -Config $Config -Phase 'Start'
+}
+
+function Test-AgentSessionFinishPreflight {
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)]$Config)
+    Test-AgentSessionVaultReadable -RepoRoot $RepoRoot
+    Test-AgentSessionGzipIntegrity -RepoRoot $RepoRoot
+    Test-AgentSessionPlanPreflight -RepoRoot $RepoRoot -Config $Config -Phase 'Finish'
 }
 
 function Commit-AgentSessionVault {
