@@ -44,7 +44,7 @@ Vault의 Archived 상태를 결정하는 신호나 보관 장소가 아닙니다
 
 ## Start
 
-1. Vault를 `git pull --ff-only`로 갱신합니다.
+1. Vault 원격과 합류합니다. 분기돼 있으면 Finish와 같은 경고·merge 규칙을 적용합니다.
 2. baton을 claim하기 전에 세션 형식, 계보, 원본 SHA를 읽기 전용으로 사전 검사합니다.
 3. 사전 검사가 통과한 동일 Vault에서 baton을 claim하고 계획을 다시 검증합니다.
 4. Vault Active를 로컬 활성 저장소에 배치합니다.
@@ -58,30 +58,34 @@ Vault의 Archived 상태를 결정하는 신호나 보관 장소가 아닙니다
 
 ## Finish
 
-1. 등록된 앱에 정상 종료를 요청하고 완전히 닫혔는지 확인합니다.
-2. 트레이 상주 프로세스가 남으면 새로 확인한 등록 앱 루트만 `taskkill /T /F`로 종료하고,
+1. Vault 작업트리·원격 합류·checkpoint 상태·기존 gzip 호환성을 앱 종료 전에 사전 검사합니다.
+   checkpoint의 부재나 HEAD 불일치는 경고일 뿐 Finish를 막지 않습니다.
+2. 등록된 앱에 정상 종료를 요청하고 완전히 닫혔는지 확인합니다.
+3. 트레이 상주 프로세스가 남으면 새로 확인한 등록 앱 루트만 `taskkill /T /F`로 종료하고,
    전체 프로세스 트리가 사라진 경우에만 계속합니다.
-3. 앱 형식과 현재 로컬 원문을 다시 검사합니다.
-4. 각 앱 adapter가 앱별 삭제 신호와 현재 로컬 존재 집합을 판정합니다.
-5. 최종 삭제로 확인된 대화만 Vault 최신 트리에서 제거합니다.
-6. 현재 활성 저장소에 새로 나타난 ID는 Vault Archived를 먼저 조회합니다.
+4. 앱 형식과 현재 로컬 원문을 다시 검사합니다.
+5. 각 앱 adapter가 앱별 삭제 신호와 현재 로컬 존재 집합을 판정합니다.
+6. 최종 삭제로 확인된 대화만 Vault 최신 트리에서 제거합니다.
+7. 현재 활성 저장소에 새로 나타난 ID는 Vault Archived를 먼저 조회합니다.
    - Archived에 있으면 Active로 이동합니다.
    - 없으면 신규 대화로 추가합니다.
-7. 계속 활성인 대화의 원문을 갱신합니다.
-8. 마지막 timestamp가 30일 기준을 넘은 Active 대화를 Archived로 이동합니다.
-9. Active/Archived 배타성과 원문 형식을 검증한 뒤 commit/push합니다.
-10. fetch 후 `HEAD == origin`을 확인한 다음에만 로컬 정리와 체크포인트 갱신을 수행합니다.
+8. 계속 활성인 대화의 원문을 갱신합니다.
+9. 마지막 timestamp가 30일 기준을 넘은 Active 대화를 Archived로 이동합니다.
+10. Active/Archived 배타성과 원문 형식을 검증한 뒤 commit/push합니다.
+11. fetch 후 `HEAD == origin`을 확인한 다음에만 로컬 정리와 체크포인트 갱신을 수행합니다.
 
 세션 운송물(`.jsonl`, `.jsonl.gz`, `.entry.json`)은 Git text/EOL 필터를 적용하지 않고 원본
 바이트를 그대로 보존합니다. 큰 Codex JSONL은 raw 길이·SHA-256과 gzip 길이·SHA-256 네 값을
 무결성 metadata에 기록하며, 네 값이 모두 일치할 때만 기존 gzip을 재사용합니다. Start와 Restore는
-압축물과 복원된 raw 양쪽을 이 metadata로 검증합니다.
+압축물과 복원된 raw 양쪽을 이 metadata로 검증합니다. 과거에 만들어져 metadata가 없는 gzip은
+gzip CRC와 JSONL 완전성을 검사해 읽을 수 있지만 캐시로 재사용하지 않으며, 다음 Finish가 새 metadata를 만듭니다.
 
 일반 Finish의 secret scan은 이번 계획에서 새로 쓰거나 바뀐 세션 payload만 검사합니다. 탐지 패턴을
 갱신했거나 전체 재검사가 필요하면 `Push-Sessions.ps1 -FullSecretScan`을 명시적으로 실행합니다.
 
 Codex에서 `C`는 `sessions ∪ archived_sessions`입니다. 보관함에 있는 동안에는 아직 삭제된 것이
-아니며, 보관함에서 최종 삭제되어 두 위치 모두에서 사라졌을 때만 삭제로 판정합니다.
+아니며, 현재 Vault HEAD와 정확히 일치하는 checkpoint가 있을 때 보관함에서 최종 삭제되어 두 위치
+모두에서 사라진 경우에만 삭제로 판정합니다. checkpoint가 없거나 stale이면 로컬 부재를 삭제로 추론하지 않습니다.
 
 Claude는 원문 파일의 부재를 삭제로 해석하지 않습니다. 앱이 만든 `deleted_<appSessionId>` 마커를
 마지막 checkpoint의 `appSessionId ↔ canonicalId` 매핑으로 해석한 경우에만 최종 삭제합니다.
@@ -132,9 +136,9 @@ Codex 데이터 형식은 Start와 Finish마다 원문에서 다시 확인합니
 
 ## Git 실패 처리
 
-- Push가 거부되면 자동 merge, `-X ours`, 자동 재시도를 수행하지 않습니다.
-- 로컬 commit이 이미 만들어졌다면 원격이 변하지 않은 경우 같은 commit을 다시 Push합니다.
-- 로컬과 원격이 모두 진행된 분기 상태라면 중단하고 사용자가 판단합니다.
+- Push가 거부되면 원격을 다시 fetch하고 최대 3회 merge·push로 합류합니다.
+- 서로 다른 경로는 합집합으로 보존하고, 같은 경로가 겹치면 경고에 경로를 출력한 뒤 현재 호스트
+  사본을 우선합니다. merge commit은 양쪽 부모 이력을 보존합니다.
 - Push 실패 전에는 로컬 세션 정리와 체크포인트 갱신을 하지 않습니다.
 
 ## 설치

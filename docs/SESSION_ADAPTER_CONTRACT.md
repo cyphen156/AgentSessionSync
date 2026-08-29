@@ -76,10 +76,16 @@ clean, because earlier operations in the same transaction may already have chang
 
 After a Vault commit exists, a rejected push keeps that commit for retry. Local cleanup
 and checkpoint updates occur only after the pushed commit is verified at the upstream.
+The orchestrator fetches and rejoins a divergent upstream up to three times. It preserves
+both merge parents, warns for every overlapping path, and gives the current host's path
+content precedence for those overlaps.
 
 Checkpoint plans are created after post-publish local operations have been applied.
 They may read that resulting local state but still return writes as plan operations.
 Every Vault-changing publish advances both application checkpoints to the same commit.
+Checkpoints are advisory bookkeeping, not ownership locks. A missing or stale checkpoint
+warns but does not block Finish. Codex may infer deletion from local absence only when its
+checkpoint commit exactly equals the current Vault HEAD; otherwise inferred deletions are empty.
 
 ## Restore ordering
 

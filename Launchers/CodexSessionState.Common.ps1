@@ -469,7 +469,12 @@ function New-CodexStartPlan {
                 $nativeRelative = $nativeRelative.Substring(0, $nativeRelative.Length - 3).Replace('\', '/')
                 $expanded = Join-Path $PlanRoot ('codex-expand-' + [guid]::NewGuid().ToString('N') + '.jsonl')
                 $integrityPath = Get-CompressedJsonlIntegrityPath $file.FullName
-                [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded -IntegrityPath $integrityPath)
+                if (Test-Path -LiteralPath $integrityPath -PathType Leaf) {
+                    [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded -IntegrityPath $integrityPath)
+                } else {
+                    Write-Warning "legacy gzip에 integrity metadata가 없습니다. CRC/JSONL 검증 후 읽기 전용으로 복원합니다: $($file.FullName)"
+                    [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded)
+                }
                 $sourcePath = $expanded
                 $sourceKind = 'StagedFile'
             }
@@ -538,7 +543,7 @@ function New-CodexFinishPlan {
     $repoRoot = [string]$Context.RepoRoot
     $config = $Context.Config
     $checkpoint = Read-CodexCheckpoint $repoRoot
-    Assert-AgentSessionCheckpointAtHead -RepoRoot $repoRoot -Checkpoint $checkpoint -AllowAncestor:$Context.AllowCheckpointAncestor
+    $checkpointCurrent = Test-AgentSessionCheckpointCurrent -RepoRoot $repoRoot -Checkpoint $checkpoint -AgentName 'Codex'
     $tiers = Get-CodexTierInventory $repoRoot
     $nativeActiveRoot = Join-Path $config.CodexHome 'sessions'
     $nativeArchivedRoot = Join-Path $config.CodexHome 'archived_sessions'
@@ -549,7 +554,8 @@ function New-CodexFinishPlan {
     }
     $exists = @{}
     foreach ($id in @($localActive.Keys) + @($localArchived.Keys)) { $exists[$id] = $true }
-    $deleted = @($checkpoint.ActiveIds | Where-Object { -not $exists.ContainsKey($_) })
+    $deleted = @()
+    if ($checkpointCurrent) { $deleted = @($checkpoint.ActiveIds | Where-Object { -not $exists.ContainsKey($_) }) }
 
     $desired = @{}
     foreach ($group in $tiers.Active.Values) { Add-CodexDesiredVaultGroup -Desired $desired -Tier Active -Group $group -RepoRoot $repoRoot -Commit $Context.VaultCommit }
@@ -686,9 +692,12 @@ function New-CodexRestorePlan {
             [void]$vaultOps.Add((New-AgentSessionDeleteOperation -TargetRoot Vault -RelativePath ('Codex/archive/' + $inside)))
             if ($file.Name -like '*.jsonl.gz') {
                 $integrityPath = Get-CompressedJsonlIntegrityPath $file.FullName
-                if (-not (Test-Path -LiteralPath $integrityPath -PathType Leaf)) { throw "gzip integrity metadata가 없습니다: $integrityPath" }
-                [void]$vaultOps.Add((New-CodexVaultFileOperation -RepoRoot $repoRoot -Commit $Context.VaultCommit -SourcePath $integrityPath -TargetRoot Vault -TargetRelative ('Codex/sessions/' + $inside + '.integrity.json')))
-                [void]$vaultOps.Add((New-AgentSessionDeleteOperation -TargetRoot Vault -RelativePath ('Codex/archive/' + $inside + '.integrity.json')))
+                if (Test-Path -LiteralPath $integrityPath -PathType Leaf) {
+                    [void]$vaultOps.Add((New-CodexVaultFileOperation -RepoRoot $repoRoot -Commit $Context.VaultCommit -SourcePath $integrityPath -TargetRoot Vault -TargetRelative ('Codex/sessions/' + $inside + '.integrity.json')))
+                    [void]$vaultOps.Add((New-AgentSessionDeleteOperation -TargetRoot Vault -RelativePath ('Codex/archive/' + $inside + '.integrity.json')))
+                } else {
+                    Write-Warning "legacy gzip에 integrity metadata가 없습니다. 원문 운반물만 활성 계층으로 옮깁니다: $($file.FullName)"
+                }
             }
         }
         $nativeRelative = Get-CodexNativeRelativePath -TransportRoot $sourceTierRoot -Path $file.FullName
@@ -696,7 +705,12 @@ function New-CodexRestorePlan {
             $nativeRelative = $nativeRelative.Substring(0,$nativeRelative.Length-3).Replace('\','/')
             $expanded = Join-Path $PlanRoot ('codex-restore-' + [guid]::NewGuid().ToString('N') + '.jsonl')
             $integrityPath = Get-CompressedJsonlIntegrityPath $file.FullName
-            [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded -IntegrityPath $integrityPath)
+            if (Test-Path -LiteralPath $integrityPath -PathType Leaf) {
+                [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded -IntegrityPath $integrityPath)
+            } else {
+                Write-Warning "legacy gzip에 integrity metadata가 없습니다. CRC/JSONL 검증 후 읽기 전용으로 복원합니다: $($file.FullName)"
+                [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded)
+            }
             $snapshotPath = $expanded
         } else {
             $snapshot = New-AgentSessionStagedSnapshot -Source $file.FullName -PlanRoot $PlanRoot -Name 'codex-restore'

@@ -60,8 +60,7 @@ function Undo-AgentSessionBatonClaim {
     }
 }
 
-& git -C $RepoRoot pull --ff-only
-if ($LASTEXITCODE -ne 0) { throw 'Vault pull --ff-only failed.' }
+[void](Prepare-AgentSessionVaultMutation -RepoRoot $RepoRoot)
 $dirty = @(& git -C $RepoRoot status --porcelain)
 if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Vault must be clean before Start claims the baton.' }
 
@@ -76,7 +75,7 @@ try {
 $active = Get-Content -LiteralPath $LockFile -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $active) { $active = 'NONE' }
 if ($active -ne 'NONE' -and $active -ne $ThisHost) {
-    Write-Warning "다른 호스트($active)가 baton을 쥔 상태입니다. 원격 분기 시 자동 merge하지 않습니다."
+    Write-Warning "다른 호스트($active)가 baton을 쥔 상태입니다. 막지 않고 현재 호스트로 이어받습니다. 같은 세션을 양쪽에서 동시에 잇지 마세요."
 }
 [IO.File]::WriteAllText($LockFile, $ThisHost + [Environment]::NewLine, [Text.Encoding]::ASCII)
 $claimCommit = Commit-AgentSessionVault -RepoRoot $RepoRoot -Message "claim by $ThisHost @ $(Get-Date -Format 'yyyy-MM-dd HH:mm')"

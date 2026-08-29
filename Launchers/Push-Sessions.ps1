@@ -28,7 +28,7 @@ $retriedPendingCommit = Prepare-AgentSessionVaultMutation -RepoRoot $RepoRoot
 $active = Get-Content -LiteralPath $LockFile -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $active) { $active = 'NONE' }
 if ($active -ne $ThisHost -and -not $ForceOwnership) {
-    Write-Warning "baton 소유자는 $active 입니다($ThisHost 아님). 분기 시 자동 merge하지 않습니다."
+    Write-Warning "baton 소유자는 $active 입니다($ThisHost 아님). 막지 않고 진행하며, 원격 충돌 시 merge로 합류합니다. 같은 경로가 겹치면 현재 호스트 사본이 우선됩니다."
 }
 if ($CheckOnly) { Write-Host "[OK] Vault and baton checked for $ThisHost." -ForegroundColor Green; return }
 

@@ -502,7 +502,7 @@ function New-ClaudeFinishPlan {
     $projectsRoot = Join-Path $config.ClaudeHome 'projects'
     $registryRoot = Get-ClaudeAppRegistryRoot -AllowMissing
     $checkpoint = Read-ClaudeCheckpoint $repoRoot
-    Assert-AgentSessionCheckpointAtHead -RepoRoot $repoRoot -Checkpoint $checkpoint -AllowAncestor:$Context.AllowCheckpointAncestor
+    [void](Test-AgentSessionCheckpointCurrent -RepoRoot $repoRoot -Checkpoint $checkpoint -AgentName 'Claude')
 
     $tiers = Get-ClaudeTierInventory $repoRoot
     $transcripts = Get-ClaudeTranscriptSet $projectsRoot

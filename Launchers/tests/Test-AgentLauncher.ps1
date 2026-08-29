@@ -27,6 +27,12 @@ try {
         if ($shortcut.TargetPath -notlike '*\cmd.exe') { throw "Invalid target: $link" }
         if ($shortcut.Arguments -notmatch [regex]::Escape($expected[$name])) { throw "Invalid arguments: $link" }
     }
+    $finishText = Get-Content -Raw -LiteralPath (Join-Path $launchers 'Finish.ps1')
+    $preflightOffset = $finishText.IndexOf('Test-AgentSessionFinishPreflight')
+    $closeOffset = $finishText.IndexOf('Stop-AgentGracefully')
+    if ($preflightOffset -lt 0 -or $closeOffset -lt 0 -or $preflightOffset -gt $closeOffset) {
+        throw 'Finish must complete read-only Vault/gzip preflight before closing app process trees.'
+    }
 
     $hiddenPackageProcess = [pscustomobject]@{
         Id = 4242

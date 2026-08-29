@@ -77,6 +77,9 @@ try {
     try { [void](Get-CodexSessionGroups (Join-Path $repo 'Codex\sessions')) } catch { $duplicateRejected = $true }
     Assert-True $duplicateRejected 'duplicate logical rollout filename in different paths was accepted'
     Remove-Item -LiteralPath $duplicateDir -Recurse -Force
+    $legacyVaultRaw = Join-Path $repo "Codex\sessions\$key\2026\08\25\rollout-a.jsonl"
+    Compress-JsonlTransportFile -Source $legacyVaultRaw -Destination ($legacyVaultRaw + '.gz')
+    Remove-Item -LiteralPath $legacyVaultRaw -Force
     [ordered]@{id=$idA;title='A'} | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $repo 'Codex\session_index.jsonl') -Encoding UTF8
     'NONE' | Set-Content -LiteralPath (Join-Path $repo 'ACTIVE_HOST.txt') -Encoding ASCII
     & git -C $repo init -q
@@ -113,6 +116,9 @@ try {
     $corruptRejected = $false
     try { [void](Expand-JsonlTransportFile -Source $corruptGzip -Destination (Join-Path $transportRoot 'corrupt-expanded.jsonl') -IntegrityPath $integrityArtifact.Path) } catch { $corruptRejected = $true }
     Assert-True $corruptRejected 'gzip restore rejects corrupted compressed bytes before expansion'
+    $legacyExpanded = Join-Path $transportRoot 'legacy-expanded.jsonl'
+    Assert-True (Expand-JsonlTransportFile -Source $gzipTransport -Destination $legacyExpanded) 'legacy gzip without integrity metadata still expands after gzip and JSONL validation'
+    Assert-True ((Get-AgentSessionFileSha256 $legacyExpanded) -eq (Get-AgentSessionFileSha256 $rawTransport)) 'legacy gzip expansion preserves the exact raw bytes'
 
     $transportRepo = Join-Path $root 'TransportRepo'
     $transportClone = Join-Path $root 'TransportClone'
@@ -130,6 +136,37 @@ try {
     foreach ($name in @('native-lf.jsonl','native-crlf.jsonl','native.entry.json')) {
         Assert-True ((Get-AgentSessionFileSha256 (Join-Path $transportRepo $name)) -eq (Get-AgentSessionFileSha256 (Join-Path $transportClone $name))) "Git checkout preserves exact transport bytes: $name"
     }
+
+    # Diverged Vault histories rejoin, preserve unique paths and both parents, and prefer this host for overlaps.
+    $mergeRemote = Join-Path $root 'MergeRemote.git'
+    $mergeLocal = Join-Path $root 'MergeLocal'
+    $mergePeer = Join-Path $root 'MergePeer'
+    & git init --bare -q $mergeRemote
+    & git clone -q $mergeRemote $mergeLocal
+    & git -C $mergeLocal config user.email test@example.com
+    & git -C $mergeLocal config user.name Test
+    Write-AgentSessionUtf8File -Path (Join-Path $mergeLocal 'same.txt') -Content 'base'
+    & git -C $mergeLocal add -A
+    & git -C $mergeLocal commit -qm base
+    & git -C $mergeLocal push -qu origin HEAD
+    & git clone -q $mergeRemote $mergePeer
+    & git -C $mergePeer config user.email test@example.com
+    & git -C $mergePeer config user.name Test
+    Write-AgentSessionUtf8File -Path (Join-Path $mergeLocal 'same.txt') -Content 'local'
+    Write-AgentSessionUtf8File -Path (Join-Path $mergeLocal 'local.txt') -Content 'local-only'
+    & git -C $mergeLocal add -A
+    & git -C $mergeLocal commit -qm local
+    Write-AgentSessionUtf8File -Path (Join-Path $mergePeer 'same.txt') -Content 'remote'
+    Write-AgentSessionUtf8File -Path (Join-Path $mergePeer 'remote.txt') -Content 'remote-only'
+    & git -C $mergePeer add -A
+    & git -C $mergePeer commit -qm remote
+    & git -C $mergePeer push -q
+    Assert-True (Prepare-AgentSessionVaultMutation -RepoRoot $mergeLocal) 'diverged Vault histories merge and publish'
+    Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $mergeLocal 'same.txt')).Trim() -eq 'local') 'overlapping path prefers the current host copy'
+    Assert-True ((Test-Path -LiteralPath (Join-Path $mergeLocal 'local.txt')) -and (Test-Path -LiteralPath (Join-Path $mergeLocal 'remote.txt'))) 'divergent unique paths are both preserved'
+    $mergeParents = @(& git -C $mergeLocal rev-list --parents -n 1 HEAD)[0].Split(' ').Count - 1
+    Assert-True ($mergeParents -eq 2) 'automatic convergence preserves both merge parents'
+    Assert-True (((& git -C $mergeLocal rev-parse HEAD).Trim()) -eq ((& git -C $mergeLocal rev-parse '@{upstream}').Trim())) 'automatic convergence verifies the published remote head'
 
     # First Start rejects any pre-existing local session without a checkpoint.
     Write-Rollout (Join-Path $codexHome 'sessions\2026\08\25\residue.jsonl') '99999999-9999-4999-8999-999999999999' $cwd $fresh
@@ -223,6 +260,16 @@ try {
     New-Item -ItemType Directory -Path $secondFinishRoot -Force | Out-Null
     $secondFinish = New-CodexFinishPlan -Context (New-Context $repo $config) -PlanRoot $secondFinishRoot
     Assert-True (@(Get-ChildItem -LiteralPath $secondFinishRoot -File -Recurse -Filter '*.gz').Count -eq 0) 'unchanged second Finish reuses verified gzip without recompression'
+
+    # A stale checkpoint is advisory only and cannot authorize deletion inferred from local absence.
+    Write-AgentSessionUtf8File -Path (Join-Path $repo 'tooling-drift.txt') -Content 'drift'
+    & git -C $repo add -A
+    & git -C $repo commit -qm tooling-drift
+    Remove-Item -LiteralPath (Join-Path $codexHome 'sessions') -Recurse -Force
+    $staleFinishRoot = Join-Path $root 'StaleFinishPlan'
+    New-Item -ItemType Directory -Path $staleFinishRoot -Force | Out-Null
+    $staleFinish = New-CodexFinishPlan -Context (New-Context $repo $config) -PlanRoot $staleFinishRoot
+    Assert-True (@($staleFinish.Result.DeletedIds).Count -eq 0) 'stale checkpoint plus locally absent ID never infers deletion'
 
     # Restore is also a plan and does not mutate until the common transaction applies it.
     $restoreRoot = Join-Path $root 'RestorePlan'

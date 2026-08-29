@@ -642,20 +642,20 @@ function Get-AgentSessionVaultHead {
     $head
 }
 
-function Assert-AgentSessionCheckpointAtHead {
+function Test-AgentSessionCheckpointCurrent {
     param(
         [Parameter(Mandatory)][string]$RepoRoot,
         [Parameter(Mandatory)]$Checkpoint,
-        [switch]$AllowAncestor
+        [string]$AgentName = 'Agent'
     )
     $head = Get-AgentSessionVaultHead $RepoRoot
-    if (-not $Checkpoint.Exists) { throw '이 PC의 checkpoint가 없습니다. Start를 먼저 실행하세요.' }
-    if ([string]::Equals([string]$Checkpoint.Commit, $head, [StringComparison]::OrdinalIgnoreCase)) { return }
-    if ($AllowAncestor) {
-        & git -C $RepoRoot merge-base --is-ancestor ([string]$Checkpoint.Commit) $head
-        if ($LASTEXITCODE -eq 0) { return }
+    if (-not $Checkpoint.Exists) {
+        Write-Warning "$AgentName checkpoint가 없습니다. checkpoint 기반 삭제 추론 없이 Finish를 계속합니다."
+        return $false
     }
-    throw '이 PC의 checkpoint가 현재 Vault HEAD와 다릅니다. Start를 먼저 실행하세요.'
+    if ([string]::Equals([string]$Checkpoint.Commit, $head, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    Write-Warning "$AgentName checkpoint가 현재 Vault HEAD와 다릅니다. checkpoint 기반 삭제 추론 없이 Finish를 계속합니다."
+    return $false
 }
 
 function Prepare-AgentSessionVaultMutation {
@@ -663,24 +663,74 @@ function Prepare-AgentSessionVaultMutation {
     $dirty = @(& git -C $RepoRoot status --porcelain)
     if ($LASTEXITCODE -ne 0) { throw 'Vault working tree 상태를 확인할 수 없습니다.' }
     if ($dirty) { throw 'Vault working tree에 미커밋 변경이 있습니다.' }
-    & git -C $RepoRoot fetch --quiet
-    if ($LASTEXITCODE -ne 0) { throw 'Vault 원격 상태를 확인할 수 없습니다.' }
-    $head = Get-AgentSessionVaultHead $RepoRoot
-    $upstream = ([string](& git -C $RepoRoot rev-parse '@{upstream}')).Trim()
-    if ($LASTEXITCODE -ne 0) { throw 'Vault upstream을 확인할 수 없습니다.' }
-    if ([string]::Equals($head, $upstream, [StringComparison]::OrdinalIgnoreCase)) { return $false }
-    & git -C $RepoRoot merge-base --is-ancestor $upstream $head
-    if ($LASTEXITCODE -eq 0) {
-        & git -C $RepoRoot push
-        if ($LASTEXITCODE -ne 0) { throw '미전송 Vault commit Push가 거부됐습니다. 자동 merge하지 않습니다.' }
+    $hadPendingCommit = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
         & git -C $RepoRoot fetch --quiet
-        $verified = ([string](& git -C $RepoRoot rev-parse '@{upstream}')).Trim()
-        if (-not [string]::Equals($head, $verified, [StringComparison]::OrdinalIgnoreCase)) { throw '미전송 commit의 원격 반영을 확인하지 못했습니다.' }
-        return $true
+        if ($LASTEXITCODE -ne 0) { throw 'Vault 원격 상태를 확인할 수 없습니다.' }
+        $head = Get-AgentSessionVaultHead $RepoRoot
+        $upstream = ([string](& git -C $RepoRoot rev-parse '@{upstream}')).Trim()
+        if ($LASTEXITCODE -ne 0) { throw 'Vault upstream을 확인할 수 없습니다.' }
+        if ([string]::Equals($head, $upstream, [StringComparison]::OrdinalIgnoreCase)) { return $hadPendingCommit }
+
+        & git -C $RepoRoot merge-base --is-ancestor $head $upstream
+        if ($LASTEXITCODE -eq 0) {
+            Write-Warning '원격 Vault가 앞서 있어 fast-forward로 합류합니다.'
+            & git -C $RepoRoot merge --ff-only $upstream | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw '원격 Vault fast-forward에 실패했습니다.' }
+            continue
+        }
+
+        & git -C $RepoRoot merge-base --is-ancestor $upstream $head
+        if ($LASTEXITCODE -ne 0) {
+            $base = ([string](& git -C $RepoRoot merge-base $head $upstream)).Trim()
+            if ($LASTEXITCODE -ne 0 -or -not $base) { throw '로컬과 원격 Vault의 공통 기준을 찾을 수 없습니다.' }
+            $localPaths = @(& git -C $RepoRoot -c core.quotepath=false diff --name-only "$base..$head")
+            $remotePaths = @(& git -C $RepoRoot -c core.quotepath=false diff --name-only "$base..$upstream")
+            $remoteSet = @{}; foreach ($path in $remotePaths) { if ($path) { $remoteSet[$path] = $true } }
+            $overlaps = @($localPaths | Where-Object { $_ -and $remoteSet.ContainsKey($_) } | Sort-Object -Unique)
+            Write-Warning "로컬과 원격 Vault가 분기돼 merge로 합류합니다 (시도 $attempt/3)."
+            foreach ($path in $overlaps) { Write-Warning "  겹친 경로는 현재 호스트 사본 우선: $path" }
+            & git -C $RepoRoot merge --no-edit -X ours $upstream | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Vault 자동 merge에 실패했습니다. git status로 충돌을 확인하세요.' }
+            $hadPendingCommit = $true
+            $head = Get-AgentSessionVaultHead $RepoRoot
+        } else {
+            $hadPendingCommit = $true
+        }
+
+        & git -C $RepoRoot push
+        if ($LASTEXITCODE -eq 0) {
+            & git -C $RepoRoot fetch --quiet
+            $verified = ([string](& git -C $RepoRoot rev-parse '@{upstream}')).Trim()
+            if ([string]::Equals((Get-AgentSessionVaultHead $RepoRoot), $verified, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+        Write-Warning "Vault push가 거부되어 원격을 다시 확인합니다 (시도 $attempt/3)."
     }
-    & git -C $RepoRoot merge-base --is-ancestor $head $upstream
-    if ($LASTEXITCODE -eq 0) { throw '원격 Vault가 앞서 있습니다. Start를 먼저 실행하세요.' }
-    throw '로컬과 원격 Vault가 분기됐습니다. 자동 merge하지 않습니다.'
+    throw 'Vault push가 3회 연속 거부됐습니다. 네트워크와 원격 상태를 확인하세요.'
+}
+
+function Test-AgentSessionFinishPreflight {
+    param([Parameter(Mandatory)][string]$RepoRoot)
+    [void](Prepare-AgentSessionVaultMutation -RepoRoot $RepoRoot)
+    $planRoot = New-AgentSessionPlanRoot -Prefix 'AgentSessionSync-Preflight'
+    try {
+        foreach ($gzip in @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'Codex') -Recurse -File -Filter '*.jsonl.gz' -ErrorAction SilentlyContinue)) {
+            $integrityPath = Get-CompressedJsonlIntegrityPath $gzip.FullName
+            if (Test-Path -LiteralPath $integrityPath -PathType Leaf) {
+                $integrity = Read-CompressedJsonlIntegrity $integrityPath
+                if ($gzip.Length -ne $integrity.GzipLength -or
+                    -not [string]::Equals((Get-AgentSessionFileSha256 $gzip.FullName), $integrity.GzipSha256, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "gzip 운반물 SHA-256 또는 길이가 metadata와 다릅니다: $($gzip.FullName)"
+                }
+                continue
+            }
+            Write-Warning "legacy gzip에 integrity metadata가 없습니다. CRC/JSONL 검증 후 계속하며 다음 Finish에서 metadata를 생성합니다: $($gzip.FullName)"
+            $expanded = Join-Path $planRoot ($gzip.BaseName + '-' + [guid]::NewGuid().ToString('N'))
+            [void](Expand-JsonlTransportFile -Source $gzip.FullName -Destination $expanded)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $planRoot) { Remove-Item -LiteralPath $planRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Commit-AgentSessionVault {
@@ -698,7 +748,10 @@ function Commit-AgentSessionVault {
 function Push-AgentSessionVault {
     param([Parameter(Mandatory)][string]$RepoRoot)
     & git -C $RepoRoot push
-    if ($LASTEXITCODE -ne 0) { throw 'Vault push가 거부됐습니다. 로컬 commit은 재시도를 위해 유지됩니다.' }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'Vault push가 거부되어 원격과 merge로 합류한 뒤 재시도합니다.'
+        [void](Prepare-AgentSessionVaultMutation -RepoRoot $RepoRoot)
+    }
     & git -C $RepoRoot fetch --quiet
     if ($LASTEXITCODE -ne 0) { throw 'Push 후 원격 확인 fetch에 실패했습니다.' }
     $head = Get-AgentSessionVaultHead $RepoRoot

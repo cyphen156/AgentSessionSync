@@ -401,17 +401,16 @@ try {
     Assert-True ((Get-TreeFingerprint @($registry)) -eq $registryBefore) '앱 저장소 탐색은 아무 파일도 만들지 않아야 한다'
     Assert-True (-not (@(Get-ChildItem -LiteralPath $registry -Recurse -Force -Filter '.assync-probe-*' -ErrorAction SilentlyContinue)).Count) '탐침 파일이 남으면 안 된다'
 
-    # --- 11) checkpoint 가 Vault HEAD 와 어긋나면 계획을 만들지 않는다 ---
+    # --- 11) checkpoint 는 보조 정보다. Vault HEAD 와 어긋나도 계획을 막지 않는다 ---
     Write-AgentSessionUtf8File -Path (Join-Path $repo 'drift.txt') -Content 'drift'
     & git -C $repo add -A
     & git -C $repo commit -qm drift
-    $tripped = $false
-    try { [void](New-ClaudeFinishPlan -Context (New-TestContext $repo $config) -PlanRoot $planRoot) } catch { $tripped = $true }
-    Assert-True $tripped 'checkpoint 가 Vault HEAD 와 다르면 중단해야 한다'
+    $driftPlan = New-ClaudeFinishPlan -Context (New-TestContext $repo $config) -PlanRoot $planRoot
+    Assert-True ($null -ne $driftPlan) 'checkpoint 가 Vault HEAD 와 달라도 경고 후 Finish 계획을 만들어야 한다'
 
     Write-Host "[PASS] ClaudeSessionState: $passed assertions" -ForegroundColor Green
     Write-Host '       계획 무변경, 첫 Start 전체 가드, 마커 전용 삭제, 마커 없는 부재 보존, 최종 상태 diff,' -ForegroundColor DarkGray
-    Write-Host '       30일 아카이브, 복원·재노화, 미해결 마커 중단, 사이드카 검증, checkpoint 드리프트 중단' -ForegroundColor DarkGray
+    Write-Host '       30일 아카이브, 복원·재노화, 미해결 마커 중단, 사이드카 검증, checkpoint 드리프트 비차단' -ForegroundColor DarkGray
 }
 finally {
     $env:LOCALAPPDATA = $oldLocalAppData

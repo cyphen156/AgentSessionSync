@@ -4,11 +4,18 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'AgentLauncher.Common.ps1')
 . (Join-Path $PSScriptRoot 'AgentSessionSync.Common.ps1')
+. (Join-Path $PSScriptRoot 'CodexSessionState.Common.ps1')
+. (Join-Path $PSScriptRoot 'ClaudeSessionState.Common.ps1')
 $config = Get-AgentSessionSyncConfig $repoRoot
 $agents = @(Get-RegisteredAgents $repoRoot)
 if (-not $agents) { throw 'No enabled agents found in Agents.' }
 $timeout = [int]$config.GracefulCloseTimeoutSeconds
 Assert-CurrentProcessOutsideAgentTrees $agents
+
+Write-Host '[0/3] Preflight Vault, checkpoints, and gzip transport...' -ForegroundColor Cyan
+Test-AgentSessionFinishPreflight -RepoRoot $repoRoot
+[void](Test-AgentSessionCheckpointCurrent -RepoRoot $repoRoot -Checkpoint (Read-CodexCheckpoint $repoRoot) -AgentName 'Codex')
+[void](Test-AgentSessionCheckpointCurrent -RepoRoot $repoRoot -Checkpoint (Read-ClaudeCheckpoint $repoRoot) -AgentName 'Claude')
 
 Write-Host "[1/3] Closing all registered agent process trees..." -ForegroundColor Cyan
 foreach ($agent in ($agents | Sort-Object Order -Descending)) {
