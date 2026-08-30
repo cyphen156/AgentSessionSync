@@ -786,7 +786,6 @@ function Test-AgentSessionPlanPreflight {
         Config = $Config
         VaultCommit = $head
         NowUtc = [DateTime]::UtcNow
-        AllowCheckpointAncestor = $true
     }
     $planRoot = New-AgentSessionPlanRoot -Prefix "AgentSessionSync-${Phase}Preflight"
     try {

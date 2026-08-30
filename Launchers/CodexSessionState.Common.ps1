@@ -419,6 +419,52 @@ function Test-CodexFileHasPrefix {
     }
 }
 
+function Test-CodexLocalGroupMatchesVaultGroup {
+    <#
+      Vault Archived 가 Task 를 내리라는 현재 상태를 나타내더라도, 로컬에 아직 게시되지
+      않은 continuation 이 있으면 삭제하면 안 된다. canonical Task 의 모든 page 가 같은
+      상대경로와 raw byte 를 가질 때만 로컬 정리를 허용한다.
+    #>
+    param(
+        [Parameter(Mandatory)]$LocalGroup,
+        [Parameter(Mandatory)][string]$LocalRoot,
+        [Parameter(Mandatory)]$VaultGroup,
+        [Parameter(Mandatory)][string]$VaultTierRoot,
+        [Parameter(Mandatory)][string]$PlanRoot
+    )
+
+    $localByRelative = @{}
+    foreach ($file in $LocalGroup.Files) {
+        $relative = Get-CodexNativeRelativeFromFile -NativeRoot $LocalRoot -File $file
+        $localByRelative[$relative.ToLowerInvariant()] = $file.FullName
+    }
+    if ($localByRelative.Count -ne $VaultGroup.Files.Count) { return $false }
+
+    foreach ($file in $VaultGroup.Files) {
+        $relative = Get-CodexNativeRelativePath -TransportRoot $VaultTierRoot -Path $file.FullName
+        $sourcePath = $file.FullName
+        if ($file.Name -like '*.jsonl.gz') {
+            $relative = $relative.Substring(0, $relative.Length - 3)
+            $expanded = Join-Path $PlanRoot ('codex-archive-compare-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+            $integrityPath = Get-CompressedJsonlIntegrityPath $file.FullName
+            if (Test-Path -LiteralPath $integrityPath -PathType Leaf) {
+                [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded -IntegrityPath $integrityPath)
+            } else {
+                [void](Expand-JsonlTransportFile -Source $file.FullName -Destination $expanded)
+            }
+            $sourcePath = $expanded
+        }
+
+        $key = $relative.Replace('\', '/').ToLowerInvariant()
+        if (-not $localByRelative.ContainsKey($key)) { return $false }
+        if (-not [string]::Equals((Get-AgentSessionFileSha256 $localByRelative[$key]),
+                (Get-AgentSessionFileSha256 $sourcePath), [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function New-CodexStartPlan {
     param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][string]$PlanRoot)
     $repoRoot = [string]$Context.RepoRoot
@@ -438,18 +484,27 @@ function New-CodexStartPlan {
 
     $operations = New-Object 'Collections.Generic.List[object]'
     $warnings = New-Object 'Collections.Generic.List[string]'
-    $vaultActive = @{}
-    foreach ($id in $tiers.Active.Keys) { $vaultActive[$id] = $true }
-    if ($checkpoint.Exists) {
-        foreach ($id in $checkpoint.ActiveIds) {
-            if ($vaultActive.ContainsKey($id)) { continue }
-            foreach ($rootInfo in @(@{ Root = $nativeActiveRoot; Prefix = 'sessions' }, @{ Root = $nativeArchivedRoot; Prefix = 'archived_sessions' })) {
-                $groups = Get-CodexSessionGroups $rootInfo.Root
-                if (-not $groups.ContainsKey($id)) { continue }
-                foreach ($file in $groups[$id].Files) {
-                    $relative = Get-CodexNativeRelativeFromFile -NativeRoot $rootInfo.Root -File $file
-                    [void]$operations.Add((New-AgentSessionDeleteOperation -TargetRoot CodexHome -RelativePath ($rootInfo.Prefix + '/' + $relative)))
-                }
+    # Codex does not expose a durable native deletion marker. A task missing from
+    # the current Vault Active tier is therefore not deleted: it may be local-only
+    # work that has never been published. Only the explicit Vault Archived tier
+    # authorizes removing a local task from the normal Start-visible state.
+    $preservedArchivedLocal = @{}
+    $vaultArchiveRoot = Join-Path $repoRoot 'Codex\archive'
+    foreach ($id in $tiers.Archived.Keys) {
+        foreach ($rootInfo in @(
+            @{ Groups = $localActive; Root = $nativeActiveRoot; Prefix = 'sessions' },
+            @{ Groups = $localArchived; Root = $nativeArchivedRoot; Prefix = 'archived_sessions' }
+        )) {
+            if (-not $rootInfo.Groups.ContainsKey($id)) { continue }
+            if (-not (Test-CodexLocalGroupMatchesVaultGroup -LocalGroup $rootInfo.Groups[$id] -LocalRoot $rootInfo.Root `
+                    -VaultGroup $tiers.Archived[$id] -VaultTierRoot $vaultArchiveRoot -PlanRoot $PlanRoot)) {
+                $preservedArchivedLocal[$id] = $true
+                [void]$warnings.Add("Codex Vault Archived와 다른 로컬 Task를 미게시 변경으로 보존합니다: $id")
+                continue
+            }
+            foreach ($file in $rootInfo.Groups[$id].Files) {
+                $relative = Get-CodexNativeRelativeFromFile -NativeRoot $rootInfo.Root -File $file
+                [void]$operations.Add((New-AgentSessionDeleteOperation -TargetRoot CodexHome -RelativePath ($rootInfo.Prefix + '/' + $relative)))
             }
         }
     }
@@ -506,7 +561,9 @@ function New-CodexStartPlan {
         }
     }
 
-    $preservedLocal = @($localActive.Keys | Where-Object { -not ($checkpoint.ActiveIds -contains $_) })
+    $preservedLocal = @($localActive.Keys | Where-Object {
+        -not $tiers.Archived.ContainsKey($_) -or $preservedArchivedLocal.ContainsKey($_)
+    })
     $finalLocalIds = @($tiers.Active.Keys) + $preservedLocal | Sort-Object -Unique
     $indexArtifact = New-CodexIndexArtifact -Inputs @((Join-Path $repoRoot 'Codex\session_index.jsonl'), (Join-Path $config.CodexHome 'session_index.jsonl')) `
         -AllowedIds $finalLocalIds -PlanRoot $PlanRoot -Name 'codex-start-index'
@@ -542,8 +599,6 @@ function New-CodexFinishPlan {
     param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][string]$PlanRoot)
     $repoRoot = [string]$Context.RepoRoot
     $config = $Context.Config
-    $checkpoint = Read-CodexCheckpoint $repoRoot
-    $checkpointCurrent = Test-AgentSessionCheckpointCurrent -RepoRoot $repoRoot -Checkpoint $checkpoint -AgentName 'Codex'
     $tiers = Get-CodexTierInventory $repoRoot
     $nativeActiveRoot = Join-Path $config.CodexHome 'sessions'
     $nativeArchivedRoot = Join-Path $config.CodexHome 'archived_sessions'
@@ -552,17 +607,9 @@ function New-CodexFinishPlan {
     foreach ($id in $localActive.Keys) {
         if ($localArchived.ContainsKey($id)) { throw "Codex 로컬 세션이 sessions와 archived_sessions에 동시에 있습니다: $id" }
     }
-    $exists = @{}
-    foreach ($id in @($localActive.Keys) + @($localArchived.Keys)) { $exists[$id] = $true }
-    $deleted = @()
-    if ($checkpointCurrent) { $deleted = @($checkpoint.ActiveIds | Where-Object { -not $exists.ContainsKey($_) }) }
-
     $desired = @{}
     foreach ($group in $tiers.Active.Values) { Add-CodexDesiredVaultGroup -Desired $desired -Tier Active -Group $group -RepoRoot $repoRoot -Commit $Context.VaultCommit }
     foreach ($group in $tiers.Archived.Values) { Add-CodexDesiredVaultGroup -Desired $desired -Tier Archived -Group $group -RepoRoot $repoRoot -Commit $Context.VaultCommit }
-    foreach ($id in $deleted) {
-        foreach ($key in @($desired.Keys | Where-Object { $desired[$_].Id -eq $id })) { $desired.Remove($key) }
-    }
 
     $lastActivity = @{}
     foreach ($localSource in @(
@@ -672,7 +719,7 @@ function New-CodexFinishPlan {
         -SourcePath $localIndexArtifact.Path -SourceSha256 $localIndexArtifact.Sha256))
 
     New-CodexPlanObject -Phase Finish -Context $Context -VaultOperations @($vaultOps | ForEach-Object { $_ }) -LocalOperations @($localOps | ForEach-Object { $_ }) `
-        -Result ([pscustomobject]@{ ActiveIds=$finalActiveIds;DeletedIds=$deleted;ArchivedIds=$aged;RestoredIds=@();MissingIds=@() })
+        -Result ([pscustomobject]@{ ActiveIds=$finalActiveIds;DeletedIds=@();ArchivedIds=$aged;RestoredIds=@();MissingIds=@() })
 }
 
 function New-CodexRestorePlan {

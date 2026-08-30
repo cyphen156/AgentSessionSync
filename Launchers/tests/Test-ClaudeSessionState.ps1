@@ -76,12 +76,11 @@ function Get-TreeFingerprint {
 }
 
 function New-TestContext {
-    param([string]$RepoRoot, $Config, [switch]$AllowAncestor)
+    param([string]$RepoRoot, $Config)
     [pscustomobject]@{
         SchemaVersion = 1; RepoRoot = $RepoRoot; Config = $Config
         VaultCommit = (Get-AgentSessionVaultHead $RepoRoot)
         NowUtc = [DateTime]::UtcNow
-        AllowCheckpointAncestor = [bool]$AllowAncestor
     }
 }
 
@@ -108,7 +107,7 @@ function Invoke-TestApply {
 
     $publishedContext = [pscustomobject]@{
         SchemaVersion = 1; RepoRoot = $RepoRoot; Config = $Config; VaultCommit = $published
-        NowUtc = [DateTime]::UtcNow; AllowCheckpointAncestor = $false
+        NowUtc = [DateTime]::UtcNow
     }
     $checkpointRoot = Join-Path $PlanRoot ('Checkpoint-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $checkpointRoot -Force | Out-Null
@@ -408,9 +407,105 @@ try {
     $driftPlan = New-ClaudeFinishPlan -Context (New-TestContext $repo $config) -PlanRoot $planRoot
     Assert-True ($null -ne $driftPlan) 'checkpoint 가 Vault HEAD 와 달라도 경고 후 Finish 계획을 만들어야 한다'
 
+    # --- 12) Start 의 로컬 삭제는 checkpoint 가 아니라 Vault 계층이 정한다 ---
+    # 예전 규칙은 "checkpoint.ActiveIds 에 있는데 지금 Vault Active 가 아니면 지운다" 였다.
+    # 그러면 상대 머신이 아직 올리지 않은 대화나, Vault 가 아예 모르는 로컬 대화까지
+    # Start 가 지운다. 새 규칙은 Vault Archived 에 같은 바이트가 있을 때만 내린다.
+    $s2 = Join-Path $testRoot 'TierRule'
+    $s2Repo = Join-Path $s2 'Vault'
+    $s2Home = Join-Path $s2 'ClaudeHome'
+    $s2Local = Join-Path $s2 'LocalA'
+    $s2Roaming = Join-Path $s2 'RoamingA'
+    $s2Registry = Join-Path $s2Roaming 'Claude\claude-code-sessions'
+    New-Item -ItemType Directory -Path $s2Repo, $s2Home, $s2Local, $s2Registry -Force | Out-Null
+
+    $tierIds = @{
+        Active   = 'aaaa1111-1111-4111-8111-111111111111'  # Vault Active  → 유지
+        Same     = 'bbbb2222-2222-4222-8222-222222222222'  # Vault Archived, 바이트 동일 → 내린다
+        Diff     = 'cccc3333-3333-4333-8333-333333333333'  # Vault Archived, 바이트 다름  → 보존
+        Unknown  = 'dddd4444-4444-4444-8444-444444444444'  # 어느 계층에도 없음          → 보존
+    }
+    $tierApps = @{
+        Active  = 'aaaa1111-0000-4000-8000-000000000000'
+        Same    = 'bbbb2222-0000-4000-8000-000000000000'
+        Diff    = 'cccc3333-0000-4000-8000-000000000000'
+        Unknown = 'dddd4444-0000-4000-8000-000000000000'
+    }
+
+    & git -C $s2Repo init -q
+    & git -C $s2Repo config user.email 'test@example.com'
+    & git -C $s2Repo config user.name 'test'
+    Write-TestTranscript (Join-Path $s2Repo "Claude\sessions\$key\$($tierIds.Active).jsonl") $tierIds.Active $fresh
+    Write-TestTranscript (Join-Path $s2Repo "Claude\archive\$key\$($tierIds.Same).jsonl") $tierIds.Same $stale
+    Write-TestTranscript (Join-Path $s2Repo "Claude\archive\$key\$($tierIds.Diff).jsonl") $tierIds.Diff $stale
+    Write-TestSidecar (Join-Path $s2Repo "Claude\sessions\$key\$($tierIds.Active).entry.json") $tierApps.Active $tierIds.Active
+    Write-TestSidecar (Join-Path $s2Repo "Claude\archive\$key\$($tierIds.Same).entry.json") $tierApps.Same $tierIds.Same
+    Write-TestSidecar (Join-Path $s2Repo "Claude\archive\$key\$($tierIds.Diff).entry.json") $tierApps.Diff $tierIds.Diff
+    & git -C $s2Repo add -A
+    & git -C $s2Repo commit -qm 'tier fixture'
+
+    $oldLocal2 = $env:LOCALAPPDATA
+    $oldRoaming2 = $env:APPDATA
+    $env:LOCALAPPDATA = $s2Local
+    $env:APPDATA = $s2Roaming
+    try {
+        # 로컬: Same 은 Vault Archived 와 바이트 동일, Diff 는 이후에 더 진행되어 달라졌다.
+        Copy-Item (Join-Path $s2Repo "Claude\archive\$key\$($tierIds.Same).jsonl") `
+                  (New-Item -ItemType Directory -Path (Join-Path $s2Home "projects\$key") -Force | ForEach-Object { Join-Path $_.FullName "$($tierIds.Same).jsonl" })
+        Write-TestTranscript (Join-Path $s2Home "projects\$key\$($tierIds.Diff).jsonl") $tierIds.Diff $fresh
+        Write-TestTranscript (Join-Path $s2Home "projects\$key\$($tierIds.Unknown).jsonl") $tierIds.Unknown $fresh
+        Write-TestEntry $s2Registry $tierApps.Same $tierIds.Same
+        Write-TestEntry $s2Registry $tierApps.Unknown $tierIds.Unknown
+
+        # checkpoint 에는 Unknown 과 Same 이 활성으로 적혀 있다. 예전 규칙이라면 둘 다 지운다.
+        Write-AgentSessionUtf8File -Path (Get-ClaudeCheckpointPath $s2Repo) -Content ([pscustomobject]@{
+            schemaVersion = 1; commit = (Get-AgentSessionVaultHead $s2Repo)
+            claudeActiveIds = @($tierIds.Unknown, $tierIds.Same)
+            entryMap = @{}
+        } | ConvertTo-Json -Depth 10)
+
+        $s2Config = [pscustomobject]@{ ClaudeHome = $s2Home; ActiveWindowDays = 30 }
+        $s2PlanRoot = New-AgentSessionPlanRoot -Prefix 'ClaudeTierRule'
+        $tierPlan = New-ClaudeStartPlan -Context (New-TestContext $s2Repo $s2Config) -PlanRoot $s2PlanRoot
+
+        $deleted = @($tierPlan.LocalOperations | Where-Object { $_.Kind -eq 'Delete' })
+        $deletedTranscripts = @($deleted | Where-Object { $_.RelativePath -like '*.jsonl' } | ForEach-Object { $_.RelativePath })
+
+        Assert-True ($deletedTranscripts.Count -eq 1) "Vault Archived 와 동일한 원문 하나만 내려야 한다 (실제 $($deletedTranscripts.Count)건)"
+        Assert-True ($deletedTranscripts[0] -eq "projects/$key/$($tierIds.Same).jsonl") 'Archived 와 바이트가 같은 원문을 내려야 한다'
+        Assert-True (@($deleted | Where-Object { $_.RelativePath -like "*$($tierIds.Unknown)*" }).Count -eq 0) `
+            'Vault 가 모르는 로컬 원문은 checkpoint 에 활성으로 적혀 있어도 지우면 안 된다'
+        Assert-True (@($deleted | Where-Object { $_.RelativePath -like "*$($tierIds.Diff)*" }).Count -eq 0) `
+            'Archived 와 바이트가 다르면 아직 올라가지 않은 변경이므로 지우면 안 된다'
+        Assert-True (@($deleted | Where-Object { $_.TargetRoot -eq 'ClaudeRegistry' -and $_.RelativePath -like "*$($tierApps.Same)*" }).Count -eq 1) `
+            '원문을 내릴 때 목록 항목도 함께 내려야 한다'
+        Assert-True (@($deleted | Where-Object { $_.TargetRoot -eq 'ClaudeRegistry' -and $_.RelativePath -like "*$($tierApps.Unknown)*" }).Count -eq 0) `
+            '보존한 원문의 목록 항목은 남아 있어야 한다'
+
+        # 결과값만으로는 사용자에게 닿지 않는다. 사유별로 묶인 경고가 함께 나와야 한다.
+        $tierWarnings = @($tierPlan.Warnings)
+        Assert-True ($tierWarnings.Count -eq 2) "보존 사유 두 종류가 각각 한 줄로 보고돼야 한다 (실제 $($tierWarnings.Count)줄)"
+        Assert-True (@($tierWarnings | Where-Object { $_ -like "*$($tierIds.Unknown)*" -and $_ -like '*어느 계층에도 없어*' }).Count -eq 1) `
+            'Vault 미지 보존이 사유와 함께 보고돼야 한다'
+        Assert-True (@($tierWarnings | Where-Object { $_ -like "*$($tierIds.Diff)*" -and $_ -like '*미게시 변경*' }).Count -eq 1) `
+            'Archived 불일치 보존이 사유와 함께 보고돼야 한다'
+        Assert-True (-not (@($tierWarnings | Where-Object { $_ -like "*$($tierIds.Same)*" }).Count)) '내린 원문은 경고 대상이 아니다'
+
+        $preserved = @($tierPlan.Result.PreservedLocalIds)
+        Assert-True ($preserved -contains $tierIds.Unknown) '보존 사유를 결과로 보고해야 한다 (Vault 미지 원문)'
+        Assert-True ($preserved -contains $tierIds.Diff) '보존 사유를 결과로 보고해야 한다 (Archived 와 불일치)'
+        Assert-True (-not ($preserved -contains $tierIds.Same)) '내린 원문은 보존 목록에 들어가면 안 된다'
+        Assert-True (-not ($preserved -contains $tierIds.Active)) 'Vault Active 는 보존 목록 대상이 아니다'
+    }
+    finally {
+        $env:LOCALAPPDATA = $oldLocal2
+        $env:APPDATA = $oldRoaming2
+    }
+
     Write-Host "[PASS] ClaudeSessionState: $passed assertions" -ForegroundColor Green
     Write-Host '       계획 무변경, 첫 Start 전체 가드, 마커 전용 삭제, 마커 없는 부재 보존, 최종 상태 diff,' -ForegroundColor DarkGray
-    Write-Host '       30일 아카이브, 복원·재노화, 미해결 마커 중단, 사이드카 검증, checkpoint 드리프트 비차단' -ForegroundColor DarkGray
+    Write-Host '       30일 아카이브, 복원·재노화, 미해결 마커 중단, 사이드카 검증, checkpoint 드리프트 비차단,' -ForegroundColor DarkGray
+    Write-Host '       Start 로컬 삭제의 Vault 계층 기준화' -ForegroundColor DarkGray
 }
 finally {
     $env:LOCALAPPDATA = $oldLocalAppData

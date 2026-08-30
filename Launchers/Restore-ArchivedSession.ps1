@@ -22,7 +22,7 @@ foreach ($required in @('New-CodexRestorePlan','New-CodexCheckpointPlan','New-Cl
 $retried = Prepare-AgentSessionVaultMutation -RepoRoot $RepoRoot
 if ($retried) { throw 'A pending Vault commit was published. Run Start before Restore so local state and both checkpoints catch up.' }
 $baseCommit = Get-AgentSessionVaultHead $RepoRoot
-$context = [pscustomobject]@{SchemaVersion=1;RepoRoot=$RepoRoot;Config=$Config;VaultCommit=$baseCommit;NowUtc=[DateTime]::UtcNow;AllowCheckpointAncestor=$false}
+$context = [pscustomobject]@{SchemaVersion=1;RepoRoot=$RepoRoot;Config=$Config;VaultCommit=$baseCommit;NowUtc=[DateTime]::UtcNow}
 
 $candidates = @()
 $codexTiers = Get-CodexTierInventory $RepoRoot
@@ -85,7 +85,7 @@ try {
         throw "Vault restore succeeded, but $($selected.Agent) did not close. Local restore was not applied. Close it and run Start. $($_.Exception.Message)"
     }
 
-    $publishedContext = [pscustomobject]@{SchemaVersion=1;RepoRoot=$RepoRoot;Config=$Config;VaultCommit=$published;NowUtc=$context.NowUtc;AllowCheckpointAncestor=$false}
+    $publishedContext = [pscustomobject]@{SchemaVersion=1;RepoRoot=$RepoRoot;Config=$Config;VaultCommit=$published;NowUtc=$context.NowUtc}
     $localPlans = @($restorePlan)
     $localRootMap = Get-AgentSessionRootMap -Plans $localPlans -RepoRoot $RepoRoot
     Assert-AgentSessionPlans -Plans $localPlans -RootMap $localRootMap -ExpectedVaultCommit $baseCommit -PlanRoot $PlanRoot -OperationProperties @('LocalOperations')

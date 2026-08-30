@@ -25,7 +25,6 @@ function New-AgentSessionStartPlanSet {
         Config = $Config
         VaultCommit = $Commit
         NowUtc = [DateTime]::UtcNow
-        AllowCheckpointAncestor = $false
     }
     $codexRoot = Join-Path $Root 'Codex'
     $claudeRoot = Join-Path $Root 'Claude'

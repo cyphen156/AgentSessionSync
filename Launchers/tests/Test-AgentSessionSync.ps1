@@ -30,8 +30,8 @@ function Write-Rollout([string]$Path, [string]$Id, [string]$Cwd, [string]$Timest
     $message = [ordered]@{ type='event_msg';payload=[ordered]@{type='message'};timestamp=$Timestamp;ordinal=1 } | ConvertTo-Json -Compress
     @($meta,$message) | Set-Content -LiteralPath $Path -Encoding UTF8
 }
-function New-Context([string]$Repo, $Config, [bool]$AllowAncestor = $false) {
-    [pscustomobject]@{ SchemaVersion=1;RepoRoot=$Repo;Config=$Config;VaultCommit=(Get-AgentSessionVaultHead $Repo);NowUtc=[DateTime]::UtcNow;AllowCheckpointAncestor=$AllowAncestor }
+function New-Context([string]$Repo, $Config) {
+    [pscustomobject]@{ SchemaVersion=1;RepoRoot=$Repo;Config=$Config;VaultCommit=(Get-AgentSessionVaultHead $Repo);NowUtc=[DateTime]::UtcNow }
 }
 function Apply-PlanOperations($Plans, [string]$Property, [string]$Repo, [string]$TxnRoot, [string]$PlanRoot) {
     $map = Get-AgentSessionRootMap -Plans $Plans -RepoRoot $Repo
@@ -60,6 +60,8 @@ try {
     $idA = '11111111-1111-4111-8111-111111111111'
     $idB = '22222222-2222-4222-8222-222222222222'
     $idC = '33333333-3333-4333-8333-333333333333'
+    $idD = '88888888-8888-4888-8888-888888888888'
+    $idE = '99999999-9999-4999-8999-999999999999'
     $idOnly = '44444444-4444-4444-8444-444444444444'
     $idOnlyPath = Join-Path $root 'IdOnly\rollout-id-only.jsonl'
     Write-Rollout $idOnlyPath $idOnly $cwd $fresh -IdOnly
@@ -188,6 +190,70 @@ try {
     Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).ContainsKey($idA)) 'Start materializes Vault Active locally'
     Assert-True ((Read-CodexCheckpoint $repo).ActiveIds -contains $idA) 'Start checkpoint records the active ID'
 
+    # checkpoint membership is diagnostic only. A local task that is absent from both
+    # current Vault tiers must survive even when an old checkpoint happened to list it.
+    $localD = Join-Path $codexHome "sessions\2026\08\25\rollout-$idD.jsonl"
+    Write-Rollout $localD $idD $cwd $fresh
+    Add-Content -LiteralPath (Join-Path $codexHome 'session_index.jsonl') `
+        -Value (([ordered]@{id=$idD;title='D'} | ConvertTo-Json -Compress)) -Encoding UTF8
+    $localOnlyCheckpointRoot = Join-Path $root 'LocalOnlyCheckpoint'
+    New-Item -ItemType Directory -Path $localOnlyCheckpointRoot -Force | Out-Null
+    $localOnlyState = [pscustomobject]@{ ActiveIds=@($idA,$idD) }
+    $localOnlyCheckpoint = New-CodexCheckpointPlan -Context $context -State $localOnlyState `
+        -PublishedCommit $context.VaultCommit -PlanRoot $localOnlyCheckpointRoot
+    Apply-PlanOperations @($localOnlyCheckpoint) LocalOperations $repo `
+        (Join-Path $root 'LocalOnlyCheckpointTxn') $localOnlyCheckpointRoot
+
+    $preserveRoot = Join-Path $root 'PreserveLocalPlan'
+    New-Item -ItemType Directory -Path $preserveRoot -Force | Out-Null
+    $preserve = New-CodexStartPlan -Context (New-Context $repo $config) -PlanRoot $preserveRoot
+    Assert-True (-not (@($preserve.LocalOperations | Where-Object { $_.Kind -eq 'Delete' -and $_.RelativePath -like "*$idD*" }).Count)) `
+        'Start never deletes a local-only task because a checkpoint listed it'
+    Assert-True ($preserve.Result.LocalActiveIds -contains $idD) 'local-only task remains in the final local active set'
+    Apply-PlanOperations @($preserve) LocalOperations $repo (Join-Path $root 'PreserveLocalTxn') $preserveRoot
+    Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).ContainsKey($idD)) 'local-only rollout survives Start'
+    Assert-True ((Get-CodexIndexLinesById @((Join-Path $codexHome 'session_index.jsonl'))).ContainsKey($idD)) 'local-only task remains in the local index'
+
+    # E exists in Vault Archived, but the local copy has an unpublished suffix.
+    # Current tier alone cannot authorize destroying those newer bytes.
+    $vaultE = Join-Path $repo "Codex\archive\$key\2026\08\25\rollout-$idE.jsonl"
+    Write-Rollout $vaultE $idE $cwd $fresh
+    $localE = Join-Path $codexHome "sessions\2026\08\25\rollout-$idE.jsonl"
+    Copy-Item -LiteralPath $vaultE -Destination $localE
+    Add-Content -LiteralPath $localE -Value (([ordered]@{type='event_msg';payload=[ordered]@{type='message'};timestamp=$fresh;ordinal=2} | ConvertTo-Json -Compress)) -Encoding UTF8
+    Add-Content -LiteralPath (Join-Path $codexHome 'session_index.jsonl') `
+        -Value (([ordered]@{id=$idE;title='E'} | ConvertTo-Json -Compress)) -Encoding UTF8
+
+    # The explicit current Vault Archived tier, not checkpoint history, authorizes
+    # removing the task from the normal Start-visible local state.
+    Write-Rollout (Join-Path $repo "Codex\archive\$key\2026\08\25\rollout-$idD.jsonl") $idD $cwd $fresh
+    & git -C $repo add -A
+    & git -C $repo commit -qm 'archive D in Vault'
+    $archiveContext = New-Context $repo $config
+    $activeOnlyCheckpointRoot = Join-Path $root 'ActiveOnlyCheckpoint'
+    New-Item -ItemType Directory -Path $activeOnlyCheckpointRoot -Force | Out-Null
+    $activeOnlyCheckpoint = New-CodexCheckpointPlan -Context $archiveContext `
+        -State ([pscustomobject]@{ ActiveIds=@($idA) }) -PublishedCommit $archiveContext.VaultCommit `
+        -PlanRoot $activeOnlyCheckpointRoot
+    Apply-PlanOperations @($activeOnlyCheckpoint) LocalOperations $repo `
+        (Join-Path $root 'ActiveOnlyCheckpointTxn') $activeOnlyCheckpointRoot
+
+    $archiveStartRoot = Join-Path $root 'ArchiveStartPlan'
+    New-Item -ItemType Directory -Path $archiveStartRoot -Force | Out-Null
+    $archiveStart = New-CodexStartPlan -Context $archiveContext -PlanRoot $archiveStartRoot
+    Assert-True (@($archiveStart.LocalOperations | Where-Object { $_.Kind -eq 'Delete' -and $_.RelativePath -like "*$idD*" }).Count -eq 1) `
+        'Start removes a local task only when the current Vault tier is Archived'
+    Assert-True ($archiveStart.Result.LocalActiveIds -notcontains $idD) 'Vault Archived task is excluded from the final local active set'
+    Assert-True (-not (@($archiveStart.LocalOperations | Where-Object { $_.Kind -eq 'Delete' -and $_.RelativePath -like "*$idE*" }).Count)) `
+        'Start preserves an archived Task whose local pages contain unpublished bytes'
+    Assert-True ($archiveStart.Result.LocalActiveIds -contains $idE) 'preserved archived Task remains in the final local active set'
+    Assert-True (@($archiveStart.Warnings | Where-Object { $_ -like "*$idE*" }).Count -eq 1) 'preserved archived Task is reported'
+    Apply-PlanOperations @($archiveStart) LocalOperations $repo (Join-Path $root 'ArchiveStartTxn') $archiveStartRoot
+    Assert-True (-not (Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).ContainsKey($idD)) 'Vault Archived rollout is removed from local sessions'
+    Assert-True (-not (Get-CodexIndexLinesById @((Join-Path $codexHome 'session_index.jsonl'))).ContainsKey($idD)) 'Vault Archived task is removed from the local index'
+    Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).ContainsKey($idE)) 'unpublished local continuation survives Start'
+    Assert-True ((Get-CodexIndexLinesById @((Join-Path $codexHome 'session_index.jsonl'))).ContainsKey($idE)) 'preserved archived Task remains in the local index'
+
     # Start must not replace a local append-only continuation with a stale Vault prefix. Replacing
     # the prefix invalidates Codex thread_history byte offsets and hides every projected turn after
     # the stale boundary.
@@ -199,7 +265,7 @@ try {
     New-Item -ItemType Directory -Path $appendStartRoot -Force | Out-Null
     $appendStart = New-CodexStartPlan -Context (New-Context $repo $config) -PlanRoot $appendStartRoot
     Assert-True (@($appendStart.LocalOperations | Where-Object RelativePath -eq 'sessions/2026/08/25/rollout-a.jsonl').Count -eq 0) 'Start does not overwrite a local append-only suffix with the Vault prefix'
-    Assert-True (@($appendStart.Warnings).Count -eq 1) 'Start reports the preserved local append-only suffix'
+    Assert-True (@($appendStart.Warnings | Where-Object { $_ -like '*append 전용 최신 suffix*' }).Count -eq 1) 'Start reports the preserved local append-only suffix'
     Apply-PlanOperations @($appendStart) LocalOperations $repo (Join-Path $root 'AppendStartTxn') $appendStartRoot
     Assert-True ((Get-Item -LiteralPath $localA).Length -eq $suffixLength -and $suffixLength -gt $localLengthBeforeSuffix) 'Start preserves the complete local append-only rollout'
 
@@ -210,7 +276,8 @@ try {
     try { [void](New-CodexStartPlan -Context (New-Context $repo $config) -PlanRoot (Join-Path $root 'DivergentStartPlan')) } catch { $divergenceRejected = $true }
     Assert-True $divergenceRejected 'Start refuses a non-append rollout divergence instead of overwriting local history'
 
-    # A is deleted. B is a two-page live thread. C is a stale new thread.
+    # A is locally absent but must remain preserved in the Vault. B is a two-page
+    # live thread. C is a stale new thread.
     Remove-Item -LiteralPath (Join-Path $codexHome 'sessions') -Recurse -Force
     $idBPage2 = '77777777-7777-4777-8777-777777777777'
     $idBRootPath = Join-Path $codexHome "sessions\2026\08\25\rollout-2026-08-25T00-00-00-$idB.jsonl"
@@ -232,7 +299,8 @@ try {
     $context = New-Context $repo $config
     $finish = New-CodexFinishPlan -Context $context -PlanRoot $finishRoot
     Assert-True (-not (& git -C $repo status --porcelain)) 'Finish planning does not mutate the Vault'
-    Assert-True ($finish.Result.DeletedIds -contains $idA) 'missing native Codex session is deleted'
+    Assert-True (@($finish.Result.DeletedIds).Count -eq 0) 'Codex Finish never infers deletion from local absence'
+    Assert-True ($finish.Result.ActiveIds -contains $idA) 'locally absent Vault task remains preserved'
     Assert-True ($finish.Result.ActiveIds -contains $idB) 'live multi-page thread remains active'
     Assert-True ($finish.Result.ArchivedIds -contains $idC) 'stale thread passing through the app archive is preserved in the Vault archive'
     Assert-True (@($finish.VaultOperations | Group-Object { "$($_.TargetRoot)|$($_.RelativePath)" } | Where-Object Count -gt 1).Count -eq 0) 'Finish emits one operation per target'
@@ -242,17 +310,24 @@ try {
     $published = Push-AgentSessionVault $repo
     Assert-True ($commit -eq $published) 'Finish commit is verified at the remote'
     Apply-PlanOperations @($finish) LocalOperations $repo (Join-Path $root 'FinishLocalTxn') $finishRoot
-    $publishedContext = [pscustomobject]@{SchemaVersion=1;RepoRoot=$repo;Config=$config;VaultCommit=$published;NowUtc=$context.NowUtc;AllowCheckpointAncestor=$false}
+    $publishedContext = [pscustomobject]@{SchemaVersion=1;RepoRoot=$repo;Config=$config;VaultCommit=$published;NowUtc=$context.NowUtc}
     $checkpointRoot = Join-Path $root 'FinishCheckpoint'
     New-Item -ItemType Directory -Path $checkpointRoot -Force | Out-Null
     $checkpoint = New-CodexCheckpointPlan -Context $publishedContext -State $finish.Result -PublishedCommit $published -PlanRoot $checkpointRoot
     Apply-PlanOperations @($checkpoint) LocalOperations $repo (Join-Path $root 'FinishCheckpointTxn') $checkpointRoot
     $tiers = Get-CodexTierInventory $repo
-    Assert-True (-not $tiers.Active.ContainsKey($idA)) 'deleted thread is absent from both final active state'
+    Assert-True ($tiers.Active.ContainsKey($idA)) 'locally absent task remains in the final Vault active state'
     Assert-True ($tiers.Active.ContainsKey($idB) -and $tiers.Active[$idB].Files.Count -eq 2) 'multi-page thread is grouped and preserved'
     Assert-True ($tiers.Archived.ContainsKey($idC)) 'aged thread exists only in archive'
     Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'sessions')).Keys.Count -eq 1) 'post-publish local cleanup leaves the final active set'
     Assert-True ((Get-CodexSessionGroups (Join-Path $codexHome 'archived_sessions')).Count -eq 0) 'post-publish cleanup removes the app archive copy'
+
+    $postFinishStartRoot = Join-Path $root 'PostFinishStartPlan'
+    New-Item -ItemType Directory -Path $postFinishStartRoot -Force | Out-Null
+    $postFinishStart = New-CodexStartPlan -Context (New-Context $repo $config) -PlanRoot $postFinishStartRoot
+    Assert-True (@($postFinishStart.LocalOperations | Where-Object {
+        $_.Kind -eq 'Put' -and $_.TargetRoot -eq 'CodexHome' -and $_.RelativePath -like '*rollout-a.jsonl'
+    }).Count -eq 1) 'next Start restores a locally deleted Codex task that remains in the Vault'
 
     $cachedGzip = Join-Path $repo "Codex\sessions\$key\2026\08\25\rollout-2026-08-25T00-00-00-$idB.jsonl.gz"
     Assert-True ((Test-Path -LiteralPath $cachedGzip) -and (Test-Path -LiteralPath (Get-CompressedJsonlIntegrityPath $cachedGzip))) 'first Finish publishes gzip with raw and gzip integrity metadata'
@@ -261,7 +336,7 @@ try {
     $secondFinish = New-CodexFinishPlan -Context (New-Context $repo $config) -PlanRoot $secondFinishRoot
     Assert-True (@(Get-ChildItem -LiteralPath $secondFinishRoot -File -Recurse -Filter '*.gz').Count -eq 0) 'unchanged second Finish reuses verified gzip without recompression'
 
-    # A stale checkpoint is advisory only and cannot authorize deletion inferred from local absence.
+    # A stale checkpoint is advisory only; Codex never infers deletion from absence.
     Write-AgentSessionUtf8File -Path (Join-Path $repo 'tooling-drift.txt') -Content 'drift'
     & git -C $repo add -A
     & git -C $repo commit -qm tooling-drift

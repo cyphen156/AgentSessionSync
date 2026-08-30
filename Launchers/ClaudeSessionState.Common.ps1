@@ -459,13 +459,39 @@ function New-ClaudeStartPlan {
     $byCanonical = Get-ClaudeEntriesByCanonicalId $entries
 
     $operations = New-Object 'Collections.Generic.List[object]'
-    # 이전에 Vault Active 였는데 지금 Active 가 아니면 활성 작업 집합에서 내린다.
-    # 한 번도 올라간 적 없는 로컬 신규는 checkpoint 에 없으므로 여기 걸리지 않는다.
-    foreach ($id in $checkpoint.ActiveIds) {
+    $warnings = New-Object 'Collections.Generic.List[string]'
+    $unknownToVault = @()
+    $archivedMismatch = @()
+    # 로컬에서 무엇을 내릴지는 checkpoint 가 아니라 지금 Vault 계층이 정한다.
+    # Archived 는 Finish 가 이미 Vault 에 올려둔 뒤 활성 작업 집합에서 내린 것이므로
+    # 로컬 사본을 지워도 원문이 남는다. 어느 계층에도 없으면 모르는 것이니 보존한다.
+    foreach ($id in @($transcripts.Keys)) {
         if ($tiers.Active.ContainsKey($id)) { continue }
+        if (-not $tiers.Archived.ContainsKey($id)) { $unknownToVault += $id; continue }
+        # Vault Archived 사본과 바이트가 같을 때만 내린다. 다르면 아직 올라가지 않은
+        # 로컬 변경이 있다는 뜻이므로 지우지 않고 보존한다.
+        $localPath = Join-Path (Join-Path $projectsRoot $transcripts[$id].Key) ($id + '.jsonl')
+        $archivedSha = Get-AgentSessionFileSha256 $tiers.Archived[$id].Transcript
+        if (-not [string]::Equals((Get-AgentSessionFileSha256 $localPath), $archivedSha, [StringComparison]::OrdinalIgnoreCase)) {
+            $archivedMismatch += $id
+            continue
+        }
         foreach ($operation in (Get-ClaudeLocalDeleteOperations -Id $id -Transcripts $transcripts -EntriesByCanonical $byCanonical)) {
             [void]$operations.Add($operation)
         }
+    }
+    # 보존 사실은 결과값만으로는 사용자에게 닿지 않는다. 사유별로 한 줄씩 묶어 낸다.
+    # ID 마다 한 줄씩 내면 세션이 많을 때 출력이 그대로 묻힌다.
+    $preservedLocal = @(@($unknownToVault) + @($archivedMismatch) | Sort-Object)
+    foreach ($group in @(
+        @{ Ids = $unknownToVault;   Reason = 'Vault 어느 계층에도 없어 판단하지 않고 보존합니다' },
+        @{ Ids = $archivedMismatch; Reason = 'Vault Archived 사본과 원문이 달라 미게시 변경으로 보존합니다' }
+    )) {
+        $ids = @($group.Ids | Sort-Object)
+        if ($ids.Count -eq 0) { continue }
+        $shown = @($ids | Select-Object -First 5)
+        $suffix = if ($ids.Count -gt $shown.Count) { ' 외 ' + ($ids.Count - $shown.Count) + '건' } else { '' }
+        [void]$warnings.Add('Claude 로컬 원문 ' + $ids.Count + '건을 ' + $group.Reason + ': ' + ($shown -join ', ') + $suffix)
     }
 
     foreach ($id in $tiers.Active.Keys) {
@@ -492,7 +518,9 @@ function New-ClaudeStartPlan {
     }
 
     New-ClaudePlanObject -Phase Start -Context $Context -VaultOperations @() -LocalOperations @($operations | ForEach-Object { $_ }) `
-        -Result ([pscustomobject]@{ ActiveIds = @($tiers.Active.Keys); DeletedIds = @(); ArchivedIds = @(); RestoredIds = @(); MissingIds = @() })
+        -Warnings @($warnings | ForEach-Object { $_ }) `
+        -Result ([pscustomobject]@{ ActiveIds = @($tiers.Active.Keys); DeletedIds = @(); ArchivedIds = @(); RestoredIds = @(); MissingIds = @()
+            PreservedLocalIds = @($preservedLocal) })
 }
 
 function New-ClaudeFinishPlan {
@@ -501,8 +529,10 @@ function New-ClaudeFinishPlan {
     $config = $Context.Config
     $projectsRoot = Join-Path $config.ClaudeHome 'projects'
     $registryRoot = Get-ClaudeAppRegistryRoot -AllowMissing
+    # checkpoint 는 삭제 마커를 canonical ID 로 옮기는 변환표로만 쓴다. 최신 여부 경고는
+    # 사용자 진입점인 Finish 가 두 에이전트 몫을 한 번씩 낸다. 여기서 또 내면 Claude 만
+    # 같은 경고를 두 번 출력한다.
     $checkpoint = Read-ClaudeCheckpoint $repoRoot
-    [void](Test-AgentSessionCheckpointCurrent -RepoRoot $repoRoot -Checkpoint $checkpoint -AgentName 'Claude')
 
     $tiers = Get-ClaudeTierInventory $repoRoot
     $transcripts = Get-ClaudeTranscriptSet $projectsRoot

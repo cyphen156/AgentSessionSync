@@ -43,7 +43,6 @@ try {
         Config = $Config
         VaultCommit = $baseCommit
         NowUtc = [DateTime]::UtcNow
-        AllowCheckpointAncestor = [bool]$retriedPendingCommit
     }
     $codexPlanRoot = Join-Path $PlanRoot 'Codex'
     $claudePlanRoot = Join-Path $PlanRoot 'Claude'
@@ -98,7 +97,7 @@ try {
 
     $publishedContext = [pscustomobject]@{
         SchemaVersion = 1; RepoRoot = $RepoRoot; Config = $Config; VaultCommit = $published
-        NowUtc = $context.NowUtc; AllowCheckpointAncestor = $false
+        NowUtc = $context.NowUtc
     }
     $localPlans = @($codexPlan, $claudePlan)
     $localRootMap = Get-AgentSessionRootMap -Plans $localPlans -RepoRoot $RepoRoot
