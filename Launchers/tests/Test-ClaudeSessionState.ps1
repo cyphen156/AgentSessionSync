@@ -502,6 +502,177 @@ try {
         $env:APPDATA = $oldRoaming2
     }
 
+    # --- 13) 로컬에서 이미 다른 원문으로 옮겨간 대화는 Vault 가 되감지 못한다 ---
+    # 앱은 같은 대화를 이어 열 때 cliSessionId 를 새로 발급하지만 목록 항목(appSessionId)
+    # 은 그대로 둔다. Vault 사이드카는 발급 당시의 옛 원문을 주장하므로, 그대로 쓰면
+    # 살아 있는 대화가 과거 원문으로 되감긴다. 운영 Vault 에서 실제로 1건 확인됐다.
+    $s3 = Join-Path $testRoot 'Rebind'
+    $s3Repo = Join-Path $s3 'Vault'
+    $s3Home = Join-Path $s3 'ClaudeHome'
+    $s3Local = Join-Path $s3 'LocalA'
+    $s3Roaming = Join-Path $s3 'RoamingA'
+    $s3Registry = Join-Path $s3Roaming 'Claude\claude-code-sessions'
+    New-Item -ItemType Directory -Path $s3Repo, $s3Home, $s3Local, $s3Registry -Force | Out-Null
+
+    $app = @{
+        Rebound = 'aaaabbbb-0000-4000-8000-000000000001'  # Vault 는 Old, 로컬은 New 를 가리킴
+        Stable  = 'aaaabbbb-0000-4000-8000-000000000002'  # 양쪽이 같은 원문
+        Unbound = 'aaaabbbb-0000-4000-8000-000000000003'  # 로컬 항목의 cliSessionId 가 빔
+    }
+    $rid = @{
+        Old    = '10000000-0000-4000-8000-000000000001'
+        New    = '10000000-0000-4000-8000-000000000002'
+        Stable = '10000000-0000-4000-8000-000000000003'
+        Unbound= '10000000-0000-4000-8000-000000000004'
+    }
+
+    & git -C $s3Repo init -q
+    & git -C $s3Repo config user.email 'test@example.com'
+    & git -C $s3Repo config user.name 'test'
+    foreach ($pair in @(
+        @{ Id = $rid.Old;     App = $app.Rebound },
+        @{ Id = $rid.Stable;  App = $app.Stable },
+        @{ Id = $rid.Unbound; App = $app.Unbound }
+    )) {
+        Write-TestTranscript (Join-Path $s3Repo "Claude\sessions\$key\$($pair.Id).jsonl") $pair.Id $fresh
+        Write-TestSidecar (Join-Path $s3Repo "Claude\sessions\$key\$($pair.Id).entry.json") $pair.App $pair.Id
+    }
+    & git -C $s3Repo add -A
+    & git -C $s3Repo commit -qm 'rebind fixture'
+
+    $oldLocal3 = $env:LOCALAPPDATA
+    $oldRoaming3 = $env:APPDATA
+    $env:LOCALAPPDATA = $s3Local
+    $env:APPDATA = $s3Roaming
+    try {
+        # 로컬: Rebound 항목은 이미 New 로 옮겨갔고 New 원문만 로컬에 있다.
+        Write-TestEntry $s3Registry $app.Rebound $rid.New
+        Write-TestTranscript (Join-Path $s3Home "projects\$key\$($rid.New).jsonl") $rid.New $fresh
+        # Stable 은 Vault 와 같은 원문에 묶여 있고 로컬 원문은 아직 없다.
+        Write-TestEntry $s3Registry $app.Stable $rid.Stable
+        # Unbound 는 항목만 있고 아무 원문에도 묶여 있지 않다.
+        Write-AgentSessionUtf8File -Path (Join-Path $s3Registry "workspace\window\local_$($app.Unbound).json") `
+            -Content ([ordered]@{ sessionId = "local_$($app.Unbound)"; cliSessionId = ''; cwd = 'C:\Project\Demo' } | ConvertTo-Json)
+
+        Write-AgentSessionUtf8File -Path (Get-ClaudeCheckpointPath $s3Repo) -Content ([pscustomobject]@{
+            schemaVersion = 1; commit = (Get-AgentSessionVaultHead $s3Repo); claudeActiveIds = @(); entryMap = @{}
+        } | ConvertTo-Json -Depth 10)
+
+        $s3Config = [pscustomobject]@{ ClaudeHome = $s3Home; ActiveWindowDays = 30 }
+        $s3PlanRoot = New-AgentSessionPlanRoot -Prefix 'ClaudeRebind'
+        $reboundPlan = New-ClaudeStartPlan -Context (New-TestContext $s3Repo $s3Config) -PlanRoot $s3PlanRoot
+
+        $puts = @($reboundPlan.LocalOperations | Where-Object { $_.Kind -ne 'Delete' })
+
+        # 2) 되감길 항목에 대한 registry Put 이 없어야 한다
+        Assert-True (@($puts | Where-Object { $_.TargetRoot -eq 'ClaudeRegistry' -and $_.RelativePath -like "*$($app.Rebound)*" }).Count -eq 0) `
+            '이미 다른 원문으로 옮겨간 목록 항목을 덮어쓰면 안 된다'
+        # 3) 옛 Vault 원문 Put 도 없어야 한다 (묶음 전체 skip)
+        Assert-True (@($puts | Where-Object { $_.RelativePath -like "*$($rid.Old)*" }).Count -eq 0) `
+            '건너뛴 묶음의 옛 원문도 내려받으면 안 된다'
+        # 4) 로컬 항목과 현재 원문은 계획 적용 뒤에도 그대로여야 한다
+        $reboundEntryPath = Join-Path $s3Registry "workspace\window\local_$($app.Rebound).json"
+        $newTranscriptPath = Join-Path $s3Home "projects\$key\$($rid.New).jsonl"
+        $entryShaBefore = Get-AgentSessionFileSha256 $reboundEntryPath
+        $newShaBefore = Get-AgentSessionFileSha256 $newTranscriptPath
+        Invoke-TestApply -RepoRoot $s3Repo -Config $s3Config -Plan $reboundPlan -PlanRoot $s3PlanRoot -SkipVault
+        Assert-True ((Get-AgentSessionFileSha256 $reboundEntryPath) -eq $entryShaBefore) '계획 적용 뒤에도 로컬 목록 항목이 그대로여야 한다'
+        Assert-True ((Get-AgentSessionFileSha256 $newTranscriptPath) -eq $newShaBefore) '계획 적용 뒤에도 현재 원문이 그대로여야 한다'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $s3Home "projects\$key\$($rid.Old).jsonl"))) '옛 원문이 로컬에 생기면 안 된다'
+
+        # 5) 경고에 세 ID 가 모두 있어야 한다
+        $reboundWarn = @($reboundPlan.Warnings | Where-Object { $_ -like "*$($app.Rebound)*" })
+        Assert-True ($reboundWarn.Count -eq 1) "건너뛴 묶음이 한 줄로 보고돼야 한다 (실제 $($reboundWarn.Count)줄)"
+        Assert-True ($reboundWarn[0] -like "*$($rid.Old)*") '경고에 Vault 가 주장하는 ID 가 있어야 한다'
+        Assert-True ($reboundWarn[0] -like "*$($rid.New)*") '경고에 로컬이 실제로 가리키는 ID 가 있어야 한다'
+
+        # 6) 같은 cliSessionId 면 기존 복원이 그대로 동작해야 한다
+        Assert-True (@($puts | Where-Object { $_.RelativePath -like "*$($rid.Stable)*" }).Count -eq 1) `
+            '바인딩이 같은 대화는 원문을 그대로 복원해야 한다'
+        # 7) 로컬 항목이 아무 원문에도 묶여 있지 않으면 Vault 로 복구해야 한다
+        Assert-True (@($puts | Where-Object { $_.RelativePath -like "*$($rid.Unbound)*" }).Count -eq 1) `
+            '묶이지 않은 항목은 Vault 원문으로 복구해야 한다'
+        Assert-True (@($puts | Where-Object { $_.TargetRoot -eq 'ClaudeRegistry' -and $_.RelativePath -like "*$($app.Unbound)*" }).Count -eq 1) `
+            '묶이지 않은 항목은 Vault 항목으로 복구해야 한다'
+
+        # 8) 로컬 항목은 appSessionId 로 찾아야 한다. 사이드카의 상대경로는 올릴 당시의 것이라
+        #    앱이 항목을 다른 account/window 하위로 옮기면 더 이상 맞지 않는다. 경로로 찾으면
+        #    "로컬에 없음" 으로 오판해 옛 경로에 같은 대화를 하나 더 만든다.
+        $movedApp = 'aaaabbbb-0000-4000-8000-000000000004'
+        $movedOld = '10000000-0000-4000-8000-000000000005'
+        $movedNew = '10000000-0000-4000-8000-000000000006'
+        Write-TestTranscript (Join-Path $s3Repo "Claude\sessions\$key\$movedOld.jsonl") $movedOld $fresh
+        Write-TestSidecar (Join-Path $s3Repo "Claude\sessions\$key\$movedOld.entry.json") $movedApp $movedOld
+        & git -C $s3Repo add -A
+        & git -C $s3Repo commit -qm 'moved entry fixture'
+        # 사이드카는 workspace/window 를 가리키지만 로컬 항목은 다른 계정 폴더로 옮겨졌다.
+        $movedPath = Join-Path $s3Registry "otheraccount\otherwindow\local_$movedApp.json"
+        Write-AgentSessionUtf8File -Path $movedPath -Content ([ordered]@{
+            sessionId = "local_$movedApp"; cliSessionId = $movedNew; cwd = 'C:\Project\Demo'
+        } | ConvertTo-Json)
+        Write-TestTranscript (Join-Path $s3Home "projects\$key\$movedNew.jsonl") $movedNew $fresh
+
+        $movedPlanRoot = New-AgentSessionPlanRoot -Prefix 'ClaudeMoved'
+        $movedPlan = New-ClaudeStartPlan -Context (New-TestContext $s3Repo $s3Config) -PlanRoot $movedPlanRoot
+        $movedPuts = @($movedPlan.LocalOperations | Where-Object { $_.Kind -ne 'Delete' })
+        Assert-True (@($movedPuts | Where-Object { $_.RelativePath -like "*$movedApp*" }).Count -eq 0) `
+            '옮겨간 항목이 다른 원문에 묶여 있으면 묶음 Put 이 없어야 한다'
+        Assert-True (@($movedPuts | Where-Object { $_.RelativePath -like "*$movedOld*" }).Count -eq 0) `
+            '옮겨간 항목의 옛 Vault 원문도 내려받으면 안 된다'
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $s3Registry "workspace\window\local_$movedApp.json"))) `
+            '사이드카의 옛 경로에 항목이 새로 생기면 안 된다'
+        Assert-True (@($movedPlan.Warnings | Where-Object { $_ -like "*$movedApp*" }).Count -eq 1) `
+            '옮겨간 항목의 건너뜀도 보고돼야 한다'
+
+        # 같은 appSessionId 인데 바인딩이 같으면, 옛 경로가 아니라 지금 있는 자리를 갱신해야 한다.
+        Write-AgentSessionUtf8File -Path $movedPath -Content ([ordered]@{
+            sessionId = "local_$movedApp"; cliSessionId = $movedOld; cwd = 'C:\Project\Demo'
+        } | ConvertTo-Json)
+        $samePlanRoot = New-AgentSessionPlanRoot -Prefix 'ClaudeMovedSame'
+        $samePlan = New-ClaudeStartPlan -Context (New-TestContext $s3Repo $s3Config) -PlanRoot $samePlanRoot
+        $sameEntryPuts = @($samePlan.LocalOperations | Where-Object { $_.TargetRoot -eq 'ClaudeRegistry' -and $_.RelativePath -like "*$movedApp*" })
+        Assert-True ($sameEntryPuts.Count -eq 1) '바인딩이 같으면 항목을 갱신해야 한다'
+        Assert-True ($sameEntryPuts[0].RelativePath -eq "otheraccount/otherwindow/local_$movedApp.json") `
+            '갱신 대상은 사이드카의 옛 경로가 아니라 지금 로컬 항목이 있는 자리여야 한다'
+
+        # 로컬에 같은 appSessionId 파일이 둘이면 어느 것이 현재인지 알 수 없으므로 중단한다.
+        Write-AgentSessionUtf8File -Path (Join-Path $s3Registry "workspace\window\local_$movedApp.json") `
+            -Content ([ordered]@{ sessionId = "local_$movedApp"; cliSessionId = $movedOld; cwd = 'C:\Project\Demo' } | ConvertTo-Json)
+        $dupLocal = ''
+        try { [void](New-ClaudeStartPlan -Context (New-TestContext $s3Repo $s3Config) -PlanRoot $s3PlanRoot) }
+        catch { $dupLocal = [string]$_.Exception.Message }
+        Assert-True ($dupLocal -like "*$movedApp*") '로컬 목록 항목이 두 경로에 있으면 중단하고 appSessionId 를 밝혀야 한다'
+        Remove-Item -LiteralPath (Join-Path $s3Registry "workspace\window\local_$movedApp.json") -Force
+        Remove-Item -LiteralPath $movedPath -Force
+
+        # 9) 사이드카 둘이 같은 목록 항목을 주장하면 중단해야 한다
+        $clashId = '10000000-0000-4000-8000-00000000000f'
+        Write-TestTranscript (Join-Path $s3Repo "Claude\sessions\$key\$clashId.jsonl") $clashId $fresh
+        Write-TestSidecar (Join-Path $s3Repo "Claude\sessions\$key\$clashId.entry.json") $app.Stable $clashId
+        & git -C $s3Repo add -A
+        & git -C $s3Repo commit -qm 'duplicate app session id'
+        $clashMessage = ''
+        try { [void](New-ClaudeStartPlan -Context (New-TestContext $s3Repo $s3Config) -PlanRoot $s3PlanRoot) }
+        catch { $clashMessage = [string]$_.Exception.Message }
+        Assert-True ($clashMessage -like "*$($app.Stable)*") '중단 메시지에 중복된 appSessionId 가 있어야 한다'
+        Assert-True ($clashMessage -like "*$($rid.Stable)*") '중단 메시지에 첫 번째 원문 ID 가 있어야 한다'
+        Assert-True ($clashMessage -like "*$clashId*") '중단 메시지에 두 번째 원문 ID 가 있어야 한다'
+
+        # 10) 사이드카 중복 검사는 로컬 registry 유무와 무관해야 한다 (첫 설치)
+        # checkpoint 는 LOCALAPPDATA 에 있으므로 그대로 두고 registry 경로만 비운다.
+        # LOCALAPPDATA 까지 바꾸면 첫 Start 잔재 가드가 먼저 걸려 이 검사를 못 한다.
+        $env:APPDATA = Join-Path $s3 'EmptyRoaming'
+        Assert-True (-not (Get-ClaudeAppRegistryRoot -AllowMissing)) '첫 설치 픽스처에는 registry 가 없어야 한다'
+        $noRegMessage = ''
+        try { [void](New-ClaudeStartPlan -Context (New-TestContext $s3Repo $s3Config) -PlanRoot $s3PlanRoot) }
+        catch { $noRegMessage = [string]$_.Exception.Message }
+        Assert-True ($noRegMessage -like "*$($app.Stable)*") 'registry 가 없어도 사이드카 중복은 중단해야 한다'
+    }
+    finally {
+        $env:LOCALAPPDATA = $oldLocal3
+        $env:APPDATA = $oldRoaming3
+    }
+
     Write-Host "[PASS] ClaudeSessionState: $passed assertions" -ForegroundColor Green
     Write-Host '       계획 무변경, 첫 Start 전체 가드, 마커 전용 삭제, 마커 없는 부재 보존, 최종 상태 diff,' -ForegroundColor DarkGray
     Write-Host '       30일 아카이브, 복원·재노화, 미해결 마커 중단, 사이드카 검증, checkpoint 드리프트 비차단,' -ForegroundColor DarkGray

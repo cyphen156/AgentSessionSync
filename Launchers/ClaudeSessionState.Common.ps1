@@ -178,6 +178,13 @@ function Get-ClaudeNativeEntries {
         catch { throw "Claude 목록 항목을 읽을 수 없습니다: $($file.FullName)" }
         $canonical = ''
         if ($content.PSObject.Properties.Name -contains 'cliSessionId') { $canonical = [string]$content.cliSessionId }
+        # 같은 appSessionId 가 두 경로에 있으면 어느 것이 현재 항목인지 판단할 근거가 없다.
+        # 조용히 마지막 것으로 덮으면 살아 있는 항목을 두고 다른 자리를 갱신하게 된다.
+        if ($entries.ContainsKey($appSessionId)) {
+            throw ("Claude 목록 항목이 두 경로에 있습니다: appSessionId=$appSessionId`n" +
+                "  $($entries[$appSessionId].Path)`n  $($file.FullName)`n" +
+                '어느 것이 현재 항목인지 정한 뒤 다시 실행하세요.')
+        }
         $entries[$appSessionId] = [pscustomobject]@{
             AppSessionId = $appSessionId
             CanonicalId = $canonical
@@ -494,8 +501,48 @@ function New-ClaudeStartPlan {
         [void]$warnings.Add('Claude 로컬 원문 ' + $ids.Count + '건을 ' + $group.Reason + ': ' + ($shown -join ', ') + $suffix)
     }
 
+    # 앱의 대화 정체성은 appSessionId 다. cliSessionId 는 같은 대화가 이어서 열릴 때마다
+    # 새로 발급되므로, Vault 사이드카가 주장하는 원문이 그 항목의 현재 원문이 아닐 수 있다.
+    # 그 상태로 항목을 덮어쓰면 살아 있는 대화가 과거 원문으로 되감긴다.
+    #
+    # 아래 조회표는 계획을 만들기 전에 한 번만 만든다. 사이드카 둘이 같은 항목을 주장하면
+    # 뒤에서 묶음을 건너뛰는 순간 duplicate target 검사가 우회되므로 여기서 중단한다.
+    # 사이드카 중복은 로컬 registry 가 있든 없든 성립해야 하는 조건이다. 묶음을 건너뛰면
+    # 그 target 이 계획에서 빠져 기존 duplicate operation 검사가 우회되므로 여기서 막는다.
+    $sidecarByApp = @{}
+    $appByCanonical = @{}
+    foreach ($id in $tiers.Active.Keys) {
+        $sidecar = Read-ClaudeSidecar -Path $tiers.Active[$id].EntryPath -CanonicalId $id
+        if ($sidecarByApp.ContainsKey($sidecar.AppSessionId)) {
+            throw ("Claude Vault 사이드카 둘이 같은 목록 항목을 주장합니다: appSessionId=$($sidecar.AppSessionId) " +
+                "원문=$($sidecarByApp[$sidecar.AppSessionId].CanonicalId), $id`n" +
+                '한 대화에 원문이 둘 붙어 있습니다. 어느 쪽이 현재인지 정한 뒤 다시 실행하세요.')
+        }
+        $sidecarByApp[$sidecar.AppSessionId] = [pscustomobject]@{ CanonicalId = $id; RelativePath = $sidecar.RelativePath }
+        $appByCanonical[$id] = $sidecar.AppSessionId
+    }
+
+    $rebound = @()
     foreach ($id in $tiers.Active.Keys) {
         $group = $tiers.Active[$id]
+
+        # 로컬 항목은 appSessionId 로 찾는다. 사이드카에 적힌 상대경로는 올릴 당시의 것이고,
+        # 앱이 같은 항목을 다른 account/window 하위로 옮기면 그 경로는 더 이상 맞지 않는다.
+        # 경로로 찾으면 "로컬에 없음" 으로 오판해 옛 경로에 항목을 하나 더 만든다.
+        $localEntry = $null
+        if ($registryRoot -and $entries.ContainsKey($appByCanonical[$id])) { $localEntry = $entries[$appByCanonical[$id]] }
+
+        # 같은 항목이 로컬에서 이미 다른 원문으로 옮겨갔으면 이 묶음은 통째로 건너뛴다.
+        # 원문만 내려놓고 항목을 두면 반쪽이 되므로 원문 Put 도 내지 않는다.
+        # 로컬 항목이 아무 원문에도 묶여 있지 않으면 되감기가 아니라 복구 대상이다.
+        if ($localEntry -and $localEntry.CanonicalId -and
+            -not [string]::Equals($localEntry.CanonicalId, $id, [StringComparison]::OrdinalIgnoreCase)) {
+            $rebound += [pscustomobject]@{
+                AppSessionId = $localEntry.AppSessionId; VaultId = $id; LocalId = $localEntry.CanonicalId
+            }
+            continue
+        }
+
         $targetRelative = 'projects/' + $group.Key + '/' + $id + '.jsonl'
         $vaultSha = Get-AgentSessionFileSha256 $group.Transcript
         $localPath = Join-Path (Join-Path $projectsRoot $group.Key) ($id + '.jsonl')
@@ -510,11 +557,19 @@ function New-ClaudeStartPlan {
         }
         if (-not $registryRoot) { continue }
         $artifact = New-ClaudeEntryArtifact -SidecarPath $group.EntryPath -CanonicalId $id -PlanRoot $PlanRoot
-        $entryTarget = Join-Path $registryRoot ($artifact.RelativePath -replace '/', '\')
+        # 로컬에 같은 항목이 있으면 그 자리를 갱신한다. 사이드카에 적힌 옛 경로에 쓰면
+        # 앱이 항목을 옮긴 경우 같은 대화가 두 곳에 생긴다.
+        $entryRelative = $(if ($localEntry) { $localEntry.RelativePath } else { $artifact.RelativePath })
+        $entryTarget = Join-Path $registryRoot ($entryRelative -replace '/', '\')
         if ((Test-Path -LiteralPath $entryTarget -PathType Leaf) -and
             [string]::Equals((Get-AgentSessionFileSha256 $entryTarget), $artifact.Sha256, [StringComparison]::OrdinalIgnoreCase)) { continue }
-        [void]$operations.Add((New-AgentSessionPutOperation -TargetRoot ClaudeRegistry -RelativePath $artifact.RelativePath `
+        [void]$operations.Add((New-AgentSessionPutOperation -TargetRoot ClaudeRegistry -RelativePath $entryRelative `
             -SourceKind StagedFile -SourcePath $artifact.Path -SourceSha256 $artifact.Sha256))
+    }
+
+    foreach ($r in @($rebound | Sort-Object AppSessionId)) {
+        [void]$warnings.Add('Claude 대화가 로컬에서 이미 다른 원문으로 옮겨가 Vault 묶음을 건너뜁니다: ' +
+            'appSessionId=' + $r.AppSessionId + ' Vault=' + $r.VaultId + ' 로컬=' + $r.LocalId)
     }
 
     New-ClaudePlanObject -Phase Start -Context $Context -VaultOperations @() -LocalOperations @($operations | ForEach-Object { $_ }) `
