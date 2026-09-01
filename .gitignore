@@ -1,4 +1,6 @@
-# Deny by default. Only the public tool and transported session formats are allowed.
+# Deny by default. This is the public tool repository: it holds code and
+# documentation only. Real session payloads live in the private Vault and are
+# never committable here.
 *
 !.gitignore
 !.gitattributes
@@ -12,20 +14,14 @@
 !Agents/
 !Agents/*.psd1
 !ACTIVE_HOST.txt
-!Claude/
-!Claude/**/
-!Claude/**/*.jsonl
-!Claude/**/*.entry.json
-!Codex/
-!Codex/**/
-!Codex/**/*.jsonl
-!Codex/**/*.jsonl.gz
-!Codex/**/*.jsonl.gz.integrity.json
 !Launchers/
 !Launchers/**
 Launchers/Shortcuts/*.lnk
 !examples/
 !examples/**
+
+# Session payload paths are not allowed in this repository. The allowances for
+# Claude/ and Codex/ session trees belong in the private Vault only.
 
 # Machine-local configuration must never be committed.
 AgentSessionSync.config.psd1

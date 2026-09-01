@@ -1,5 +1,3 @@
-# Session payloads are byte transports. Never apply Git text or EOL filters.
-*.jsonl                   -text
-*.jsonl.gz                -text
-*.entry.json              -text
-*.jsonl.gz.integrity.json -text
+# Preserve file bytes. Do not normalize line endings or re-encode content.
+# Keep text diffs available; do not apply binary or -diff to all files.
+* -text -working-tree-encoding -filter -ident
