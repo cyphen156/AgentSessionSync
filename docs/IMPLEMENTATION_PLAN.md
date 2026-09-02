@@ -448,11 +448,32 @@ session by itself. There is no `generation` field.
 
 `lineageFingerprint` is the SHA-256 of a serialised, ordered record of each
 lineage payload's identifier, relative path, raw length, raw SHA-256, and the
-identifying information of its last valid conversation record.
+identifying information of its last valid conversation record. The relative
+path component is the path inside the Vault payload layout, not a local one, so
+that two machines holding the same bytes compute the same value.
+
+**The value written into a Deleted record is copied from the last published and
+verified Active or Archived manifest for that `vaultSessionId`. It is not
+recomputed from local payloads after the deletion.** `lineageIds` comes from
+the same manifest; `deletedAt` comes from the verified app deletion signal.
+
+The 2026-09-01 Claude survey measured why. Deleting a conversation appends one
+record to its current transcript, so a fingerprint recomputed after the deletion
+differs from the published one on the deleting machine alone. Comparing that
+value against another machine that is merely behind would report every normal
+deletion as a conflict, and the "fingerprint matches" branch of section 2.16
+would be unreachable.
+
+A Deleted record therefore requires an existing `vaultSessionId` and a published
+state to copy from. A deletion of a session that was never published creates no
+record: see section 2.16.
 
 The record is kept for as long as the Vault exists: no expiry, no archival, no
 compaction, no cleanup. It holds no conversation text, title, attachment or MCP
 configuration. It never permanently blocks an app identifier.
+
+The field list above is fixed. The agent is already distinguished by the
+`Codex/Deleted/` and `Claude/Deleted/` paths and is not repeated as a field.
 
 ### 2.16 Delete and continuation conflict
 
@@ -467,6 +488,23 @@ look in Active
 
 A `vaultSessionId` present in Deleted therefore never reaches the new-session
 branch and is never re-uploaded by a stale machine.
+
+**A deletion that was never published creates no record.** When a verified
+deletion signal exists but there is no app record, no trusted mapping to a
+`vaultSessionId`, and no entry in any of the three states, nothing is written:
+
+```
+no Deleted file is created
+no new vaultSessionId is issued
+not a Failure
+not SURVEY_REQUIRED
+reported as a previously deleted session that was never published
+```
+
+Such a record could not serve any of the purposes above. The session was never
+shared, so no machine can re-upload it, and there is no published state to
+compare against. This is the normal state of a first run against an empty Vault
+on a machine where conversations were deleted beforehand.
 
 ```
 fingerprint matches      -> apply deletion, do not upload,
@@ -536,17 +574,32 @@ predecessor ordinal and byte offset, canonical thread and physical page alias,
 fork, guardian parent relationships, database projection, attachments, embedded
 images and visualisations, and project, order and tab links.
 
-**The Codex deletion signal is not established.**
+**The measured Codex versions expose no durable deletion signal that Finish can
+use.** This is now a surveyed result, not an open question.
 
 ```
 deletion cannot be proven
     -> do not delete
     -> preserve the payload
-    -> report SURVEY_REQUIRED
+    -> report the known limitation
+    -> do not set SURVEY_REQUIRED on a normal run
 ```
 
-Absence-based deletion is forbidden. New, updated and archived sessions are
-handled normally.
+The 2026-09-01 Codex survey observed two deletion paths, a user deletion from
+the UI and the app-server `thread/delete` request. Both removed the rollout, the
+canonical state row, the history projection and turns, and the session index
+entry. Only global-state references remained, and those were present before the
+deletion as well. No tombstone or other durable marker was created.
+
+Because the survey is complete, a run that merely reports this limitation is a
+normal run. Setting `SURVEY_REQUIRED` every time would mark every Finish as
+needing a survey that has already been performed. `SURVEY_REQUIRED` stays for
+structures this document does not describe.
+
+Absence-based deletion is forbidden. A Deleted record that already exists in the
+Vault is still honoured for the ordered lookup in section 2.16 and still blocks
+re-upload; Codex Finish does not invent new Deleted records. New, updated and
+archived sessions are handled normally.
 
 See `CODEX_SESSION_STRUCTURE.md` for the measured structure.
 
@@ -694,6 +747,25 @@ published.
 
 Each step is checked for completeness inside its own script before the root
 script integrates it. The first implementation target is Codex Finish.
+
+### Verification order
+
+For each step the case list is fixed before the code is written.
+
+```
+write the case list, each case citing the clause it comes from
+  -> the other agent reviews the case list, not the code
+  -> the list is agreed
+  -> the script is implemented
+  -> a case is not reinterpreted afterwards to match the code
+  -> temporary fixtures run it on Windows PowerShell 5.1 and PowerShell 7
+```
+
+An author writing both the code and the cases can pass every case while
+misreading the contract, because the cases encode the same misreading. The
+review therefore happens on the list, before there is code to fit it to.
+
+Fixtures are built in a temporary directory. No test file is committed.
 
 ### Removing the previous implementation
 

@@ -8,20 +8,27 @@ sizes, real identifiers, machine paths, hashes - belong to the private Vault
 survey, not here. Every statement below is scoped to what was actually observed
 on the versions listed; nothing is asserted as universal app behaviour.
 
-Derived from survey `Surveys/Claude/2026-08-31.md` (baseline date 2026-08-31,
-one machine). See `SURVEY_GUIDE.md` for what a survey is and when a new one is
-required. Where this document and that survey disagree, the survey is the
-evidence and this document is corrected.
+Derived from surveys `Surveys/Claude/2026-08-31.md` and
+`Surveys/Claude/2026-09-01.md`, both on one machine. See `SURVEY_GUIDE.md` for
+what a survey is and when a new one is required. Where this document and a
+survey disagree, the survey is the evidence and this document is corrected.
+
+The 2026-09-01 survey found the same app and engine versions but corrected
+several claims that the 2026-08-31 survey had inferred rather than measured:
+the trigger that extends a lineage (section 4), how many tombstones a deletion
+writes and which files it touches (section 7). Those corrections are not app
+behaviour changing; they are this document being wrong earlier. The version
+table below therefore gains no new row and section 12 gains none either.
 
 ## 1. Observed versions
 
 | Component | Version | First observed | Last confirmed |
 |---|---|---|---|
-| Desktop app | `Claude_1.40609.0.0_x64` | 2026-08-31 | 2026-08-31 |
-| CLI engine | `2.1.247` | 2026-08-31 | 2026-08-31 |
-| App record | no schema version field present | 2026-08-31 | 2026-08-31 |
-| Sidecar | `"v": 1` | 2026-08-31 | 2026-08-31 |
-| Tombstone | 13-byte ASCII epoch milliseconds | 2026-08-31 | 2026-08-31 |
+| Desktop app | `Claude_1.40609.0.0_x64` | 2026-08-31 | 2026-09-01 |
+| CLI engine | `2.1.247` | 2026-08-31 | 2026-09-01 |
+| App record | no schema version field present | 2026-08-31 | 2026-09-01 |
+| Sidecar | `"v": 1` | 2026-08-31 | 2026-09-01 |
+| Tombstone | 13-byte ASCII epoch milliseconds | 2026-08-31 | 2026-09-01 |
 
 Add a new row when a version changes; keep the previous row so the difference
 between versions stays readable.
@@ -92,6 +99,20 @@ sample.
 The only join between layer 1 and layer 2 is the `cliSessionId` field inside
 the app record.
 
+### Stability
+
+The two identifiers do not have the same lifetime.
+
+| ID | Lifetime |
+|---|---|
+| `appSessionId` | Stable. Survived three lineage extensions of one conversation in the surveyed sample; the record file was never renamed |
+| `cliSessionId` | Rotates. A new value is issued every time the lineage is extended (see section 4), and the previous value moves into `priorCliSessionIds` |
+
+A tool that keys a conversation by `cliSessionId` loses the mapping the first
+time the user extends the lineage. `appSessionId` is the stable key.
+
+`appSessionId` never names a transcript file. Only `cliSessionId` values do.
+
 ### Transcript directory name
 
 Derived from the session `cwd` by replacing every character outside
@@ -122,8 +143,59 @@ in `priorCliSessionIds`.** Matching only on `cliSessionId` and treating the rest
 as unreferenced discards the live conversation's own history.
 
 The field is **optional and uncommon** in the surveyed sample - most records do
-not have it. The conditions under which the app adds an entry have not been
-determined. Absence must not be read as "this conversation has no history".
+not have it. Absence must not be read as "this conversation has no history".
+
+### What extends a lineage
+
+Measured by controlled comparison on 2026-09-01: two conversations in the same
+app over the same minutes, one given a rejected tool call only, the other a
+rejected tool call followed by a rewind.
+
+| Action | Effect on the app record |
+|---|---|
+| Rejecting a tool call | `completedTurns`, `lastFocusedAt`, `lastActivityAt` only. Identifiers unchanged, no new transcript |
+| **Rewinding and resending** | New `cliSessionId` issued; the previous one is appended to the end of `priorCliSessionIds`; a new transcript file is created |
+
+Observed three times in a row on one conversation. Other triggers may exist;
+these two are what has been tested.
+
+Two things a rewind does **not** do: it does not increment `completedTurns`,
+and it does not change `createdAt`.
+
+Compaction is **not** the trigger. In the surveyed sample five transcripts
+carried a compaction record without any lineage entry existing, and six lineage
+entries existed in transcripts carrying no compaction record.
+
+### A continuation is not distinguishable from a new session by its transcript
+
+The transcript created by a rewind opens the same way a brand new conversation
+does: the first user record carries `parentUuid: null`.
+
+More than that, the record graph does not cross the file boundary at all. Every
+`parentUuid` in one seven-transcript lineage was resolved against both its own
+file and its immediate predecessor:
+
+```
+parentUuid resolved inside the same transcript   690
+parentUuid resolved in the predecessor             0
+unresolved                                         0
+```
+
+The lineage exists **only** in the app record's `priorCliSessionIds`. It cannot
+be reconstructed from transcript content. Once the app record is gone - which
+is what deletion does, see section 7 - the on-disk lineage is unrecoverable
+from the transcripts alone.
+
+A compaction record can appear in two consecutive transcripts of one lineage.
+That is not evidence that compaction split them: in the observed case the
+record's timestamp preceded the split by 2 h 25 min, so the new transcript
+carried a copy of an earlier compaction forward rather than being created by
+it.
+
+This is why "does not appear in the sidebar" is not a safe basis for treating a
+transcript as unreferenced. The question that can be answered is "does any app
+record claim this identifier in its lineage", and it can only be asked while
+that record exists.
 
 ## 5. Example compositions
 
@@ -206,16 +278,27 @@ Notes:
 
 ## 7. Deletion signal
 
-Observed once: deleting a single conversation from the sidebar produced all of
+Observed twice: once on a conversation with a single `cliSessionId`
+(2026-08-31), once on a conversation whose lineage held four (2026-09-01, with
+a full before-and-after snapshot). Deleting from the sidebar produced all of
 the following in one operation.
 
 | Step | Target | Effect |
 |---|---|---|
 | 1 | `local_<appSessionId>.json` | removed |
-| 2 | `deleted_<cliSessionId>` | created, one per identifier in the lineage |
-| 3 | `<cliSessionId>.desktop-released.json` | created |
-| 4 | `<cliSessionId>.jsonl` | untouched; still present afterwards |
-| 5 | `dframe-group-scopes` assignments and order | entry removed |
+| 2 | `deleted_<id>` | created: one per `cliSessionId` in the lineage, **plus one for the `appSessionId`** |
+| 3 | `<currentCliSessionId>.desktop-released.json` | created, for the current identifier only |
+| 4 | `<currentCliSessionId>.jsonl` | still present, but **appended to**: one `last-prompt` record |
+| 5 | prior `<cliSessionId>.jsonl` | still present, byte-identical, mtime unchanged |
+| 6 | `dframe-group-scopes` assignments and order | not established, see below |
+
+The second deletion wrote **five** tombstones for a four-identifier lineage.
+
+```
+deleted_<currentCliSessionId>
+deleted_<priorCliSessionId>     x3
+deleted_<appSessionId>          <- not a lineage member
+```
 
 ### Tombstone
 
@@ -226,8 +309,25 @@ deleted_dddddddd-dddd-dddd-dddd-dddddddddddd
 1788175963002
 ```
 
-In the observed deletion, two tombstones were written and both carried the same
-value. Whether that holds for every deletion has not been established.
+Every tombstone written by one deletion carried the identical value, in both
+observed deletions.
+
+**One tombstone names an `appSessionId`, not a `cliSessionId`.** Because an
+`appSessionId` never names a transcript, that tombstone has no `.jsonl` beside
+it and matches no lineage identifier in any surviving record - the record that
+carried it was removed by the same operation. This is a normal, fully explained
+outcome of every deletion, not an anomaly. A tool that treats "a tombstone
+nothing claims" as a fault will fault on every deleted conversation.
+
+The 2026-08-31 deletion is explained by the same rule: that conversation had
+one `cliSessionId` and one `appSessionId`, so it produced two tombstones, and
+the second one had no transcript.
+
+### What deletion does not do
+
+- It does not remove any transcript, current or prior.
+- It does not modify prior transcripts at all.
+- It does not remove the tombstones it wrote; they persist.
 
 ### Sidecar
 
@@ -239,15 +339,31 @@ value. Whether that holds for every deletion has not been established.
 }
 ```
 
-`releasedAt` trailed the tombstone value by a few milliseconds. `reason` is a
-field, so values other than `delete` may exist; none have been observed.
+`releasedAt` trailed the tombstone value by 6 ms in both observed deletions,
+and matched the current transcript's mtime to the millisecond in the second.
+`reason` is a field, so values other than `delete` may exist; none have been
+observed.
+
+One sidecar per deletion, next to the current transcript. Prior transcripts do
+not get one.
+
+### Group assignment
+
+The 2026-08-31 survey recorded the deleted session's entry disappearing from
+`dframe-group-scopes`. The 2026-09-01 deletion could not confirm it: that
+conversation had never been assigned to a group, the assignment count did not
+change, and the configuration file was not written at all during the deletion.
+What happens to an assigned session's placement on deletion is therefore not
+established by a snapshotted observation.
 
 ### Consequence
 
-In the observed deletion the transcript was **not** removed. A tool that treats
-"present on disk" as "live" will republish conversations the user deleted. A
-tombstone may exist for an identifier that has no transcript; one such case was
-observed and its cause is unknown.
+In both observed deletions no transcript was removed. A tool that treats
+"present on disk" as "live" will republish conversations the user deleted.
+
+The signal to read is the tombstone, and reading it requires knowing which
+identifier space it belongs to. Of the five tombstones written by one deletion,
+four named transcripts and one named an app record that no longer exists.
 
 ## 8. Placement
 
@@ -305,12 +421,25 @@ No compression threshold is established by this document.
 ## 11. Not yet observed
 
 - Values of `reason` other than `delete`.
-- Why a lineage identifier can have a tombstone but no transcript.
-- The conditions under which the app adds a `priorCliSessionIds` entry.
-- On-disk representation of an archived session (`isArchived: true`).
+- On-disk representation of an archived session (`isArchived: true`). Every
+  record in both surveys carried `isArchived: false`.
+- What happens to an assigned session's `dframe-group-scopes` entry on
+  deletion, under a before-and-after snapshot.
 - Whether LevelDB overwrites the config file, and when.
 - Which process writes which storage layer.
+- Triggers that extend a lineage other than a rewind.
+- Whether a prior transcript is ever written to after it becomes a prior. The
+  one observed write to a transcript that was about to become a prior happened
+  3.8 seconds before the new transcript opened, so it belongs to the old
+  session, not to its life as a prior.
+- Why `titleSource: custom` was present in the 2026-08-31 sample and absent
+  from the 2026-09-01 one.
 - Any behaviour on a second machine; only one machine has been surveyed.
+
+Resolved since the 2026-08-31 survey, and no longer open: why a tombstone can
+exist for an identifier with no transcript (it names an `appSessionId`), how
+many tombstones a deletion writes, what deletion does to transcripts, and what
+extends a lineage.
 
 ## 12. Structure change log
 

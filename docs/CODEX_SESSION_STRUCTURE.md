@@ -2,7 +2,8 @@
 
 Baseline date: 2026-08-31.
 Recording conventions: [Session Survey Guide](SURVEY_GUIDE.md).
-Private baseline: AgentSessionVault/Surveys/Codex/2026-08-31.md.
+Private surveys: AgentSessionVault/Surveys/Codex/2026-08-31.md and
+AgentSessionVault/Surveys/Codex/2026-09-01.md.
 
 This is a structure reference for Finish and Start, not a completed adapter or
 a declaration of cross-machine compatibility. Observations are scoped to the
@@ -13,9 +14,10 @@ fields and relationships, not complete application records or runnable fixtures.
 
 | Component | Version | First observed | Last confirmed |
 |---|---|---|---|
-| Desktop package | 26.825.6671.0 | 2026-08-31 | 2026-08-31 |
-| Internal app | 26.825.51511 | 2026-08-31 | 2026-08-31 |
-| Active backend | 0.151.0-alpha.7.2 | 2026-08-31 | 2026-08-31 |
+| Desktop package | 26.825.6671.0 | 2026-08-31 | 2026-09-01 |
+| Internal app | 26.825.51511 | 2026-08-31 | 2026-09-01 |
+| Active backend | 0.151.0-alpha.7.2 | 2026-08-31 | 2026-09-01 |
+| App-server executable | 0.152.0 | 2026-09-02 | 2026-09-02 |
 
 Versions recorded in the first session_meta of existing transcripts:
 
@@ -26,7 +28,7 @@ Versions recorded in the first session_meta of existing transcripts:
 | 0.149.0-alpha.4.3 | user / paginated, no initial history_base | 2026-08-31 | 2026-08-31 |
 | 0.150.0-alpha.8 | user / paginated continuation with history_base | 2026-08-31 | 2026-08-31 |
 | 0.151.0-alpha.7.1 | user / paginated, no initial history_base | 2026-08-31 | 2026-08-31 |
-| 0.151.0-alpha.7.2 | user / paginated initial and continuation pages; guardian_review / legacy | 2026-08-31 | 2026-08-31 |
+| 0.151.0-alpha.7.2 | user / multi-page paginated; guardian_review / legacy | 2026-08-31 | 2026-09-01 |
 
 These are observations of stored metadata, not separate execution tests of each
 historical app version. They do not establish a feature's first release.
@@ -60,6 +62,7 @@ Paths below are relative to the discovered <CODEX_HOME> unless stated otherwise.
 | attachments and pasted-text-attachments.json | Pasted text and its path index |
 | visualizations/.../<thread-id>/ | Session-related generated artifacts; intermediate directories vary |
 | browser/sessions/<thread-id>.toml | Some session-specific browser settings |
+| thread-writer-locks/<thread-id>.lock | Empty coordination lock observed for the active canonical thread; not a conversation payload |
 | %APPDATA%/Codex/web/Codex/browser-sidebar-page-states.json | Browser page state with client-thread references |
 
 Numbered database filenames are observed names, not permanent cross-version APIs.
@@ -87,8 +90,11 @@ Multiple past session_meta records in one transcript do not each create a new li
 A user thread can have an earlier physical page and a later continuation.
 The state row retains the canonical identity but points to the latest file.
 history_base refers to a predecessor history boundary, expressed in both record
-ordinal and original byte offset. Verify the actual line boundary and ordinal,
-not just whether the offset is below file size.
+ordinal and original byte offset. Its thread_id can be the canonical ID on an
+early continuation or the immediately preceding physical page alias on a later
+continuation. Verify the physical alias, the actual line boundary and ordinal,
+not just whether the offset is below file size. Do not restrict predecessor
+lookup to files whose canonical ID equals history_base.thread_id.
 
 Forked transcripts may include parent history without retaining a standalone
 parent file. Embedded history does not prove an exact recoverable parent original.
@@ -97,6 +103,35 @@ do not remove a parent as a duplicate merely because a child exists.
 
 A guardian can have its own physical file and ID while referencing a user parent.
 An empty thread_spawn_edges table does not prove that no subagent relationship exists.
+
+An agent-created thread can carry its source relation only inside the
+create_thread function output as a source_thread_id value. The source need not
+appear in session_meta or thread_spawn_edges. In one controlled deletion, the
+app removed the source thread and every one of its physical pages while leaving
+the agent-created thread, its rollout, state, history projection, catalog,
+index and worktree intact. Direct lookup of the child continued to work.
+
+This is a surviving branch with an explicit deleted-source relation. Preserve
+the branch and the source identifier. Do not recreate the deleted source and do
+not cascade the source deletion into the child. A missing source does not make
+an otherwise complete and readable child an unknown new session. Transport can
+keep the source relation as provenance without requiring the source payload.
+
+A newly created logical session is not unresolved merely because it is absent
+from the Vault or the previous checkpoint. When its local transcript, canonical
+state row, history projection and app catalog relationships are internally
+consistent, Finish treats it as new upload material. An unresolved or orphaned
+classification requires a concrete dangling or contradictory relationship.
+
+An undo and retry can create another physical page with the same canonical ID
+without history_base. The new page can restart ordinals and contain different
+records while the canonical state row moves to it and history projections retain
+both physical keys. Preserve both originals. Do not classify the older page as
+a duplicate or orphan only because it is no longer the latest path.
+
+A later continuation after that retry can reference the retry page's physical
+alias in history_base at an early truncated boundary. Resolve that alias and
+verify the byte and ordinal boundary just as for an ordinary continuation.
 
 ## 5. Example compositions
 
@@ -154,6 +189,21 @@ The first line is 8 bytes and the second 9. These are not real application recor
 An initial page may omit history_base. Finish must collect the required earlier
 page; Start must preserve both pages and the reference. Do not merge pages or
 rename A_P to A as a shortcut.
+
+A later survey observed a third physical page for the same canonical thread:
+
+~~~text
+canonical A
+  page 1 key A
+  page 2 alias P2, history_base.thread_id = A
+  page 3 alias P3, history_base.thread_id = P2
+  state latest rollout_path -> page 3
+  history projection keys -> A, P2, P3
+~~~
+
+The third page still recorded A in session_meta.id and session_id. The
+predecessor reference alone used P2. Each boundary was verified against the
+predecessor's original byte offset and record ordinal.
 
 ### Case 3: fork history
 
@@ -229,9 +279,10 @@ Selected observed fields, not a complete or required schema:
 | state thread row | id, rollout_path, title, name, project_id |
 | Pasted text index | attachmentPaths, pendingRemovalPaths, textExcerptsByPath |
 
-history_base was absent from initial pages. Fork and guardian fields depend on the
-record kind. state.name was NULL for some older threads. Do not turn sample field
-presence or counts into a fixed schema validation rule.
+history_base was absent from initial pages. Its thread_id role depends on the
+continuation depth as described in section 4. Fork and guardian fields depend on
+the record kind. state.name was NULL for some older threads. Do not turn sample
+field presence or counts into a fixed schema validation rule.
 
 Observed JSONL record types include session_meta, event_msg, response_item,
 world_state, turn_context, compacted and inter_agent_communication_metadata.
@@ -246,6 +297,44 @@ thread-deletion tombstone.
 File absence, sidebar absence or a missing DB row alone does not establish final
 deletion. The app's archive and a tool-defined Vault archive are separate concepts.
 Legacy checkpoint-based deletion inference is not validated by this survey.
+
+In one observed archive operation on an agent-created thread, the app moved the
+rollout byte-identically from sessions to archived_sessions, retained its state
+row with archived=1 and a new rollout_path, retained its history projection and
+session index entry, and removed its local app catalog row. The worktree and
+other app-state references remained. The archived thread did not appear in the
+archived-thread listing, but direct lookup by ID still returned its turns. An
+active agent-created comparison thread was also absent from the general listing
+and remained directly readable. Listing or catalog absence is therefore not a
+deletion signal. Finish must inspect both rollout roots and the state relation.
+
+Deletion was not executed in this experiment, so it did not establish a final
+deletion signal.
+
+A later controlled delete of a user thread with three physical pages removed
+all three rollouts, the canonical state row, all three history projections and
+their turns/items, the session index entry and the local app catalog row. Global
+state still retained permissions, description, binding, project/order and path
+references. Its writing-block deleted flag had already been present while the
+thread was live and is not a final-deletion tombstone. No durable catalog removal
+record was found. The before-and-after operation establishes what the app
+removed, but a later snapshot still has no unique standalone deletion marker.
+
+The archive-listing failure was reproduced with a second agent-created thread.
+Its rollout moved byte-identically to archived_sessions, state changed to
+archived=1, history and the session index remained, the local catalog row was
+absent, direct lookup still worked, and the archived list still returned no
+entry. Both observed failures involved agent-created threads, but that does not
+establish thread_source as the cause or prove that every such thread is hidden.
+
+The installed app-server protocol exposed thread/delete with a single threadId
+parameter. Calling that official request for the hidden archived branch returned
+success and a thread/deleted notification. It removed the rollout, canonical
+state row, history projection, turns/items and session index entry. Direct lookup
+then failed. Eight global-state references remained, and no new unique deletion
+tombstone was found. The deleted source_thread_id relationship disappeared with
+the branch payload and history; this was an explicit delete of the branch, not a
+cascade from deleting its source thread. Direct SQLite/WAL edits were not used.
 
 ## 8. Placement
 
@@ -316,6 +405,7 @@ A structure survey does not prove Finish/Start implementation or round-trip succ
 | Date | Version / comparison | Confirmed structure | Finish / Start impact |
 |---|---|---|---|
 | 2026-08-31 | Versions in section 1; initial baseline | Legacy, continuation, fork, guardian, placement and attachment relationships | Preserve related originals and distinguish identity layers; restoration remains unverified |
+| 2026-09-01 | Codex 0.151.0-alpha.7.2 survey continued; deletion completed with app-server 0.152.0 | A third paginated page can reference the preceding physical page alias in history_base.thread_id; undo/retry can create another physical page with the same canonical ID and no history_base; archiving two agent-created threads moved each rollout byte-identically while neither appeared in archived listing; deleting a three-page source left a complete usable branch with embedded source_thread_id; an explicit thread/delete of that hidden branch removed its payload and primary projections but left global-state references; a per-thread writer lock was observed | Resolve physical predecessor aliases, preserve every physical original and surviving branch, retain source provenance without resurrecting a deleted source, inspect sessions and archived_sessions with state, require an actual unexplained broken relationship before classifying an orphan, and verify each byte/ordinal boundary; do not infer final deletion from list/catalog absence, stale global references or the writing-block flag, do not infer UI-listing causation from thread_source, and do not transport the empty lock as conversation payload |
 
 This baseline came from one observed environment, not an execution comparison
 against a prior app release. Add confirmed changes and corrections with evidence
