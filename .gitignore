@@ -1,32 +1,19 @@
-# Deny by default. This is the public tool repository: it holds code and
-# documentation only. Real session payloads live in the private Vault and are
-# never committable here.
+# Public distribution: code and documentation only. Initialize rewrites the
+# copied PRIVATE installation rules. Never initialize this public original.
 *
 !.gitignore
 !.gitattributes
 !LICENSE
 !README.md
+!AgentSessionSync.config.example.psd1
 !docs/
-!docs/**
-!*.cmd
-!*.ps1
-!*.psd1
-!Agents/
-!Agents/*.psd1
-!ACTIVE_HOST.txt
+!docs/**/
+!docs/**/*.md
 !Launchers/
-!Launchers/**
-Launchers/Shortcuts/*.lnk
-!examples/
-!examples/**
-
-# Session payload paths are not allowed in this repository. The allowances for
-# Claude/ and Codex/ session trees belong in the private Vault only.
-
-# Machine-local configuration must never be committed.
+!Launchers/**/
+!Launchers/**/*.ps1
 AgentSessionSync.config.psd1
-
-# Explicit credential and local database blocks.
+ACTIVE_HOST.txt
 auth.json
 config.toml
 *.db

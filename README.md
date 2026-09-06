@@ -1,192 +1,84 @@
 # AgentSessionSync
 
-AgentSessionSync는 여러 Windows PC에서 Claude와 Codex의 대화를 이어 쓰기 위한 공개 MIT 도구입니다.
-실제 대화 원문은 사용자가 소유한 비공개 `AgentSessionVault`에만 저장합니다.
+여러 Windows PC에서 Codex와 Claude 대화를 이어 쓰는 MIT 공개 도구입니다.
+공개 저장소는 배포 원본이고, 사용자가 복사해 **비공개 저장소로 준비한 설치본 자체가 Vault**입니다.
+실행할 때 공개 도구 저장소를 별도로 유지할 필요는 없습니다. 실제 대화·설정·측량 원문은 공개 원본에 넣지 않습니다.
 
-이 도구는 대화 세션만 다룹니다. 프로젝트 소스, 워크벤치 상태, 에이전트 메모리는 동기화하지 않습니다.
+2026-09-06 기준 공통 Start/Finish와 두 앱의 실제 구현을 반영했습니다.
+실사용 All-Finish 게시 및 이후 All-Start 성공이 확인됐습니다. 이것이 다른 PC의 모든 경로와
+앱 UI 동작까지 검증됐다는 뜻은 아닙니다.
+완료 범위, 알려진 불일치, 검증 근거와 다음 개선 후보는
+[마감 보고](docs/IMPLEMENTATION_CLOSEOUT_2026-09-06.md)에 있습니다.
 
-지원 대상은 Claude와 Codex입니다. 이 저장소는 등록형 에이전트 프레임워크로 일반화하지 않습니다.
-다른 에이전트가 필요하면 MIT 라이선스에 따라 포크에서 직접 추가할 수 있습니다.
-
-동기화는 사용자가 Start와 Finish를 명시적으로 실행할 때만 동작합니다. 상시 백그라운드 프로세스,
-OS 스케줄러 자동 Pull·Push, 앱 실행·종료에 연결된 자동 동기화는 제공하지 않습니다.
-
-## 보장하는 동작
-
-- 한 PC에서 Finish한 활성 대화를 다른 PC의 Start에서 이어서 사용할 수 있습니다.
-- 마지막 활동 후 30일이 지난 대화는 활성 목록에서 내려가고 Vault의 Archived에 보관됩니다.
-- 앱에서 최종 삭제한 대화는 Vault의 현재 트리와 각 PC의 로컬 저장소에서 제거되어 다시 나타나지 않습니다.
-- Vault에 없던 로컬 신규 대화는 삭제하지 않고 다음 Finish에서 추가합니다.
-- 알려지지 않은 앱 데이터 형식을 만나면 로컬 데이터와 Vault를 변경하지 않고 중단합니다.
-
-다음 동작은 보장하지 않습니다.
-
-- Codex 사이드바의 즉시 갱신. 앱 재시작 또는 업데이트가 필요할 수 있습니다.
-- 복원했지만 새 활동을 남기지 않은 오래된 대화의 30일 유지. 다음 Finish에서 다시 Archived로 내려갈 수 있습니다.
-- 과거 Git 이력에서 삭제된 원문까지 제거하는 완전 파기.
-
-## 저장 위치와 상태
-
-현재 checkout된 private Vault가 동기화 기준입니다.
-
-| 상태 | Vault | 로컬 앱 저장소 |
-|---|---|---|
-| Active | `Claude/sessions`, `Codex/sessions` | 존재 |
-| Archived | `Claude/archive`, `Codex/archive` | 활성 저장소에서 제거 |
-| Deleted | 현재 트리에 없음 | 제거 |
-
-Active와 Archived는 동시에 존재할 수 없습니다. Deleted 원문은 과거 Git commit에는 남지만 최신
-트리에는 없으므로 다른 PC에서 Pull하면 동일하게 삭제됩니다. 별도 tombstone으로 원문을 보존하지
-않습니다.
-
-Codex의 `~/.codex/archived_sessions`는 앱의 2단계 삭제 절차를 확인하기 위한 존재 위치일 뿐,
-Vault의 Archived 상태를 결정하는 신호나 보관 장소가 아닙니다.
-
-## Start
-
-1. Vault 원격과 합류합니다. 분기돼 있으면 Finish와 같은 경고·merge 규칙을 적용합니다.
-2. baton을 claim하기 전에 세션 형식, 계보, 원본 SHA를 읽기 전용으로 사전 검사합니다.
-3. 사전 검사가 통과한 동일 Vault에서 baton을 claim하고 계획을 다시 검증합니다.
-4. Vault Active를 로컬 활성 저장소에 배치합니다.
-5. Vault Archived와 최신 트리에서 삭제된 기존 세션을 로컬 활성 저장소에서 제거합니다.
-6. Vault에 아직 없는 로컬 신규 세션은 보존합니다.
-7. 로컬 체크포인트를 갱신하고 등록된 앱을 실행합니다. claim 이후 적용이 실패해 로컬 변경이
-   롤백되면, 원격과 로컬이 여전히 해당 claim commit일 때만 이전 baton 값으로 자동 복구합니다.
-
-로컬 체크포인트는 `%LOCALAPPDATA%\AgentSessionSync\State`에 저장합니다. 대화 원문이나 공유 상태가
-아니며, 마지막으로 이 PC에 반영한 Vault commit과 Active ID 집합만 기록합니다.
-
-## Finish
-
-1. Vault 작업트리·원격 합류·checkpoint 상태·기존 gzip 호환성을 앱 종료 전에 사전 검사합니다.
-   checkpoint의 부재나 HEAD 불일치는 경고일 뿐 Finish를 막지 않습니다.
-2. 등록된 앱에 정상 종료를 요청하고 완전히 닫혔는지 확인합니다.
-3. 트레이 상주 프로세스가 남으면 새로 확인한 등록 앱 루트만 `taskkill /T /F`로 종료하고,
-   전체 프로세스 트리가 사라진 경우에만 계속합니다.
-4. 앱 형식과 현재 로컬 원문을 다시 검사합니다.
-5. 각 앱 adapter가 앱별 삭제 신호와 현재 로컬 존재 집합을 판정합니다.
-6. 최종 삭제로 확인된 대화만 Vault 최신 트리에서 제거합니다.
-7. 현재 활성 저장소에 새로 나타난 ID는 Vault Archived를 먼저 조회합니다.
-   - Archived에 있으면 Active로 이동합니다.
-   - 없으면 신규 대화로 추가합니다.
-8. 계속 활성인 대화의 원문을 갱신합니다.
-9. 마지막 timestamp가 30일 기준을 넘은 Active 대화를 Archived로 이동합니다.
-10. Active/Archived 배타성과 원문 형식을 검증한 뒤 commit/push합니다.
-11. fetch 후 `HEAD == origin`을 확인한 다음에만 로컬 정리와 체크포인트 갱신을 수행합니다.
-
-세션 운송물(`.jsonl`, `.jsonl.gz`, `.entry.json`)은 Git text/EOL 필터를 적용하지 않고 원본
-바이트를 그대로 보존합니다. 큰 Codex JSONL은 raw 길이·SHA-256과 gzip 길이·SHA-256 네 값을
-무결성 metadata에 기록하며, 네 값이 모두 일치할 때만 기존 gzip을 재사용합니다. Start와 Restore는
-압축물과 복원된 raw 양쪽을 이 metadata로 검증합니다. 과거에 만들어져 metadata가 없는 gzip은
-gzip CRC와 JSONL 완전성을 검사해 읽을 수 있지만 캐시로 재사용하지 않으며, 다음 Finish가 새 metadata를 만듭니다.
-
-일반 Finish의 secret scan은 이번 계획에서 새로 쓰거나 바뀐 세션 payload만 검사합니다. 탐지 패턴을
-갱신했거나 전체 재검사가 필요하면 `Push-Sessions.ps1 -FullSecretScan`을 명시적으로 실행합니다.
-
-Codex에서 `C`는 `sessions ∪ archived_sessions`입니다. 보관함에 있는 동안에는 아직 삭제된 것이
-아니며, 현재 Vault HEAD와 정확히 일치하는 checkpoint가 있을 때 보관함에서 최종 삭제되어 두 위치
-모두에서 사라진 경우에만 삭제로 판정합니다. checkpoint가 없거나 stale이면 로컬 부재를 삭제로 추론하지 않습니다.
-
-Claude는 원문 파일의 부재를 삭제로 해석하지 않습니다. 앱이 만든 `deleted_<appSessionId>` 마커를
-마지막 checkpoint의 `appSessionId ↔ canonicalId` 매핑으로 해석한 경우에만 최종 삭제합니다.
-해석할 수 없는 마커가 있으면 삭제나 업로드를 추측하지 않고 Finish 전체를 중단합니다.
-
-## Restore
-
-`Restore-ArchivedSession.ps1`은 선택한 대화를 Vault Archived에서 Active로 즉시 이동하고 별도
-commit/push로 확정합니다.
+## 실행
 
 ```powershell
-.\Launchers\Restore-ArchivedSession.ps1
-.\Launchers\Restore-ArchivedSession.ps1 <세션-ID-일부>
+# 비공개 설치본에서 환경 준비. Start와 별도 작업입니다.
+.\Launchers\Initialize-AgentSessionSync.ps1
+
+# 로컬 대화가 먼저 있고 원격 세션이 비어 있다면 Finish로 처음 게시합니다.
+.\Launchers\Finish.ps1
+
+# 원격 상태를 앱에 적용합니다. 미게시 작업 폐기 확인을 읽고 결정하세요.
+.\Launchers\Start.ps1
 ```
 
-복원 상태를 Vault에 commit/push한 뒤 앱이 열려 있으면 정상 종료를 요청합니다. 제한시간 안에
-닫히지 않으면 강제 종료하거나 로컬 파일을 쓰지 않습니다. 이때 Vault의 Active 전환은 이미
-유효하며 다음 Start가 로컬 배치를 완료합니다. 정상 종료가 확인되면 로컬 파일을 배치하고 앱을
-다시 실행합니다.
+Initialize는 디렉터리, Git 바이트 보존 속성, private 추적 규칙, 머신별 설정과 바로가기를 준비합니다.
+기존 설정은 덮어쓰지 않습니다. `AgentSessionSync.config.psd1`은 Git에서 제외됩니다.
+원격의 공개/비공개 여부를 자동으로 보장하는 도구가 아니므로, **Initialize 전에 비공개 origin을 확인**하세요.
 
-복원은 데이터와 Vault 상태 전환을 보장하지만 앱 사이드바의 즉시 표시는 보장하지 않습니다.
-표시되지 않으면 앱을 다시 실행하고, 그래도 표시되지 않으면 앱을 업데이트한 뒤 Start를 다시
-실행합니다. `restoredAt` 같은 별도 유예 필드는 만들지 않습니다.
+## 처리 기준
 
-## Codex 판정 기준
+| 항목 | 동작 |
+|---|---|
+| Start | fetch → 폐기 의도 확인 → 앱 정상 종료 → 앱별 검증·적용 → 전 앱 성공 후 기준·바통 게시 → 앱 실행 |
+| Finish | fetch·바통 확인 → 전 앱 종료(필요시 강제) → 앱별 검증·백업·정합화 → 전 앱 성공 시 공동 commit/push → 기준 확정 → 백업 정리 → Vault 작업트리 반영 |
+| 다른 PC 바통 | Start는 경고 후 성공할 때 인수. Finish는 중단하고 Start 필요를 보고하며, 자동으로 Start하지 않음 |
+| 미커밋 변경 | Finish가 Git 추적 대상 변경을 공동 게시에 포함. 사전 수집 커밋을 만들거나 로컬 작업을 원격으로 reset하지 않음 |
+| 충돌 | 앱이 실제 기준·로컬·원격 세션을 비교. 같은 세션의 양쪽 변경은 보고하고 공동 게시 중단. 자동 내용 병합 없음 |
+| 실패 | 게시 전 실패는 앱별 Cancel로 이번 변경 복구. 게시 여부가 불명확하면 복구·재게시를 단정하지 않고 자료 보존 |
+| 버전 변경 | 보조 정보. 버전 번호만으로 차단하지 않으며 실제 구조 불일치는 보고 후 중단 |
 
-- canonical ID는 파일명이 아니라 첫 `session_meta`에서 읽습니다. `session_id`가 있으면 thread ID로 우선하고, 최신 형식처럼 없으면 `id`를 사용합니다.
-- 같은 thread의 여러 page 파일은 canonical ID 하나로 묶습니다.
-- continuation의 `history_base`는 predecessor page 존재 여부뿐 아니라 `end_byte_offset`의 JSONL 행 경계와
-  `end_ordinal_exclusive`도 검사합니다. 길이만 충분하고 내용이 바뀐 predecessor는 허용하지 않습니다.
-- 마지막 활동 시각은 모든 page의 최상위 레코드 중 timestamp가 있는 마지막 레코드로 판정합니다.
-- 파일 mtime, 파일명 날짜, Git commit 시각은 활동 시각으로 쓰지 않습니다.
-- `state_5.sqlite`를 복사하거나 직접 수정하지 않습니다.
-- 지원하지 않는 `session_meta` 구조나 상충하는 ID가 발견되면 변경 전에 중단합니다.
+Start는 앱 간 일부 적용이 남아도 전체 Failure입니다. 기준·바통을 전진시키지 않고 사용자가 Start를 다시 실행합니다.
+Finish는 전 앱이 성공해야 게시합니다. 성공한 Finish는 앱을 다시 실행하지 않습니다.
 
-Codex 데이터 형식은 Start와 Finish마다 원문에서 다시 확인합니다. 앱이 열린 뒤 업데이트될 수
-있으므로 Start의 판정 결과를 Finish에서 재사용하지 않습니다. 오래된 지원 형식은 adapter로 읽을
-수 있지만, 알 수 없는 형식을 추측해서 변환하지 않습니다.
-
-## Claude 판정 기준
-
-- canonical ID는 원문 모든 레코드의 `sessionId`를 확인해 판정합니다. 서로 다른 ID가 섞이면 중단합니다.
-- 목록 항목은 `local_<appSessionId>.json`의 `cliSessionId`로 원문과 연결합니다.
-- Vault에서는 `<session-id>.jsonl`과 `<session-id>.entry.json`을 한 쌍으로 보관합니다.
-- 로컬 목록 항목이 없어도 Vault sidecar가 있으면 기존 쌍을 유지하고, 다음 Start에서 항목을 복원합니다.
-- 한 원문에 목록 항목이 둘 이상 연결되거나 sidecar의 경로·ID·스키마가 맞지 않으면 중단합니다.
-- 마지막 활동 시각은 timestamp가 있는 마지막 레코드에서 읽으며 파일 mtime은 사용하지 않습니다.
-
-## Git 실패 처리
-
-- Push가 거부되면 원격을 다시 fetch하고 최대 3회 merge·push로 합류합니다.
-- 서로 다른 경로는 합집합으로 보존하고, 같은 경로가 겹치면 경고에 경로를 출력한 뒤 현재 호스트
-  사본을 우선합니다. merge commit은 양쪽 부모 이력을 보존합니다.
-- Push 실패 전에는 로컬 세션 정리와 체크포인트 갱신을 하지 않습니다.
-
-## 설치
-
-private Vault를 두 PC에 clone하고 각 PC에서 초기화합니다.
-
-```powershell
-git clone https://github.com/<YOU>/<PRIVATE-SESSION-VAULT>.git C:\Project\MultiAgent\AgentSessionVault
-cd C:\Project\MultiAgent\AgentSessionVault
-.\Launchers\Initialize-AgentSessionSync.ps1 `
-  -EnableSessionPush
-```
-
-두 PC의 원본 프로젝트 절대경로는 같게 유지합니다. 최초 Start 전에는 동기화 대상 앱 저장소를
-정리해 비어 있는 상태로 시작해야 합니다. 기존 세션이 남아 있으면 자동 흡수하지 않고 초기 정리
-절차를 먼저 수행합니다.
-
-자세한 설치 과정은 [Windows 설치](docs/SETUP_WINDOWS.md), 실패 대응은
-[문제 해결](docs/TROUBLESHOOTING.md)을 참고하세요.
-
-## Vault 예시
-
-`examples/session-store`는 실제 대화가 아닌 합성 placeholder입니다.
+## Vault 상태와 앱 상태
 
 ```text
-Claude/sessions/<cwd-key>/<session-id>.jsonl
-Claude/sessions/<cwd-key>/<session-id>.entry.json
-Claude/archive/<cwd-key>/*.jsonl
-Claude/archive/<cwd-key>/*.entry.json
-Codex/session_index.jsonl
-Codex/session_projects.jsonl
-Codex/sessions/<cwd-key>/YYYY/MM/DD/*.jsonl[.gz]
-Codex/archive/<cwd-key>/YYYY/MM/DD/*.jsonl[.gz]
+Codex/Active    Codex/Archived    Codex/Deleted
+Claude/Active   Claude/Archived   Claude/Deleted
+Surveys/Codex   Surveys/Claude
+ACTIVE_HOST.txt
 ```
 
-공개 저장소나 예제에 실제 대화, 자격 증명, 앱 DB, 에이전트 메모리를 넣지 마세요.
+- Vault Active는 적용 대상, Archived는 마지막 대화 활동으로부터 30일이 지난 보존 대상입니다.
+- Deleted에는 원문이 아닌 최소 삭제 기록만 남습니다. 원문은 Git 과거 이력에 남을 수 있습니다.
+- 앱의 보관 기능과 Vault Archived는 다릅니다. Codex native Archived는 이 도구의 운용 규약상 삭제 경유지입니다.
+  Finish는 검증된 경유 상태를 백업 후 삭제 완료하고, 게시된 세션에는 Deleted를 남깁니다.
+- Codex의 단순 부재는 삭제 증거가 아닙니다. 전에 수신한 Active가 설명 없이 사라지면 보고하고 멈춥니다.
+- Claude 삭제는 앱이 남긴 계보 전체와 앱 세션 ID의 묘비를 확인합니다.
+- Claude Finish의 Vault Archive는 앱 원본을 직접 바꾸지 않습니다. Start가 Vault 상태를 적용합니다.
+- 원격 Deleted인데 로컬에 세션이 남아 있으면 조용히 넘기거나 되살리지 않고 보고합니다.
 
-## 검사
+본문은 바이트 그대로 운송합니다. 95 MiB 초과 원문은 gzip, gzip도 한도를 넘으면 분할 운송합니다.
+검증 마커가 같은 자료는 재압축·검증용 압축 해제를 재사용하지만, 모든 전수 읽기가 제거된 것은 아닙니다.
 
-```powershell
-.\Launchers\tests\Test-AgentLauncher.ps1
-.\Launchers\tests\Test-PlanEngine.ps1
-.\Launchers\tests\Test-AgentSessionSync.ps1
-.\Launchers\tests\Test-ClaudeSessionState.ps1
-.\Launchers\tests\Test-AgentSessionIntegration.ps1
-.\Launchers\tests\Test-CodexStateContract.ps1
-```
+## 진입점과 현재 제한
 
-마지막 통합 테스트는 Codex와 Claude가 한 번의 Publish를 공유하는지, 한쪽 실패 시 전체가 무변경인지,
-Restore 뒤 두 checkpoint가 함께 전진하는지를 확인합니다. 모든 테스트는 임시 Git 저장소와 임시
-프로필을 사용하며 실제 사용자 세션을 수정하지 않아야 합니다.
+공통 3개와 앱별 3개씩, 실행 파일은 9개입니다. 별도 공통 Reactivate는 없습니다.
+`Launchers/Codex/Reactivate.ps1`와 `Launchers/Claude/Reactivate.ps1`은 구현돼 있지만,
+**현재 게시 후 앱별 Start를 내부 호출하는 불일치가 남아 있으므로 사용을 보류합니다.**
+확정 요구는 Vault의 Archived → Active 전환만 하고 앱 적용은 별도 Start에서 하는 것입니다.
+이 차이는 마감 보고에 후속 수정 대상으로 남겼으며 이번 문서 정리에서 동작을 바꾸지 않았습니다.
+
+프로젝트 소스·워크벤치 상태·에이전트 메모리는 이 도구의 동기화 대상이 아닙니다.
+상시 동기화, 자동 측량, 자동 충돌 해결은 제공하지 않습니다.
+
+- [Windows 설치](docs/SETUP_WINDOWS.md)
+- [문제 해결](docs/TROUBLESHOOTING.md)
+- [구현 계약](docs/IMPLEMENTATION_PLAN.md)
+- [Codex 구조](docs/CODEX_SESSION_STRUCTURE.md), [Claude 구조](docs/CLAUDE_SESSION_STRUCTURE.md)
+- [측량 기준](docs/SURVEY_GUIDE.md)
+
+구 구현의 지원 스크립트·테스트·Agents 설정·예제는 삭제 승인 대기 상태로 남아 있습니다.
+현재 9개 진입점은 이 파일들을 호출하지 않습니다. 구 테스트 결과를 현재 구현 검증으로 사용하지 마세요.

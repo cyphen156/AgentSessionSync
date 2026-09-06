@@ -142,6 +142,19 @@ local_<appSessionId>.json
 in `priorCliSessionIds`.** Matching only on `cliSessionId` and treating the rest
 as unreferenced discards the live conversation's own history.
 
+### When a lineage transcript is gone
+
+The app does not record the absence. In the surveyed sample one conversation
+referred to two `priorCliSessionIds` whose files no longer existed, and the app
+carried on across 48 turns without marking that anywhere: no file, no sidecar,
+no field. Absence is only visible by resolving `priorCliSessionIds` against the
+transcript directory.
+
+A tool therefore cannot learn from the app which losses are known and which are
+new. That judgement belongs to the user, and the sync contract keeps it in the
+private configuration rather than inferring it. See "Confirmed lineage loss" in
+`IMPLEMENTATION_PLAN.md`.
+
 The field is **optional and uncommon** in the surveyed sample - most records do
 not have it. Absence must not be read as "this conversation has no history".
 
@@ -264,6 +277,16 @@ Present in only some records (optional):
 title                  titleSource            reportFindingsCard
 remoteControlAutoEligible                     chromePermissionMode
 priorCliSessionIds     writtenBranches        sessionSettings
+promptAppendSnapshot   bridgeSessionIds       contextExceededCount
+```
+
+The last three appeared in the 2026-09-05 survey and were absent from both
+earlier ones. No field has disappeared. Their measured forms:
+
+```
+bridgeSessionIds       array of "session_" + exactly 24 alphanumerics, not UUIDs
+promptAppendSnapshot   object: append, cliVersion, cwd, settingsKey; all strings
+contextExceededCount   non-negative integer
 ```
 
 Per-field frequencies are in the Vault survey.
@@ -275,6 +298,18 @@ Notes:
 - A record without `title` is displayed by the app as `General coding session`.
 - `isArchived` is written by the app. A sync tool should read it, not write it.
 - `titleSource` was observed with the values `auto` and `custom`.
+- `createdAt`, `lastActivityAt` and `lastFocusedAt` hold epoch milliseconds as
+  numbers, not strings.
+- **`bridgeSessionIds` is not evidence of a transcript lineage.** Its values
+  match no `cliSessionId`, no `appSessionId`, no `priorCliSessionIds` entry, no
+  transcript file name, and appear in no transcript record or LevelDB file. What
+  they refer to is not established. A sync tool must carry them and must not use
+  them for session identity, lineage or deletion.
+- `promptAppendSnapshot.append` held the app's injected system prompt and
+  contained no path, account, device, MCP or URL string. Its sibling fields do
+  carry machine state: `cwd` is an absolute path and `cliVersion` is the local
+  app version. `settingsKey` was one value across every record that had it; what
+  it keys is not established.
 
 ## 7. Deletion signal
 
@@ -377,11 +412,41 @@ preferences.epitaxyPrefs["dframe-group-scopes"]["<accountId>/<deviceId>"]
 - The scope key embeds `accountId` and `deviceId`.
 - Assignment keys use `appSessionId`, not `cliSessionId`.
 - A session absent from `assignments` is displayed under an ungrouped section.
-- The same group data was also found in `Local Storage\leveldb`. At the time of
-  observation the LevelDB files had a newer modification time than the config
-  file. Whether LevelDB overwrites the config file, and under what conditions,
-  was not tested. Until that is established, treat editing the config file
-  while the app is running as unsafe.
+- Rechecked on 2026-09-06: editing only the config while Claude was fully
+  closed did not persist. After relaunch, the two removed assignments and
+  order entries returned, and the parsed config equalled the pre-edit backup.
+- The installed renderer persists `dframe-store` in Chromium Local Storage.
+  Its version-1 envelope contains `state.customGroupsByScope`, including the
+  assignments and order. `LSS-persisted.dframe-group-scopes` carries a second
+  copy in its `value` member. The `dframe-local-slice` preference and its
+  `LSS-persisted.dframe-local-slice` copy also carry pin arrays.
+- Startup hydrates `dframe-store`, combines it with the preference scopes,
+  and writes the resulting scopes back through `AppPreferences.setPreference`.
+  Therefore config-only removal cannot establish persistent cleanup.
+- The evidence is the installed renderer's `NO` / `MO` hydration and merge
+  path in `shared-20-BuOxByKU.js`, the version-1 `dframe-store` persistence in
+  `shared-2-DD9M-xj-.js`, and the `epitaxyPrefs` write bridge in
+  `shared-12-RJIRw5sU.js`. These filenames identify the inspected build, not
+  an allowed-app-version gate.
+- Start must prepare browser-storage cleanup before changing app data, keep
+  a backup of the complete original database file set, and remove only the
+  selected app identities from the measured scope and pin lists. Group
+  definitions, other identities, foreign scopes, and unrelated storage keys
+  must remain intact. Unsettled legacy migration or an unknown shape fails.
+- The current implementation uses the installed Microsoft Edge Chromium
+  storage engine on an isolated copy under the app-owned run directory.
+  It does not load the Claude application or contact claude.ai: every page
+  request is fulfilled locally and external name resolution is disabled.
+  It changes values through `localStorage`, closes and reopens the copy to
+  verify persistence, then replaces the closed app's database with verified
+  file backups. No LevelDB bytes are patched by hand. An unavailable engine,
+  occupied database, or changed source aborts without accepting the cleanup.
+- Isolated Chromium reopen and byte-exact rollback were verified in both
+  PowerShell 5.1 and 7. On 2026-09-06 the two stale placements were then
+  removed with a full storage backup and the actual Claude app was relaunched.
+  Neither the config nor either persisted storage key regained the references.
+  All app-record and tombstone files remained byte-identical. This verifies
+  persistence of this cleanup, not every session UI or the full sync round trip.
 
 ## 9. Portability
 
@@ -425,7 +490,9 @@ No compression threshold is established by this document.
   record in both surveys carried `isArchived: false`.
 - What happens to an assigned session's `dframe-group-scopes` entry on
   deletion, under a before-and-after snapshot.
-- Whether LevelDB overwrites the config file, and when.
+- Writer behaviour outside the measured dframe hydration/repersistence path
+  in section 8. That specific path was checked on 2026-09-06; other keys and
+  future renderer behaviour remain unverified.
 - Which process writes which storage layer.
 - Triggers that extend a lineage other than a rewind.
 - Whether a prior transcript is ever written to after it becomes a prior. The
@@ -443,12 +510,19 @@ extends a lineage.
 
 ## 12. Structure change log
 
-Baseline row only. Nothing here is a change from an earlier release; no earlier
-release of this app has been surveyed.
+The baseline row records the initial survey. Later dated observations and
+implementation checks are scoped separately; none establish an unknown
+feature introduction date.
 
 | Date | Versions | Change | Survey |
 |---|---|---|---|
 | 2026-08-31 | app `Claude_1.40609.0.0_x64`, engine `2.1.247` | Baseline. First survey of this agent. | `Surveys/Claude/2026-08-31.md` |
+
+| 2026-09-05 | Stored records; version identity remains supplementary | Observed optional bridgeSessionIds, promptAppendSnapshot and contextExceededCount. Preserve opaque values; do not infer transcript lineage from bridge IDs. | `Surveys/Claude/2026-09-05.md` |
+| 2026-09-06 | Installed renderer, targeted placement verification | Section 8 records dframe LocalStorage hydration and verified persistent placement removal; not a full new survey. | Private closeout evidence and section 8 |
+
+For implementation and operational validation scope, see
+[the closeout](IMPLEMENTATION_CLOSEOUT_2026-09-06.md).
 
 Add one row per confirmed structural change, newest last. A row is added only
 after a survey establishes the change; a version bump with no observed

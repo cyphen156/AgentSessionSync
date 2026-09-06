@@ -1,58 +1,62 @@
 # Windows 설치
 
-## 1. 실행환경을 맞춥니다
+2026-09-06 구현 기준입니다. 기존 도구의 `Agents/*.psd1`, 체크포인트 파일,
+`-EnableSessionPush`, Pull/Push-Sessions 진입점은 사용하지 않습니다.
 
-두 PC에서 같은 설치 방식과 프로젝트 절대경로를 사용합니다. 앱은 Start 이후 업데이트될 수 있으므로
-세션 데이터 형식은 매 Start와 Finish에서 다시 검사합니다.
+## 1. 비공개 설치본 준비
 
-## 2. Private Vault를 clone합니다
-
-```powershell
-git clone https://github.com/<YOU>/<PRIVATE-REPO>.git C:\Project\MultiAgent\AgentSessionVault
-```
-
-실제 대화가 들어가는 저장소는 반드시 private이어야 합니다. Git 이력에는 삭제 전 원문이 남습니다.
-
-## 3. 기존 앱 데이터를 정리합니다
-
-첫 Start 전에 동기화 대상 앱의 세션 저장소가 비어 있어야 합니다. 남길 대화를 선별해야 한다면 먼저
-별도 백업하고, 초기 정리 절차로 삭제 범위를 확정합니다. 새 도구는 첫 실행에서 출처를 모르는 기존
-원문을 임의로 Vault에 흡수하지 않습니다.
-
-Codex는 `sessions`, `archived_sessions`, 세션 인덱스를 함께 확인합니다. 앱 DB를 직접 수정하지
-않습니다.
-
-Claude는 `~/.claude/projects`의 원문뿐 아니라 앱 목록의 `local_*.json`과 `deleted_*` 마커까지
-비어 있어야 합니다. 삭제 마커만 남아 있어도 이전 설치의 삭제 판정을 안전하게 복구할 수 없으므로
-첫 Start를 중단합니다.
-
-## 4. PC별 설정을 만듭니다
+공개 AgentSessionSync의 사본을 사용자의 비공개 Git 저장소로 준비합니다.
+그 사본 안에 실행 파일과 Vault 데이터가 함께 존재합니다. 공개 원본에서는 Initialize를 실행하지 마세요.
+원격에는 `origin/main`을 준비하고, 첫 앱 게시 전에 비공개 저장소인지와 Git 인증을 확인합니다.
+Initialize는 원격을 만들거나 저장소 공개 여부를 변경하지 않습니다.
 
 ```powershell
-cd C:\Project\MultiAgent\AgentSessionVault
-.\Launchers\Initialize-AgentSessionSync.ps1 `
-  -EnableSessionPush
+git remote -v
+git status
+.\Launchers\Initialize-AgentSessionSync.ps1
 ```
 
-머신별 설정과 바로가기는 Git에 넣지 않습니다. 대화는 프로젝트별이 아니라 앱 전체 단위로
-동기화합니다. 프로젝트 소스 동기화는 이 도구의 범위가 아닙니다.
+Windows PowerShell 5.1 이상, Git for Windows와 대상 데스크톱 앱이 필요합니다.
+Codex는 설치된 앱 backend와 측량된 SQLite 구조를 사용합니다.
+Claude의 필요한 영구 배치 정리는 Edge의 격리 저장소 처리를 사용하며,
+앱이 닫혀 있고 원본 저장소가 변하지 않았음을 확인합니다. 미확인 구조는 추측해서 쓰지 않습니다.
 
-## 5. 등록 앱과 바로가기를 확인합니다
+## 2. 머신 설정 확인
 
-`Agents\*.psd1`에서 사용하지 않는 앱은 `Enabled = $false`로 바꿉니다. 설치 중 생성된 Start와
-Finish 바로가기를 작업 표시줄에 고정합니다. Restore는 필요할 때 PowerShell에서 실행합니다.
+Initialize가 만드는 `AgentSessionSync.config.psd1`을 확인합니다.
+`Codex`와 `Claude` 블록의 `Enabled`, `Home`, `AppId`, `ProcessNames`, Claude의 `AppData`가
+이 PC의 실제 설치를 가리켜야 합니다. `VaultRoot` 설정은 없습니다.
+설정은 Git에서 제외되며 다른 PC는 자기 설정을 생성합니다.
+기존 설정·바통은 Initialize 재실행으로 초기화하지 않습니다.
 
-## 6. 운용합니다
+기본 정책은 대화 활동 30일, 운송 한도 99,614,720바이트, 정상 종료 대기 8초입니다.
+임의의 앱 버전 허용 목록을 설정하지 않습니다.
+`AcknowledgedMissingLineage`는 기본 빈 맵이며, 사용자가 확인한 과거 계보 손실만 명시합니다.
+일반 결손을 통과시키기 위해 자동으로 채우면 안 됩니다.
 
-- 작업 시작: Start
-- 작업 종료 및 전달: Finish
-- 오래된 대화 복원: `Restore-ArchivedSession.ps1`
+## 3. 첫 게시와 수신
 
-Finish는 사전검사를 통과한 뒤 정상 종료를 요청하고, 트레이 상주 프로세스가 남으면 등록된 앱의
-검증된 루트 프로세스 트리만 강제 종료합니다. Restore는 정상 종료만 요청하며 실패하면 중단합니다.
+현재 PC에 보존할 대화가 있고 원격 세션이 비어 있으면 **Initialize → Finish**로 처음 게시합니다.
+먼저 Start해서 기존 대화를 폐기하지 마세요. 최초 Finish는 정상적인 신규 게시입니다.
+Finish 전 사용자가 미리 커밋할 필요는 없습니다. Git 추적 대상 미커밋 변경은 함께 수집합니다.
 
-baton과 checkpoint는 보조 정보입니다. 소유권 또는 HEAD 불일치는 경고하지만 Finish를 막지 않습니다.
-Push가 거부되면 최대 3회 원격과 merge로 합류하며, 같은 경로가 겹치면 현재 호스트 사본이 우선됩니다.
+다른 PC는 같은 private Vault를 clone하고 **Initialize → Start → 작업 → Finish** 순서로 사용합니다.
+처음부터 앱 저장소를 수동으로 전부 지우라는 요구는 없습니다.
+Start의 미게시 작업 폐기 확인과 앱별 매핑·구조 검사 결과를 읽고 처리합니다.
+프로젝트 경로나 앱 매핑 차이가 보고되면 임의로 경로를 바꾸거나 자료를 삭제하지 않습니다.
 
-지원 앱은 Claude와 Codex입니다. 다른 에이전트를 자동 등록하는 구조는 제공하지 않습니다. 필요하면
-MIT 라이선스에 따라 별도 포크에서 저장 형식과 삭제 판정을 구현해야 합니다.
+Finish → 추가 작업 → Finish도 가능합니다. 다른 PC가 바통을 소유하면 Finish는 중단합니다.
+Start는 원격을 받는 동작이므로 미게시 작업을 살릴 필요가 있으면 **바로 Start하지 말고**
+보고를 바탕으로 보존·충돌 처리 지시를 먼저 정합니다.
+
+## 4. All-Start / All-Finish 연결
+
+외부 워크벤치 어댑터가 가리킬 toolRoot는 공개 배포 원본이 아닌 **private Vault 설치본**입니다.
+등록 스크립트는 `Launchers/Start.ps1`, `Launchers/Finish.ps1`입니다.
+Initialize는 다른 워크벤치 저장소의 등록부를 수정하지 않습니다.
+설치본 업데이트는 사용자가 정한 시점에 코드·문서를 복사하는 작업이지 자동 업데이트가 아닙니다.
+
+이 대화에서 사용한 All 실행기는 로그를 남기고 실패 시 엽니다. 독립 사용자의 직접 스크립트 실행에도
+같은 로그 UI가 자동 제공된다고 가정하면 안 됩니다. 직접 실행 시에는 콘솔 결과를 보존하세요.
+
+Reactivate는 [마감 보고](IMPLEMENTATION_CLOSEOUT_2026-09-06.md)의 호출 범위 불일치를 수정하기 전까지 보류합니다.

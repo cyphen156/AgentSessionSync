@@ -34,7 +34,7 @@ survey that restates the structure without measured values is not a survey.
 ## 3. Location and naming
 
 ```
-<VaultRoot>/Surveys/<Agent>/<YYYY-MM-DD>.md
+<installation-root>/Surveys/<Agent>/<YYYY-MM-DD>.md
 ```
 
 - `<Agent>` matches the agent registration key in the machine configuration,
