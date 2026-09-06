@@ -32,6 +32,74 @@ using System.Diagnostics;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public static class CodexStartNative {
+
+    // Compare decoded JSON/data values without serializing large unchanged histories.
+    static object Unwrap(object value) {
+        var wrapper=value as System.Management.Automation.PSObject;
+        if(wrapper==null)return value;
+        if(wrapper.BaseObject is System.Management.Automation.PSCustomObject)return wrapper;
+        return Unwrap(wrapper.BaseObject);
+    }
+    static Dictionary<string,object> Members(object value) {
+        var result=new Dictionary<string,object>(StringComparer.Ordinal);
+        var dictionary=value as System.Collections.IDictionary;
+        if(dictionary!=null){foreach(System.Collections.DictionaryEntry pair in dictionary)result.Add((string)pair.Key,pair.Value);return result;}
+        var wrapper=value as System.Management.Automation.PSObject;
+        if(wrapper!=null){foreach(var prop in wrapper.Properties)result.Add(prop.Name,prop.Value);return result;}
+        return null;
+    }
+    static int NumberKind(object value) {
+        if(value is byte||value is sbyte||value is short||value is ushort||value is int||value is uint||value is long||value is ulong)return 1;
+        if(value is double||value is float||value is decimal)return 2;
+        return 0;
+    }
+    public static bool SameData(object left,object right) {
+        left=Unwrap(left);right=Unwrap(right);
+        if(left==null||right==null)return left==null&&right==null;
+        if(left is string||right is string)return left is string&&right is string&&String.Equals((string)left,(string)right,StringComparison.Ordinal);
+        if(left is bool||right is bool)return left is bool&&right is bool&&(bool)left==(bool)right;
+        int a=NumberKind(left),b=NumberKind(right);
+        if(a!=0||b!=0){if(a!=b)return false;if(a==2)return left.GetType()==right.GetType()&&left.Equals(right);try{return Convert.ToDecimal(left)==Convert.ToDecimal(right);}catch{return false;}}
+        var lm=Members(left);var rm=Members(right);
+        if(lm!=null||rm!=null){if(lm==null||rm==null||lm.Count!=rm.Count)return false;foreach(var p in lm){object v;if(!rm.TryGetValue(p.Key,out v)||!SameData(p.Value,v))return false;}return true;}
+        var le=left as System.Collections.IEnumerable;var re=right as System.Collections.IEnumerable;
+        if(le!=null||re!=null){if(le==null||re==null)return false;var l=le.GetEnumerator();var r=re.GetEnumerator();while(true){bool ln=l.MoveNext(),rn=r.MoveNext();if(ln!=rn)return false;if(!ln)return true;if(!SameData(l.Current,r.Current))return false;}}
+        // Unknown objects are never evidence for reuse.
+        return false;
+    }
+
+
+    public static Dictionary<string,string> JsonBlobs(string repo,string[] ids) {
+        var si=new ProcessStartInfo("git","cat-file --batch");
+        si.WorkingDirectory=repo;si.UseShellExecute=false;si.CreateNoWindow=true;
+        si.RedirectStandardInput=true;si.RedirectStandardOutput=true;si.RedirectStandardError=true;
+        using(var p=Process.Start(si)) {
+            var errors=p.StandardError.ReadToEndAsync();
+            // Drain stdout while feeding requests: either pipe can fill with large blobs.
+            var sending=System.Threading.Tasks.Task.Run(() => {
+                foreach(string id in ids)p.StandardInput.WriteLine(id);
+                p.StandardInput.Close();
+            });
+            try {
+                var result=new Dictionary<string,string>(StringComparer.Ordinal);
+                var stream=p.StandardOutput.BaseStream;
+                foreach(string id in ids) {
+                    var header=new StringBuilder();int c;
+                    while((c=stream.ReadByte())!=10){if(c<0||header.Length>256)throw new IOException("Invalid git batch header.");header.Append((char)c);}
+                    var parts=header.ToString().Split(' ');int size;
+                    if(parts.Length!=3||parts[0]!=id||parts[1]!="blob"||!Int32.TryParse(parts[2],out size)||size<0)throw new IOException("Git batch object is missing or not a blob: "+id);
+                    var bytes=new byte[size];int offset=0;
+                    while(offset<size){int got=stream.Read(bytes,offset,size-offset);if(got==0)throw new IOException("Truncated git batch blob.");offset+=got;}
+                    if(stream.ReadByte()!=10)throw new IOException("Invalid git batch terminator.");
+                    result[id]=new UTF8Encoding(false,true).GetString(bytes);
+                }
+                sending.GetAwaiter().GetResult();p.WaitForExit();string error=errors.GetAwaiter().GetResult();
+                if(p.ExitCode!=0)throw new IOException("Git batch failed: "+error);
+                return result;
+            } catch {try{if(!p.HasExited)p.Kill();}catch{};throw;}
+        }
+    }
+
     public static string Quote(string s) {
         StringBuilder b=new StringBuilder("\""); int slashes=0;
         foreach(char c in s) { if(c=='\\') { slashes++; continue; }
@@ -168,8 +236,11 @@ function Resolve-Within([string]$Root,[string]$Relative) {
 function Git([string[]]$Arguments,[string]$InputFile=$null,[string]$OutputFile=$null) {
     return [CodexStartNative]::Git($script:repo,$Arguments,$InputFile,$OutputFile).TrimEnd("`r","`n")
 }
+$script:verifiedObjects=@{}
 function Object-Id([string]$Value,[string]$Type) {
+    $key=$Value+'/'+$Type;if($script:verifiedObjects.ContainsKey($key)){return}
     if ($Value -notmatch '^[a-f0-9]{40}([a-f0-9]{24})?$' -or (Git @('cat-file','-t',$Value)) -ne $Type) { throw "Invalid $Type object: $Value" }
+    $script:verifiedObjects[$key]=$true
 }
 function Save-Receipt { Write-Json (Join-Path $script:runRoot 'receipt.json') $script:receipt }
 function Report([string]$Result,[string]$Reason,[string]$Detail) {
@@ -206,10 +277,76 @@ function Rows-Equal($Left,$Right) { return (Json (Ordered-Value $Left)) -ceq (Js
 
 function Blob-File([string]$Path) { return Git @('hash-object','-w','--no-filters','--',$Path) }
 function Blob-Json($Value) {
+    $text=Json $Value;$key=Analysis-Key $text
+    if($script:jsonContentIds.ContainsKey($key)){return $script:jsonContentIds[$key]}
     $path=Join-Path $script:runRoot ([guid]::NewGuid().ToString()+'.json')
-    [IO.File]::WriteAllText($path,(Json $Value),$script:utf8); return Blob-File $path
+    [IO.File]::WriteAllText($path,$text,$script:utf8);$oid=Blob-File $path
+    $script:jsonContentIds[$key]=$oid
+    return $oid
 }
+
+$script:madeTrees=@{}
+
+function Entry-Identity($Entries) {
+    $lines=New-Object 'Collections.Generic.List[string]'
+    foreach($path in @($Entries.Keys|Sort-Object -CaseSensitive)){
+        if($path-match '(^/|\\|(^|/)\.\.?(/|$)|[\x00-\x1f])'){throw "Invalid Git payload path: $path"}
+        $oid=[string]$Entries[$path]
+        if($oid-cnotmatch '^[0-9a-f]{40}([0-9a-f]{24})?$'){throw 'Invalid Git entry identity.'}
+        $lines.Add($path+"`0"+$oid+"`0")
+    }
+    return Analysis-Key ($lines-join '')
+}
+$script:existingTrees=@{}
+$script:reusedTrees=0
+function Remember-AppTrees($Entries,$Trees) {
+    $sets=@{};$empty=New-Object 'Collections.Generic.List[string]'
+    foreach($prefix in $Trees.Keys){
+        $children=@{}
+        foreach($path in $Entries.Keys){if($path.StartsWith($prefix,[StringComparison]::Ordinal)){$children[$path.Substring($prefix.Length)]=$Entries[$path]}}
+        $sets[$prefix]=$children;if(-not$children.Count){$empty.Add($prefix)}
+    }
+    foreach($prefix in $Trees.Keys){
+        $hasEmpty=$false;foreach($missing in $empty){if($missing.StartsWith($prefix,[StringComparison]::Ordinal)){$hasEmpty=$true;break}}
+        if(-not$hasEmpty){$script:existingTrees[(Entry-Identity $sets[$prefix])]=$Trees[$prefix]}
+    }
+}
+function Reuse-Json($Value,[string[]]$PriorIds) {
+    foreach($oid in @($PriorIds|Where-Object{$_}|Select-Object -Unique)){
+        if([CodexStartNative]::SameData($Value,(Read-BlobJson $oid))){$script:reusedJson++;return $oid}
+    }
+    return Blob-Json $Value
+}
+$script:reusedJson=0
+$script:reusablePayloads=@{}
+function Index-ReusablePayloads($Base,$Remote) {
+    $script:reusablePayloads=@{};$lengths=@{}
+    foreach($set in @($Base,$Remote)){
+        foreach($session in $set.Values){
+            if($session.State-eq'Deleted'){continue}
+            foreach($payload in @($session.Manifest.payloads)){
+                $files=@{}
+                $relative=[string]$payload.transportPath
+                if($relative.EndsWith('.gz',[StringComparison]::OrdinalIgnoreCase)-or$relative.EndsWith('.gz.parts.json',[StringComparison]::Ordinal)){$files=Get-TransportFiles $session.Entries $session.Prefix $payload}
+                else{$files[$relative]=$session.Entries[$session.Prefix+$relative]}
+                $key=[string]$payload.path+"`0"+[string]$payload.length+"`0"+[string]$payload.sha256
+                $largest=[long]$payload.length
+                if($relative.EndsWith('.gz',[StringComparison]::OrdinalIgnoreCase)-or$relative.EndsWith('.gz.parts.json',[StringComparison]::Ordinal)){
+                    $largest=0
+                    foreach($oid in $files.Values){
+                        if(-not$lengths.ContainsKey($oid)){$lengths[$oid]=[long](Transport-Git @('cat-file','-s',$oid))}
+                        $largest=[Math]::Max($largest,$lengths[$oid])
+                    }
+                }
+                $script:reusablePayloads[$key]=[pscustomobject]@{Payload=$payload;Files=$files;Largest=$largest}
+            }
+        }
+    }
+}
+
 function Make-Tree($Entries) {
+    $entryKey=Entry-Identity $Entries
+    if($script:existingTrees.ContainsKey($entryKey)){$script:reusedTrees++;return $script:existingTrees[$entryKey]}
     $dirs=@{}; $leaves=@{}
     foreach($path in $Entries.Keys){
         if($path -match '(^/|\\|(^|/)\.\.?(/|$)|[\x00-\x1f])'){throw "Invalid Git payload path: $path"}
@@ -220,9 +357,11 @@ function Make-Tree($Entries) {
     $lines=New-Object 'Collections.Generic.List[string]'
     foreach($name in $leaves.Keys){Object-Id $leaves[$name] 'blob';$lines.Add("100644 blob $($leaves[$name])`t$name`0")}
     foreach($name in $dirs.Keys){if($leaves.ContainsKey($name)){throw 'File/directory collision.'};$tree=Make-Tree $dirs[$name];$lines.Add("040000 tree $tree`t$name`0")}
+    $treeKey=Analysis-Key ((@($lines)|Sort-Object -CaseSensitive)-join '')
+    if($script:madeTrees.ContainsKey($treeKey)){return $script:madeTrees[$treeKey]}
     $path=Join-Path $script:runRoot ([guid]::NewGuid().ToString()+'.tree')
     [IO.File]::WriteAllText($path,($lines -join ''),$script:utf8)
-    return Git @('mktree','-z') $path
+    $tree=Git @('mktree','-z') $path;$script:madeTrees[$treeKey]=$tree;$script:existingTrees[$entryKey]=$tree;return $tree
 }
 function Read-AppTree([string]$Commit) {
     $entries=@{}
@@ -230,16 +369,36 @@ function Read-AppTree([string]$Commit) {
     $listing=Git @('ls-tree','-z',$Commit,'--','Codex')
     if(-not$listing){return $entries}
     if($listing -notmatch '^040000 tree ([a-f0-9]+)\tCodex\x00$'){Survey 'Codex is not an app tree in the supplied commit.'}
-    $tree=$Matches[1]
-    foreach($entry in (Git @('ls-tree','-r','-z',$tree)).Split([char]0)){
+    $tree=$Matches[1];$trees=@{'/'=$tree}
+    foreach($entry in (Git @('ls-tree','-r','-t','-z',$tree)).Split([char]0)){
         if(-not$entry){continue}
+        if($entry-match '^040000 tree ([a-f0-9]+)\t(.+)$'){$trees[$Matches[2]+'/']=$Matches[1];continue}
         if($entry -notmatch '^100644 blob ([a-f0-9]+)\t(.+)$'){Survey 'Unsupported app tree entry mode.'}
         $entries[$Matches[2]]=$Matches[1]
     }
+    $trees.Remove('/');$trees['']=$tree;Remember-AppTrees $entries $trees
     return $entries
 }
-function Read-BlobJson([string]$Oid) { Object-Id $Oid 'blob';return Parse-Json (Git @('cat-file','blob',$Oid)) }
+# Immutable Git JSON is read and decoded once per invocation. Consumers do not mutate it.
+$script:jsonBlobs=@{}
+$script:jsonContentIds=@{}
+function Read-BlobJson([string]$Oid) {
+    if(-not$script:jsonBlobs.ContainsKey($Oid)){Object-Id $Oid 'blob';$text=Git @('cat-file','blob',$Oid);$script:jsonBlobs[$Oid]=Parse-Json $text}
+    return $script:jsonBlobs[$Oid]
+}
+
+function Prime-JsonBlobs([string[]]$Oids) {
+    $pending=@($Oids|Where-Object{-not$script:jsonBlobs.ContainsKey($_)}|Sort-Object -Unique)
+    if(-not$pending.Count){return}
+    foreach($oid in $pending){if($oid-cnotmatch '^[0-9a-f]{40}([0-9a-f]{24})?$'){throw 'Invalid JSON blob identity.'}}
+    $batch=[CodexStartNative]::JsonBlobs($script:repo,[string[]]$pending)
+    foreach($pair in $batch.GetEnumerator()){$script:verifiedObjects[$pair.Key+'/blob']=$true;$script:jsonBlobs[$pair.Key]=Parse-Json $pair.Value;$script:jsonContentIds[(Analysis-Key $pair.Value)]=$pair.Key}
+}
+
 function Read-Sessions($Entries) {
+    $jsonIds=@($Entries.Keys|Where-Object{$_-match '(^Deleted/[^/]+\.json$|/(manifest|projection)\.json$|\.integrity\.json$|\.gz\.parts\.json$)'}|ForEach-Object{$Entries[$_]})
+    Prime-JsonBlobs $jsonIds
+
     $sessions=@{}
     foreach($path in $Entries.Keys){
         if($path -match '^(Active|Archived)/([^/]+)/manifest.json$') {
@@ -285,7 +444,75 @@ function Same-LocalSnapshot($A,$B) {
     return Rows-Equal $A.Manifest.comparison $B.Manifest.comparison
 }
 
+
+# Derived analysis only: local Git refs, never publication/baseline authority.
+# Full source hashes also catch predecessor edits with an unchanged latest page.
+# Both entry-file hashes invalidate these records when validation code changes.
+$script:rolloutAnalysis=@{}
+$script:analysedSources=@{}
+$script:verifiedStoredPayloads=@{}
+$script:analysisRules=''
+$script:analysisRefs=$null
+function Analysis-Key([string]$Text) {
+    $sha=[Security.Cryptography.SHA256]::Create()
+    try{return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+}
 function Inspect-Rollout([string]$Path) {
+    $before=Get-Item -LiteralPath $Path
+    $length=$before.Length;$stamp=$before.LastWriteTimeUtc.Ticks
+    $raw=Hash $Path
+    $afterHash=Get-Item -LiteralPath $Path
+    if($afterHash.Length-ne$length-or$afterHash.LastWriteTimeUtc.Ticks-ne$stamp){throw "Rollout changed during change detection: $Path"}
+    if(-not$script:analysisRules){
+        $script:analysisRules=Analysis-Key ((Hash (Join-Path $PSScriptRoot 'Start.ps1'))+':'+(Hash (Join-Path $PSScriptRoot 'Finish.ps1')))
+    }
+    if($null-eq$script:analysisRefs){
+        $script:analysisRefs=@{}
+        try{
+            foreach($line in (Git @('for-each-ref','--format=%(refname) %(objectname)','refs/agent-session-sync/codex-analysis-v1/')).Split("`n")){
+                if(-not$line){continue};$parts=$line.Trim().Split(' ')
+                if($parts.Count-ne2){throw 'Invalid analysis ref listing.'};$script:analysisRefs[$parts[0]]=$parts[1]
+            }
+            Prime-JsonBlobs ([string[]]@($script:analysisRefs.Values))
+        }catch{$script:analysisRefs=@{};Write-CodexStartProgress 'Analysis cache could not be read; full validation remains available'}
+    }
+    $name=[IO.Path]::GetFileName($Path)
+    $key=$raw+'/'+(Analysis-Key $name)
+    # One ref per physical filename replaces superseded analysis; no ref per append.
+    $ref='refs/agent-session-sync/codex-analysis-v1/'+(Analysis-Key $name)
+    $page=$null
+    if($script:rolloutAnalysis.ContainsKey($key)){$page=$script:rolloutAnalysis[$key]}
+    else {
+        $oid='';if($script:analysisRefs.ContainsKey($ref)){$oid=$script:analysisRefs[$ref]}
+        if($oid){
+            try{
+                $saved=Read-BlobJson $oid
+                if($saved.schemaVersion-ne1-or$saved.rules-cne$script:analysisRules-or$saved.sha256-cne$raw-or[long]$saved.length-ne$length-or$saved.name-cne$name){throw 'Analysis identity differs.'}
+                $b=@{};foreach($p in $saved.boundaries.PSObject.Properties){$b[$p.Name]=[long]$p.Value}
+                $last=$null;if($saved.last){$last=[DateTimeOffset]::Parse([string]$saved.last,[Globalization.CultureInfo]::InvariantCulture)}
+                $page=[pscustomobject]@{Path=$Path;Name=$name;Id=[string]$saved.id;Alias=[string]$saved.alias;Meta=$saved.meta;Last=$last;Boundaries=$b;Texts=@($saved.texts);Length=$length;Sha256=$raw}
+            }catch{Write-CodexStartProgress ("Analysis cache unavailable; validating original: {0}" -f $name)}
+        }
+    }
+    if($null-ne$page){
+        $page.Path=$Path
+        $script:analysedSources[$Path]=$raw
+        $script:rolloutAnalysis[$key]=$page
+        Write-CodexStartProgress ("Reusing verified rollout analysis: {0}" -f $name)
+        return $page
+    }
+    $page=Inspect-RolloutFull $Path
+    $after=Get-Item -LiteralPath $Path
+    if($page.Sha256-cne$raw-or$after.Length-ne$length-or$after.LastWriteTimeUtc.Ticks-ne$stamp){throw "Rollout changed during analysis: $Path"}
+    $saved=[ordered]@{schemaVersion=1;rules=$script:analysisRules;sha256=$raw;length=$length;name=$name;id=$page.Id;alias=$page.Alias;meta=$page.Meta;last=$(if($null-ne$page.Last){$page.Last.ToUniversalTime().ToString('o')}else{$null});boundaries=$page.Boundaries;texts=@($page.Texts)}
+    try{$oid=Blob-Json $saved;Git @('update-ref',$ref,$oid)|Out-Null}
+    catch{Write-CodexStartProgress ('Analysis cache could not be saved; original validation still completed: '+$name)}
+    $script:rolloutAnalysis[$key]=$page
+    $script:analysedSources[$Path]=$raw
+    return $page
+}
+
+function Inspect-RolloutFull([string]$Path) {
     $types=@('session_meta','event_msg','response_item','world_state','turn_context','compacted','inter_agent_communication_metadata','token_usage_record')
     $versions=@('0.146.0-alpha.9.2','0.147.0-alpha.6.6','0.149.0-alpha.4.3','0.150.0-alpha.8','0.151.0-alpha.7.1','0.151.0-alpha.7.2','0.152.0','0.153.0-alpha.5','0.153.1','0.153.3')
     Write-CodexStartProgress ("Inspecting rollout: {0}" -f [IO.Path]::GetFileName($Path))
@@ -596,9 +823,17 @@ function Package-Payload([string]$Source,[string]$Relative,$Entries) {
     $safe=Resolve-Within $script:appHome $Source.Substring($script:appHome.Length).TrimStart('\','/')
     if($safe-ne$Source){throw 'Payload path normalization mismatch.'}
     $length=(Get-Item -LiteralPath $Source).Length;$raw=Hash $Source;$transport=$Source
+    if($script:analysedSources.ContainsKey($Source)-and$script:analysedSources[$Source]-cne$raw){throw "Rollout changed after analysis: $Source"}
     $ceiling=[Math]::Min([long]$script:limit,99614720);if($ceiling-le0){throw 'Invalid transport limit.'}
     $identity=[ordered]@{path=$Relative;length=$length;sha256=$raw}
     $script:transportSources[$raw+'-'+$length]=$Source
+    $reuseKey=$Relative+"`0"+[string]$length+"`0"+$raw
+    if($script:reusablePayloads.ContainsKey($reuseKey)-and$script:reusablePayloads[$reuseKey].Largest-le$ceiling){
+        $saved=$script:reusablePayloads[$reuseKey]
+        foreach($entry in $saved.Files.Keys){$Entries[$entry]=$saved.Files[$entry]}
+        if((Get-Item -LiteralPath $Source).Length-ne$length-or(Hash $Source)-ne$raw){throw "Source changed while preparing: $Source"}
+        return [ordered]@{path=[string]$saved.Payload.path;transportPath=[string]$saved.Payload.transportPath;length=[long]$saved.Payload.length;sha256=[string]$saved.Payload.sha256}
+    }
     $name=$Relative
     if($length-gt$ceiling){
         $cached=Get-CachedTransport $identity $ceiling $Entries
@@ -629,6 +864,7 @@ function Package-Payload([string]$Source,[string]$Relative,$Entries) {
     return $payload
 }
 function Prepare-Local($Base,$Remote) {
+    Index-ReusablePayloads $Base $Remote
     $pages=New-Object 'Collections.Generic.List[object]'
     foreach($relative in @('sessions','archived_sessions')){
         $root=Resolve-Within $script:appHome $relative
@@ -744,12 +980,20 @@ function Prepare-Local($Base,$Remote) {
             foreach($f in Get-ChildItem -LiteralPath $dir.FullName -File -Recurse){$rel=$f.FullName.Substring($visualRoot.Length).TrimStart('\','/').Replace('\','/');$inventory.Add((Package-Payload $f.FullName ('visualizations/'+$rel) $files))}
         }}
         $projection=[ordered]@{state=$portableState;history=$history;catalog=$catalog;sessionIndex=$display;relations=$extras;globalReferences=(Selected-Global $globalIndex $ids);attachmentReferences=$owned.ToArray()}
-        $files['projection.json']=Blob-Json $projection
+        $priorProjections=@();$priorManifests=@()
+        foreach($set in @($Base,$Remote)){
+            if($set.ContainsKey($vaultId)-and$set[$vaultId].State-ne'Deleted'){
+                $prior=$set[$vaultId]
+                $priorProjections+=@($prior.Entries[$prior.Prefix+'projection.json'])
+                $priorManifests+=@($prior.Entries[$prior.Prefix+'manifest.json'])
+            }
+        }
+        $files['projection.json']=Reuse-Json $projection $priorProjections
         $selectedRefs=Selected-Global $globalIndex @($id)
         $placement=@($selectedRefs | Where-Object { $_.pointer -match '^/(thread-project-assignments|sidebar-project-thread-orders|thread-writable-roots)/' })
         $comparison=[ordered]@{canonicalId=$id;title=$title;metadata=[ordered]@{name=(Field $row 'name');pinned=(Field $row 'is_pinned');projectId=(Field $row 'project_id');sectionId=(Field $row 'thread_section_id');sectionPosition=(Field $row 'section_position');placement=$placement};payloads=@($inventory.ToArray()|Sort-Object path|ForEach-Object{[ordered]@{path=$_.path;length=$_.length;sha256=$_.sha256}})}
         $manifest=[ordered]@{schemaVersion=1;vaultSessionId=$vaultId;canonicalId=$id;lineageIds=$ids;lastActivityAt=$last.ToUniversalTime().ToString('o');comparison=$comparison;payloads=$inventory.ToArray()}
-        $files['manifest.json']=Blob-Json $manifest
+        $files['manifest.json']=Reuse-Json $manifest $priorManifests
         $entries=@{};foreach($path in $files.Keys){$entries["$state/$vaultId/$path"]=$files[$path]}
         $result[$vaultId]=[pscustomobject]@{State=$state;Manifest=$manifest;Prefix="$state/$vaultId/";Entries=$entries;LocalPages=$sessionPages;NeedsArchive=($state-eq'Archived'-and[long]$row['archived']-eq0)}
     }
@@ -772,6 +1016,8 @@ function Verify-StoredSessions($Sessions) {
             $path=$s.Prefix+$relative
             if(-not$s.Entries.ContainsKey($path)){throw "Stored session payload missing: $path"}
             $compressed=$relative.EndsWith('.gz',[StringComparison]::OrdinalIgnoreCase)-or$relative.EndsWith('.gz.parts.json',[StringComparison]::Ordinal)
+            $verifiedKey=[string]$s.Entries[$path]+'/'+[string]$payload.length+'/'+[string]$payload.sha256
+            if(-not$compressed-and$script:verifiedStoredPayloads.ContainsKey($verifiedKey)){continue}
             if($compressed-and(Test-TransportMarker $s.Entries $s.Prefix $payload)){continue}
             if($relative.EndsWith('.gz.parts.json',[StringComparison]::Ordinal)){
                 $restored=Expand-SplitGzip $s.Entries $s.Prefix $relative
@@ -793,6 +1039,7 @@ function Verify-StoredSessions($Sessions) {
             }
             if((Get-Item -LiteralPath $raw).Length-ne$payload.length-or(Hash $raw)-ne$payload.sha256){throw "Stored raw integrity failure: $path"}
             if($compressed){Save-TransportMarker $s.Entries $s.Prefix $payload $raw}
+            else{$script:verifiedStoredPayloads[$verifiedKey]=$true}
         }
     }
 }
@@ -1271,6 +1518,60 @@ function Restore-Catalog($Remote) {
         $catalog.Query('COMMIT',@())|Out-Null
     }catch{try{$catalog.Query('ROLLBACK',@())|Out-Null}catch{};throw}finally{$catalog.Dispose()}
 }
+
+function Same-AppliedEntries($Local,$Remote) {
+    if($null-eq$Local-or$null-eq$Remote-or$Remote.State-ne'Active'-or$Local.State-ne$Remote.State){return $false}
+    $left=@{};$right=@{};Copy-Session $Local $left;Copy-Session $Remote $right
+    if($left.Count-ne$right.Count){return $false}
+    foreach($path in $left.Keys){
+        $other=$Remote.Prefix+$path.Substring($Local.Prefix.Length)
+        if(-not$right.ContainsKey($other)-or$right[$other]-cne$left[$path]){return $false}
+    }
+    return $true
+}
+function Same-ApplicationTarget($Local,$Remote,$Basis) {
+    if(Same-AppliedEntries $Local $Remote){return $true}
+    # A received projection contains source-machine metadata that thread/read
+    # derives again. Require the ENTIRE actual local snapshot to still match its
+    # accepted basis before comparing the fields Start applies from the remote.
+    if(-not(Same-AppliedEntries $Local $Basis)-or$Remote.State-ne'Active'-or-not(Same-LocalSnapshot $Local $Remote)){return $false}
+    $lp=Get-Projection $Local;$rp=Get-Projection $Remote
+    foreach($key in @('history','sessionIndex','relations','attachmentReferences')){
+        if((Json (Field $lp $key))-cne(Json (Field $rp $key))){return $false}
+    }
+    foreach($key in @('id','latestRollout','archived','archived_at','section_entered_at_ms')){
+        if(-not(Rows-Equal (Field $lp.state $key) (Field $rp.state $key))){return $false}
+    }
+    # These exact catalog fields are derived from target state in Restore-Catalog.
+    $derived=@('host_id','cwd','source_created_at','source_updated_at','model_provider','git_branch','thread_source','source_recency_at','project_id')
+    $catalogs=New-Object 'Collections.Generic.List[string]'
+    foreach($projection in @($lp,$rp)){
+        $rows=New-Object 'Collections.Generic.List[object]'
+        foreach($row in @(Field $projection 'catalog' @())){
+            $values=[ordered]@{};foreach($prop in @($row.PSObject.Properties|Sort-Object Name)){if($prop.Name-notin$derived){$values[$prop.Name]=$prop.Value}}
+            $rows.Add($values)
+        }
+        $catalogs.Add((Json $rows.ToArray()))
+    }
+    if($catalogs[0]-cne$catalogs[1]){return $false}
+    $permission='/electron-persisted-atom-state/heartbeat-thread-permissions-by-id/'+[string]$Remote.Manifest.canonicalId
+    $lg=@($lp.globalReferences|Where-Object{[string]$_.pointer-cne$permission})
+    $rg=@($rp.globalReferences|Where-Object{[string]$_.pointer-cne$permission})
+    return (Json $lg)-ceq(Json $rg)
+}
+function Select-ApplicationChanges($Current,$Remote,$Base) {
+    $local=@{};$desired=@{};$all=@{};$unchanged=0
+    foreach($set in @($Current,$Remote)){foreach($id in $set.Keys){$all[$id]=$true}}
+    foreach($id in $all.Keys){
+        if($Current.ContainsKey($id)-and$Remote.ContainsKey($id)-and(Same-ApplicationTarget $Current[$id] $Remote[$id] $Base[$id])){$unchanged++;continue}
+        if(-not$Current.ContainsKey($id)-and$Remote.ContainsKey($id)-and$Remote[$id].State-ne'Active'){$unchanged++;continue}
+        if($Current.ContainsKey($id)){$local[$id]=$Current[$id]}
+        if($Remote.ContainsKey($id)){$desired[$id]=$Remote[$id]}
+    }
+    Write-CodexStartProgress ("Application selection: {0} unchanged; {1} local and {2} remote targets require application" -f $unchanged,$local.Count,$desired.Count)
+    return [pscustomobject]@{Current=$local;Remote=$desired}
+}
+
 function Apply-Remote($Current,$Remote) {
     $desired=@{};$activeIds=New-Object 'Collections.Generic.List[string]'
     foreach($session in @($Remote.Values|Where-Object{$_.State-eq'Active'})){
@@ -1358,18 +1659,20 @@ try {
     Assert-TargetMappings $remote $current
     Write-CodexStartProgress 'Validation passed; applying remote state with app-owned backups'
     $script:receipt.status='applying';Save-Receipt
-    Apply-Remote $current $remote
+    $changes=Select-ApplicationChanges $current $remote $base
+    if($changes.Current.Count-or$changes.Remote.Count){Apply-Remote $changes.Current $changes.Remote}
     Write-CodexStartProgress 'Checking applied app state'
-    Validate-Applied $remote $current
+    Validate-Applied $changes.Remote $changes.Current
     # The local basis records what this target machine actually received.  It
     # deliberately keeps target-derived app metadata rather than pretending
     # that a source machine's portable projection was installed byte-for-byte.
     Write-CodexStartProgress 'Recording the actual applied local comparison basis'
-    $applied=Prepare-Local $remote $remote
+    $applied=if($changes.Current.Count-or$changes.Remote.Count){Prepare-Local $remote $remote}else{$current}
     $basis=@{}
     foreach($session in $remote.Values){if($session.State-eq'Deleted'){Copy-Session $session $basis}}
     foreach($session in $applied.Values){Copy-Session $session $basis}
     $tree=Make-Tree $basis;Object-Id $tree 'tree'
+    Write-CodexStartProgress ("Reused result objects: {0}; existing trees: {1}" -f $script:reusedJson,$script:reusedTrees)
     Write-CodexStartProgress 'Application verified; releasing this Start backup and scratch'
     $script:receipt.status='applied';Save-Receipt;Clear-StartReceipt
     Report 'Success' 'Pinned Codex state applied' "Known structure and payload integrity passed. UI and future app interpretation are not claimed."

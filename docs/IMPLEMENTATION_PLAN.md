@@ -1275,7 +1275,7 @@ to reduce runtime. Do not introduce automatic surveys or version-number gates.
 
 ### Approved incremental processing direction - 2026-09-06 follow-up
 
-This revises the optimization design, not the runtime implementation. Both
+The approved design below is implemented for Codex Start/Finish. Both
 Start and Finish should complete as quickly as possible. One minute is a target,
 not a timeout or failure gate. Initial full transfer and bulk changes must be
 measured separately from unchanged runs and small conversational updates.
@@ -1320,5 +1320,78 @@ state requirement and its necessity before expanding that design.
 Cross-review unchanged and small-update Start/Finish, edits/rewinds/page changes,
 new sessions, remote changes, deletion/Archive, failures and rollback. Compare
 semantic/byte results and total duration, not just cache hit counts. See closeout
-section 6 and the private evidence for the measured data. Optimization remains
-unimplemented; no end-to-end runtime improvement has yet been demonstrated.
+section 6 and the private evidence for the measured data. This change does not
+implement Claude optimization or establish live All-Start/All-Finish timing.
+
+### Codex incremental implementation - 2026-09-06
+
+Codex resolves the current latest path from current app state on every run.
+Each collected physical rollout is still hashed in full; unchanged file bytes
+reuse their verified JSON record analysis instead of parsing every line again.
+This first implementation also hashes predecessors, so an independent predecessor
+edit cannot hide behind an unchanged latest page. History links, byte/ordinal
+boundaries and missing predecessors are checked against the current page set.
+
+Existing manifests do not retain each physical page's record boundaries and
+user-text attachment references. Repeated analysis needs those derived results.
+Codex therefore stores replaceable analysis blobs under local-only Git refs
+refs/agent-session-sync/codex-analysis-v1/<filename-hash>, one ref per physical
+filename. They bind the filename, full raw hash/length and both Codex script
+hashes. They do not enter the published tree, change the accepted comparison
+basis, or grant publication rights. No new configuration or standalone cache
+file is introduced. Missing, invalid or obsolete analysis falls back to original
+validation. A script change invalidates it; app version alone does not.
+
+Within one invocation, immutable Git JSON blobs are batch-read and decoded once;
+exact serialized JSON bytes, verified object types, raw transport checks and
+identical tree construction are reused. Code that adjusts a projection after
+local normalization clones the decoded object first. Existing gzip/split markers
+remain the authority for transport reuse; this does not recompress unchanged
+large payloads merely to compare them.
+
+Start selects affected app targets using session entries and the independently
+read app projection. Target-derived projection fields may differ from the source
+only when current local entries exactly match the accepted local basis and the
+fields actually applied by Start match. Missing basis, DB-only changes, latest
+path changes and remote history changes do not take that shortcut. A still-present
+Archived/Deleted target must be processed. With zero affected targets, Start skips
+app reconstruction and the second Prepare-Local pass; with changes, that pass
+remains and reuses unchanged analysis. Finish retains its three-way decisions,
+actual normalization before Ready, Cancel and publication-cleanup contract.
+
+Limitations: file hashing, directory enumeration and current app data reads
+still cover the collected local set. The follow-up below reuses identical result
+objects; it does not cache away current DB/placement checks. Changed-target Start
+still revisits the local set after application. See the closeout for isolated
+timing and validation scope.
+
+
+### Codex unchanged-result reuse - 2026-09-06 follow-up
+
+Start and Finish read the current app projection and compare its actual values
+against already verified baseline/remote JSON. Equal projection and manifest
+values reuse the original blob ID instead of serializing and writing the same
+large JSON again. The comparison is recursive: property membership and case,
+array order, null/empty distinction, strings, booleans and numeric values remain
+significant. Unknown value types do not establish reuse. Integer widths may
+agree when the exact value agrees; floating types are not rounded for comparison.
+This is result reuse, not a new persistent DB cache or a replacement for the
+app-owned three-way decision.
+
+Unchanged raw payloads reuse blob IDs from the verified input sessions after
+current length/hash checks. Compressed transport reuses its existing descriptor,
+integrity record and part/blob IDs, within the applicable file ceiling. The
+returned inventory retains the existing data shape and ordering. No transcript
+is rewritten. Changed transport follows the existing compression/marker path.
+
+Read-AppTree records existing subtree IDs. Make-Tree reuses a tree only when its
+complete relative-path/blob-ID map matches. Changed leaves rebuild the affected
+tree. A flattened map cannot stand in for a tree containing empty descendants;
+such trees are excluded from this shortcut. These indexes last one invocation.
+
+Schema checks, latest path, page connections, real DB/placement reads, native
+delete transit and remote Deleted/conflict handling remain in place. An unchanged
+rollout alone never proves these independent states unchanged. Cancel/Complete,
+baton rules and common publication ordering are not changed. Progress reports
+reused JSON objects and existing trees. Code replacement still invalidates the
+previous derived rollout-analysis cache once.
