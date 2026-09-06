@@ -1272,3 +1272,53 @@ single-machine app observations and an actual second-machine UI round trip.
 The last item is not established by an isolated fixture or the latest log.
 Do not weaken payload integrity, deletion evidence, conflict reporting or Cancel
 to reduce runtime. Do not introduce automatic surveys or version-number gates.
+
+### Approved incremental processing direction - 2026-09-06 follow-up
+
+This revises the optimization design, not the runtime implementation. Both
+Start and Finish should complete as quickly as possible. One minute is a target,
+not a timeout or failure gate. Initial full transfer and bulk changes must be
+measured separately from unchanged runs and small conversational updates.
+
+For Codex, resolve each canonical session's current latest rollout path, then
+compare that local path and its full SHA-256 with the previous verified state.
+Do not keep reading a fixed former path after a new physical page is selected.
+The path comparison is within this machine, not a cross-machine path identity.
+A path/hash change selects the conversation for required analysis; it does not
+mean all predecessor bytes or all other sessions changed. A new page requires
+checking its history_base linkage and the necessary referenced boundaries.
+
+An unchanged latest path/hash with unchanged related state may reuse existing
+verified conversation analysis and transport. It is not a signature proving
+every predecessor, attachment or database unchanged. Remote Git object changes,
+deletion, movement, indexes and placement remain separate inputs. This does not
+replace three-way session conflict decisions with a hash-only publication gate.
+No prior verification, changed actual validation rules or unprovable relationships
+require validation, not silently manufactured cache success. App version alone
+is not an invalidation or permission rule.
+
+Start should reuse identical verified Git objects and unaffected local comparison
+material; after applying, validate changed targets and affected relationships
+instead of unconditionally rebuilding everything. Finish should analyse changed
+conversations, handle independent state transitions, reuse unchanged output and
+retain the joint publication/Cancel/Complete contract.
+
+Measured locally: ten app-listed latest rollouts totalled 463.44 MiB. Shared-read
+SHA-256 passes took 1.147/0.770/0.706 seconds in PowerShell 5.1 and
+0.691/0.638/0.636 seconds in PowerShell 7.6.5, with OS cache not flushed.
+This excludes process startup, path lookup and JSON analysis. An edited/resubmitted
+question was followed by a new latest page linked to a prefix of its predecessor;
+path/hash comparison detected the change even though the question text repeated.
+This is a scoped observation, not proof that editing always rolls over a page.
+
+Claude requires its own measured record/lineage change selector; the Codex result
+does not establish a Claude single-latest-page model. No new cache/config file,
+background watcher, app-success flag or root-owned app policy is specified here.
+Use existing verified basis/transport mechanisms first. Record any additional
+state requirement and its necessity before expanding that design.
+
+Cross-review unchanged and small-update Start/Finish, edits/rewinds/page changes,
+new sessions, remote changes, deletion/Archive, failures and rollback. Compare
+semantic/byte results and total duration, not just cache hit counts. See closeout
+section 6 and the private evidence for the measured data. Optimization remains
+unimplemented; no end-to-end runtime improvement has yet been demonstrated.
