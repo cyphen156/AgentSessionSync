@@ -559,3 +559,16 @@ in the matching private survey report.
 References used in the original survey:
 - [Codex App Server](https://learn.chatgpt.com/docs/app-server): thread behaviour, not a local DB restore guarantee.
 - [GitHub file limits](https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github).
+
+
+### Unread reference receive clarification (2026-09-07)
+
+The 2026-09-03 controlled archive observation already recorded a local unread
+membership removal. The private 2026-09-07 published corpus contains one
+/electron-persisted-atom-state/unread-thread-ids-by-host-v1/local/<index>
+reference whose string value matches the session canonical ID. A missing receive
+branch, not an unrecognized app version, caused Start to reject it.
+The implementation treats this as local unread membership, never as transcript
+lineage, a portable array slot, or deletion evidence. Target other-host entries
+are retained. This clarification does not establish which UI event creates the
+membership or claim that every app-version field has been surveyed.

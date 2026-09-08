@@ -38,6 +38,7 @@ $gzipTool = $null
 $runRoot = ''
 $receipt = $null
 $surveyRequired = $false
+$discardRequired = $false
 $notes = New-Object 'Collections.Generic.List[string]'
 $transportLimit = 0
 $transportCache = @{}
@@ -129,7 +130,7 @@ function Test-JsonMember {
     # nothing on return, so a present-but-empty field would read as absent.
     param($Object, [string] $Name)
     if ($null -eq $Object) { return $false }
-    return ($Object.PSObject.Properties.Name -contains $Name)
+    return ($null -ne $Object.PSObject.Properties[$Name])
 }
 
 function Get-JsonMember {
@@ -1266,7 +1267,7 @@ function Get-LocalMap {
 }
 
 function Assert-StartDiscardPermission {
-    param($LocalMap, $Basis, $Remote)
+    param($LocalMap, $Basis, $Remote, $Store, $Tombstones)
     $changed = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($pair in $LocalMap.GetEnumerator()) {
         $id = [string]$pair.Key
@@ -1277,17 +1278,32 @@ function Assert-StartDiscardPermission {
         if ($basisEntry -and $basisEntry.Tier -ne 'Deleted' -and $basisEntry.TreeId -eq $localTree) { continue }
         [void]$changed.Add($id)
     }
-    foreach ($pair in $Basis.Sessions.GetEnumerator()) {
-        if ($pair.Value.Tier -ne 'Active' -or $LocalMap.ContainsKey($pair.Key)) { continue }
-        $remoteEntry = if ($Remote.Sessions.ContainsKey($pair.Key)) { $Remote.Sessions[$pair.Key] } else { $null }
-        if ($remoteEntry -and $remoteEntry.Tier -eq 'Active') { [void]$changed.Add([string]$pair.Key) }
+    # A missing local record is a receive target, not proof of a local edit.
+    # A previously known remote session disappearing without a marker is different.
+    foreach($id in $Basis.Sessions.Keys){
+        if(-not$Remote.Sessions.ContainsKey($id)-and-not$Remote.Deleted.ContainsKey($id)){
+            throw "Published basis session disappeared without an Active, Archived or Deleted record: $id. Nothing was removed."
+        }
+    }
+    # Unlike absence alone, measured tombstones prove an unpublished local
+    # deletion that receiving an Active session would undo.
+    foreach($entry in $Remote.Sessions.GetEnumerator()){
+        if($entry.Value.Tier-ne'Active'){continue}
+        $material=Get-VaultMaterial $entry.Value
+        $required=@(@($material.Lineage)+@($material.AppSessionId)|Sort-Object -Unique)
+        $coverage=Test-TombstoneCoverage $required $Tombstones
+        if($coverage-eq'None'){continue}
+        if($coverage-eq'Partial'-or$LocalMap.ContainsKey($entry.Key)){
+            $script:surveyRequired=$true
+            throw "Unresolved Claude deletion signals for $($entry.Key): $coverage coverage or a live record coexists. Nothing was applied."
+        }
+        Assert-ConsistentTombstoneTimes $Store $required
+        [void]$changed.Add([string]$entry.Key)
     }
     if ($changed.Count -ne 0 -and -not $DiscardLocalChanges) {
         $changedText = @($changed | Sort-Object) -join ', '
-        $answer = Read-Host ("Claude Start will replace unpublished local sessions: $changedText. Continue? [y/N]")
-        if ($answer -notmatch '^(?i:y|yes)$') {
-            throw "Claude Start was cancelled before changing app data. Unpublished local sessions: $changedText"
-        }
+        $script:discardRequired=$true
+        throw "Local-only, changed or incomplete Claude sessions would be replaced: $changedText. Approve discard to apply the verified remote; decline to retain local state for separately instructed reconciliation."
     }
 }
 
@@ -1651,6 +1667,24 @@ function Remove-ClaudeAssignments {
     Assert-ClaudeAssignmentsRemoved $Store $AppSessionIds
 }
 
+function Assert-ClaudeReceivePath([string]$Path,$Store) {
+    $full=[IO.Path]::GetFullPath($Path)
+    $roots=@([IO.Path]::GetFullPath($Store.RecordRoot).TrimEnd('\','/'),[IO.Path]::GetFullPath($Store.ProjectsRoot).TrimEnd('\','/'),[IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Store.ConfigPath)))
+    if(@($roots|Where-Object{$full.StartsWith($_+'\',[StringComparison]::OrdinalIgnoreCase)}).Count-eq0){throw "Claude receive path escapes configured storage: $full"}
+    $cursor=$full
+    while($cursor){if(Test-Path -LiteralPath $cursor){if((Get-Item -LiteralPath $cursor -Force).Attributes-band[IO.FileAttributes]::ReparsePoint){throw "Claude receive path is a reparse point: $cursor"}};$cursor=[IO.Path]::GetDirectoryName($cursor)}
+    return $full
+}
+function Assert-ClaudeReceiveMaterial($Store,$Remote) {
+    $targets=@{}
+    foreach($session in $Remote.Sessions.Values){if($session.Tier-ne'Active'){continue}
+        $material=Get-VaultMaterial $session
+        $paths=@((Join-Path $Store.RecordRoot ('local_'+$material.AppSessionId+'.json')))
+        foreach($id in $material.Lineage){if($id-notin$material.Unavailable){$paths+=@(Resolve-Within $Store.ProjectsRoot ($material.Slug+'/'+$id+'.jsonl'))}}
+        foreach($path in $paths){$path=Assert-ClaudeReceivePath $path $Store;if($targets.ContainsKey($path)){throw "Claude destination belongs to multiple sessions: $path"};$targets[$path]=$true}
+    }
+    Assert-ClaudeReceivePath $Store.ConfigPath $Store|Out-Null
+}
 function Apply-RemoteClaude {
     param($Store, $LocalMap, $Remote, $Tombstones, [string[]]$RemovedAppSessionIds, $PlacementStoragePlan)
     $active = @{}
@@ -1752,9 +1786,10 @@ try {
     $local = @(Get-LocalSessions $store (Get-TranscriptIndex $store))
     $localMap = Get-LocalMap $local $basis $remote
     $tombstones = Get-Tombstones $store
-    Assert-StartDiscardPermission $localMap $basis $remote
+    Assert-ClaudeReceiveMaterial $store $remote
     $removedAppSessionIds = @(Get-RemovedAppSessionIds $localMap $remote $basis)
     $placementStoragePlan = Prepare-ClaudePlacementStorage $store $removedAppSessionIds
+    Assert-StartDiscardPermission $localMap $basis $remote $store $tombstones
     $receipt.status = 'applying'
     Save-StartReceipt
     Apply-RemoteClaude $store $localMap $remote $tombstones $removedAppSessionIds $placementStoragePlan
@@ -1781,5 +1816,6 @@ catch {
         catch { $message += ' Scratch cleanup failed: ' + $_.Exception.Message }
     }
     Write-ContractResult 'Failure' 'Claude Start could not complete' $message
+    if($script:discardRequired-and-not$retain){Write-Output 'DISCARD_REQUIRED: True'}
     exit 1
 }

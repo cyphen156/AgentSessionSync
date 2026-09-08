@@ -5,6 +5,8 @@ param(
     [string] $CodexAppId = 'OpenAI.Codex_2p2nqsd0c76g0!App',
     [string[]] $CodexProcessNames = @('ChatGPT', 'Codex'),
     [switch] $DisableCodex,
+    [hashtable] $CodexPathMappings = @{},
+    [hashtable] $CodexProjectIdMappings = @{},
     [string] $ClaudeHome = '',
     [string] $ClaudeAppData = '',
     [string] $ClaudeAppId = 'Claude_pzs8sxrjxfjjc!Claude',
@@ -25,6 +27,12 @@ function Format-StringArray {
     param([string[]] $Values)
     $quoted = @($Values | ForEach-Object { Quote-DataValue ([string]$_) })
     return '@(' + ($quoted -join ', ') + ')'
+}
+
+function Format-StringMap {
+    param([hashtable]$Values)
+    $pairs=@($Values.Keys|Sort-Object|ForEach-Object{(Quote-DataValue ([string]$_))+' = '+(Quote-DataValue ([string]$Values[$_]))})
+    return '@{ '+($pairs -join '; ')+' }'
 }
 
 function Resolve-RequiredDirectory {
@@ -185,6 +193,21 @@ try {
         throw ('Git attributes do not preserve managed files as bytes: ' + ($attributeOutput -join '; '))
     }
 
+    # An existing machine configuration is authoritative on repeated setup.
+    # Do not validate guessed defaults instead of the paths Start actually uses.
+    $savedConfig=$null
+    if(Test-Path -LiteralPath $configPath -PathType Leaf){
+        $savedConfig=Import-PowerShellDataFile -LiteralPath $configPath
+        if($savedConfig.ContainsKey('Codex')){
+            $CodexHome=[string]$savedConfig.Codex.Home;$CodexAppId=[string]$savedConfig.Codex.AppId;$CodexProcessNames=@($savedConfig.Codex.ProcessNames)
+            $CodexPathMappings=@{};$CodexProjectIdMappings=@{}
+            if($savedConfig.Codex.ContainsKey('PathMappings')){$CodexPathMappings=$savedConfig.Codex.PathMappings}
+            if($savedConfig.Codex.ContainsKey('ProjectIdMappings')){$CodexProjectIdMappings=$savedConfig.Codex.ProjectIdMappings}
+        }
+        if($savedConfig.ContainsKey('Claude')){
+            $ClaudeHome=[string]$savedConfig.Claude.Home;$ClaudeAppData=[string]$savedConfig.Claude.AppData;$ClaudeAppId=[string]$savedConfig.Claude.AppId;$ClaudeProcessNames=@($savedConfig.Claude.ProcessNames)
+        }
+    }
     if (-not $CodexHome) { $CodexHome = Join-Path $env:USERPROFILE '.codex' }
     if (-not $ClaudeHome) { $ClaudeHome = Join-Path $env:USERPROFILE '.claude' }
     if (-not $ClaudeAppData) {
@@ -202,6 +225,7 @@ try {
 
     $codexEnabled = -not $DisableCodex.IsPresent
     $claudeEnabled = -not $DisableClaude.IsPresent
+    if($savedConfig){$codexEnabled=$savedConfig.ContainsKey('Codex')-and[bool]$savedConfig.Codex.Enabled;$claudeEnabled=$savedConfig.ContainsKey('Claude')-and[bool]$savedConfig.Claude.Enabled}
     if ($codexEnabled) {
         $CodexHome = Resolve-RequiredDirectory $CodexHome 'Codex Home'
         if (-not $CodexAppId -or -not $CodexProcessNames) { throw 'Codex AppId and ProcessNames are required.' }
@@ -212,6 +236,17 @@ try {
         if (-not $ClaudeAppId -or -not $ClaudeProcessNames) { throw 'Claude AppId and ProcessNames are required.' }
     }
 
+    if($codexEnabled){foreach($relative in @('state_5.sqlite','thread_history_1.sqlite','sqlite/codex-dev.db')){
+        if(-not[IO.File]::Exists((Join-Path $CodexHome $relative))){throw "Codex has not prepared its store ($relative is missing). Launch the app once with this Home, close it, and rerun Initialize. Do not create empty SQLite files."}
+    }}
+    if($claudeEnabled){
+        if(-not[IO.Directory]::Exists((Join-Path $ClaudeHome 'projects'))){[IO.Directory]::CreateDirectory((Join-Path $ClaudeHome 'projects'))|Out-Null}
+        $accounts=@(Get-ChildItem -LiteralPath $ClaudeAppData -Directory)
+        if($accounts.Count-ne1-or@(Get-ChildItem -LiteralPath $accounts[0].FullName -Directory).Count-ne1){throw 'Claude account/device directories are not unambiguous. Prepare the app account before receiving sessions.'}
+    }
+    foreach($source in $CodexPathMappings.Keys){
+        if(-not[IO.Path]::IsPathRooted([string]$source)-or-not[IO.Path]::IsPathRooted([string]$CodexPathMappings[$source])-or-not[IO.Directory]::Exists([string]$CodexPathMappings[$source])){throw 'CodexPathMappings requires absolute source prefixes and existing target directories.'}
+    }
     if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
         $codexFlag = if ($codexEnabled) { '$true' } else { '$false' }
         $claudeFlag = if ($claudeEnabled) { '$true' } else { '$false' }
@@ -225,6 +260,8 @@ try {
             "        Home = $(Quote-DataValue $CodexHome)",
             "        AppId = $(Quote-DataValue $CodexAppId)",
             "        ProcessNames = $(Format-StringArray $CodexProcessNames)",
+            "        PathMappings = $(Format-StringMap $CodexPathMappings)",
+            "        ProjectIdMappings = $(Format-StringMap $CodexProjectIdMappings)",
             '    }',
             '',
             '    Claude = @{',

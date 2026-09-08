@@ -27,6 +27,24 @@ Initialize는 디렉터리, Git 바이트 보존 속성, private 추적 규칙, 
 기존 설정은 덮어쓰지 않습니다. `AgentSessionSync.config.psd1`은 Git에서 제외됩니다.
 원격의 공개/비공개 여부를 자동으로 보장하는 도구가 아니므로, **Initialize 전에 비공개 origin을 확인**하세요.
 
+## 기존 로컬 세션을 버리고 새로 받는 경우에만
+
+앱을 닫은 뒤 **폐기할 앱의 수동 도구만** 실행합니다. 기존 세션을 백업 없이 지우므로
+평소 Start/Finish 순서에는 넣지 않습니다. 이 도구는 Initialize가 저장한 현재 PC의 경로를 사용합니다.
+
+```powershell
+.\Launchers\Codex\Reset-LocalSessions.ps1 -ConfirmDiscard
+.\Launchers\Claude\Reset-LocalSessions.ps1 -ConfirmDiscard
+
+# 필요한 앱의 초기화가 모두 성공한 뒤, 별도로 원격을 받습니다.
+.\Launchers\Start.ps1
+```
+
+초기화 도구는 해당 앱의 세션 자료와 연결된 목록만 정리합니다. 로그인·설정·프로젝트 정의·DB 스키마는
+남기며, Vault·원격·바통·비교 기준은 바꾸지 않습니다. 앱이 열려 있거나 모르는 구조이면 중단합니다.
+실행 도중 실패하면 일부 정리됐을 수 있으므로 보고를 확인하고 해결해야 합니다. 복구됐다고 간주하거나
+그 상태로 Finish하지 마세요. 이후 일반 Start의 기존 폐기 확인·백업 절차는 그대로 적용됩니다.
+
 ## 처리 기준
 
 | 항목 | 동작 |
@@ -65,7 +83,7 @@ ACTIVE_HOST.txt
 
 ## 진입점과 현재 제한
 
-공통 3개와 앱별 3개씩, 실행 파일은 9개입니다. 별도 공통 Reactivate는 없습니다.
+일반 동기화 진입점은 공통 3개와 앱별 3개씩 9개이고, 별도로 앱별 수동 초기화 도구 2개가 있습니다. 별도 공통 Reactivate는 없습니다.
 `Launchers/Codex/Reactivate.ps1`와 `Launchers/Claude/Reactivate.ps1`은 구현돼 있지만,
 **현재 게시 후 앱별 Start를 내부 호출하는 불일치가 남아 있으므로 사용을 보류합니다.**
 확정 요구는 Vault의 Archived → Active 전환만 하고 앱 적용은 별도 Start에서 하는 것입니다.
@@ -80,5 +98,5 @@ ACTIVE_HOST.txt
 - [Codex 구조](docs/CODEX_SESSION_STRUCTURE.md), [Claude 구조](docs/CLAUDE_SESSION_STRUCTURE.md)
 - [측량 기준](docs/SURVEY_GUIDE.md)
 
-구 구현의 지원 스크립트·테스트·Agents 설정·예제는 삭제 승인 대기 상태로 남아 있습니다.
-현재 9개 진입점은 이 파일들을 호출하지 않습니다. 구 테스트 결과를 현재 구현 검증으로 사용하지 마세요.
+구 구현의 지원 스크립트·테스트·Agents 설정·session-store 예제는 제거했습니다.
+현재 배포본은 일반 동기화 진입점 9개, 앱별 수동 초기화 도구 2개와 현행 구조 문서만 제공합니다.

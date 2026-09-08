@@ -11,10 +11,13 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 $script:survey = $false
+$script:discardRequired = $false
 $script:receipt = $null
 $script:archiveTitles = @{}
 $script:runRoot = ''
 $script:warnings = New-Object 'Collections.Generic.List[string]'
+$script:receiveConfig=@{}
+$script:receiveMetadata=$null
 $script:utf8 = New-Object Text.UTF8Encoding($false, $true)
 
 # All native I/O lives in this entry file. There is no Python or module dependency.
@@ -423,11 +426,75 @@ function Read-Sessions($Entries) {
     }
     return $sessions
 }
+
+# Only keyed collections are unordered. Do not sort transcript records, lineage,
+# or other arrays whose order carries app meaning.
+function Comparable-SessionData($Comparison) {
+    $copy=Parse-Json (Json $Comparison)
+    $payloads=New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach($payload in @($copy.payloads)){
+        $key=[string]$payload.path
+        if(-not$key){throw 'Invalid comparison payload path.'}
+        if($payloads.ContainsKey($key)){
+            # Older Start bases counted slash aliases twice. Only identical
+            # attachment descriptors are redundant; conflicting bytes still fail.
+            if($key.StartsWith('attachments/',[StringComparison]::Ordinal)-and(Rows-Equal $payloads[$key] $payload)){continue}
+            throw 'Conflicting or duplicate comparison payload path.'
+        }
+        $payloads.Add($key,$payload)
+    }
+    $copy.payloads=$payloads
+    $placement=New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach($entry in @($copy.metadata.placement)){
+        $key=[string]$entry.pointer
+        if(-not$key-or$placement.ContainsKey($key)){throw 'Invalid or duplicate comparison placement pointer.'}
+        $placement.Add($key,$entry.value)
+    }
+    $copy.metadata.placement=$placement
+    return $copy
+}
+function Same-Comparison($Left,$Right) {
+    return Rows-Equal (Comparable-SessionData $Left) (Comparable-SessionData $Right)
+}
+# This witness belongs only to the existing local basis tree, never publication.
+# Local edits are compared to actual applied state; remote edits to received state.
+function Remote-Witness($Session) {
+    if($null-eq$Session){return $null}
+    if($Session.State-eq'Deleted'){throw 'Deleted uses its existing minimal record, not a comparison witness.'}
+    return [pscustomobject]@{state=$Session.State;comparison=$Session.Manifest.comparison}
+}
+function Accepted-RemoteWitness($Basis) {
+    if($null-eq$Basis-or$Basis.State-eq'Deleted'){return $null}
+    $witness=Field $Basis.Manifest 'acceptedRemoteComparison'
+    if($null-eq$witness){return $null}
+    if((@($witness.PSObject.Properties.Name|Sort-Object)-join ',')-ne'comparison,state'-or
+        $witness.state-notin@('Active','Archived')-or
+        [string]$witness.comparison.canonicalId-cne[string]$Basis.Manifest.canonicalId){
+        throw 'Invalid accepted remote comparison in local basis.'
+    }
+    return $witness
+}
+function Copy-LocalBasis($Session,$Witness,$Output) {
+    Copy-Session $Session $Output
+    if($null-eq$Session-or$Session.State-eq'Deleted'-or$null-eq$Witness){return}
+    $manifest=Parse-Json (Json $Session.Manifest)
+    $manifest|Add-Member -NotePropertyName acceptedRemoteComparison -NotePropertyValue $Witness -Force
+    $Output[$Session.Prefix+'manifest.json']=Blob-Json $manifest
+}
+
 function Copy-Session($Session,$Output) {
     if($null-eq$Session){return}
     foreach($path in $Session.Entries.Keys){if(($Session.State-eq'Deleted'-and$path-eq$Session.Prefix)-or($Session.State-ne'Deleted'-and$path.StartsWith($Session.Prefix,[StringComparison]::Ordinal))){$Output[$path]=$Session.Entries[$path]}}
+    if($Session.State-ne'Deleted'-and($null-ne(Field $Session.Manifest 'acceptedRemoteComparison')-or$null-ne(Field $Session.Manifest 'confirmedAppDeletion'))){
+        $manifest=Parse-Json (Json $Session.Manifest)
+        $manifest.PSObject.Properties.Remove('acceptedRemoteComparison')
+        $manifest.PSObject.Properties.Remove('confirmedAppDeletion')
+        $Output[$Session.Prefix+'manifest.json']=Blob-Json $manifest
+    }
+
 }
 function Same-LocalSnapshot($A,$B) {
+    if((Field $A 'Incomplete' $false)-or(Field $B 'Incomplete' $false)){return $false}
     if($null-eq$A-or$null-eq$B){return $null-eq$A-and$null-eq$B}
     if($A.State-eq'Deleted'-or$B.State-eq'Deleted'){
         if($A.State-ne$B.State){return $false}
@@ -441,7 +508,7 @@ function Same-LocalSnapshot($A,$B) {
         if(($flag-isnot[int]-and$flag-isnot[long])-or$flag-notin@(0,1)){Survey 'Local comparison projection lacks the surveyed archive flag.'}
     }
     if($aArchived-ne$bArchived){return $false}
-    return Rows-Equal $A.Manifest.comparison $B.Manifest.comparison
+    return Same-Comparison $A.Manifest.comparison $B.Manifest.comparison
 }
 
 
@@ -863,7 +930,56 @@ function Package-Payload([string]$Source,[string]$Relative,$Entries) {
     if($name.EndsWith('.gz',[StringComparison]::OrdinalIgnoreCase)){Save-TransportMarker $Entries '' $payload}
     return $payload
 }
-function Prepare-Local($Base,$Remote) {
+function Get-TransportedAttachmentRelative($Session,[string]$Reference) {
+    $normal=$Reference.Replace('\','/');$found=New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach($payload in @($Session.Manifest.payloads)){
+        $logical=[string]$payload.path
+        if(-not$logical.StartsWith('attachments/attachments/',[StringComparison]::Ordinal)){continue}
+        $relative=$logical.Substring('attachments/'.Length)
+        if($normal.EndsWith('/'+$relative,[StringComparison]::OrdinalIgnoreCase)){
+            if($found.ContainsKey($relative)){
+                if(-not(Rows-Equal $found[$relative] $payload)){throw "Conflicting attachment transport descriptors: $Reference"}
+            }else{$found.Add($relative,$payload)}
+        }
+    }
+    if($found.Count-ne1){throw "Attachment reference has no unique relative transport path: $Reference"}
+    return @($found.Keys)[0]
+}
+function Find-AttachmentSourceReference([string]$Path,$Pages,$Base,$Remote,[string]$VaultId) {
+    $candidates=New-Object 'Collections.Generic.List[string]';$candidates.Add($Path)
+    $full=[IO.Path]::GetFullPath($Path)
+    if(-not$full.StartsWith($script:appHome+'\attachments\',[StringComparison]::OrdinalIgnoreCase)){throw "Attachment index path escapes configured Home: $Path"}
+    $relative=$full.Substring($script:appHome.Length).TrimStart('\','/').Replace('\','/')
+    foreach($set in @($Base,$Remote)){
+        if(-not$set.ContainsKey($VaultId)-or$set[$VaultId].State-eq'Deleted'){continue}
+        $session=$set[$VaultId];$projection=Read-BlobJson $session.Entries[$session.Prefix+'projection.json']
+        foreach($reference in @(Field $projection 'attachmentReferences' @())){
+            if((Get-TransportedAttachmentRelative $session ([string]$reference))-ceq$relative-and-not$candidates.Contains([string]$reference)){$candidates.Add([string]$reference)}
+        }
+    }
+    foreach($reference in $candidates){foreach($page in $Pages){foreach($text in $page.Texts){if($text.Contains($reference)){return $reference}}}}
+    return $null
+}
+function New-IncompleteLocalSession([string]$Id,$Pages,[string]$Issue,$Base,$Remote) {
+    # An inventory item, never a publishable or accepted snapshot. Only app-issued
+    # canonical identity is used; missing bytes are not fabricated from metadata.
+    $vaultId=$Id
+    $mapped=@{}
+    foreach($set in @($Base,$Remote)){foreach($entry in $set.GetEnumerator()){
+        if($entry.Value.State-ne'Deleted'-and$entry.Value.Manifest.canonicalId-eq$Id){$mapped[$entry.Key]=$true}
+    }}
+    if($mapped.Count-gt1){throw "Ambiguous Vault identity for incomplete local session: $Id"}
+    if($mapped.Count){$vaultId=[string]@($mapped.Keys)[0]}
+    $lineage=@(@($Id)+@($Pages|ForEach-Object{$_.Alias})|Sort-Object -Unique)
+    $remoteState=if($Remote.ContainsKey($vaultId)){$Remote[$vaultId].State}else{'Absent'}
+    Write-CodexStartProgress ("Local session {0}: {1}; remote={2}. Inventory only; no local data changed." -f $Id,$Issue,$remoteState)
+    return [pscustomobject]@{
+        State='Active';Incomplete=$true;Issue=$Issue;Prefix="Active/$vaultId/";Entries=@{};
+        Manifest=[pscustomobject]@{vaultSessionId=$vaultId;canonicalId=$Id;lineageIds=$lineage};
+        LocalPages=@($Pages);NeedsArchive=$false
+    }
+}
+function Prepare-Local($Base,$Remote,[switch]$InventoryIncomplete) {
     Index-ReusablePayloads $Base $Remote
     $pages=New-Object 'Collections.Generic.List[object]'
     foreach($relative in @('sessions','archived_sessions')){
@@ -895,11 +1011,20 @@ function Prepare-Local($Base,$Remote) {
     foreach($id in @($groups.Keys|Sort-Object)){
         $sessionNumber++
         Write-CodexStartProgress ("Building local comparison {0}/{1}: {2}" -f $sessionNumber,$groups.Count,$id)
-        if(-not$byId.ContainsKey($id)){throw "Rollout has no canonical state row: $id"}
+        if(-not$byId.ContainsKey($id)){
+            $issue='Rollout has no canonical state row'
+            if(-not$InventoryIncomplete){throw "$issue : $id"}
+            $item=New-IncompleteLocalSession $id $groups[$id].ToArray() $issue $Base $Remote
+            $result[$item.Manifest.vaultSessionId]=$item;continue
+        }
         $row=$byId[$id];$sessionPages=@($groups[$id].ToArray()|Sort-Object Name)
         $latest=[IO.Path]::GetFullPath([string]$row['rollout_path'])
         $latestKey=Get-RolloutComparisonPath $latest
-        if(@($sessionPages|Where-Object{[string]::Equals((Get-RolloutComparisonPath $_.Path),$latestKey,[StringComparison]::OrdinalIgnoreCase)}).Count-ne1){throw "Canonical latest path does not resolve to a collected original: $id"}
+        if(@($sessionPages|Where-Object{[string]::Equals((Get-RolloutComparisonPath $_.Path),$latestKey,[StringComparison]::OrdinalIgnoreCase)}).Count-ne1){
+            if(-not$InventoryIncomplete){throw "Canonical latest path does not resolve to a collected original: $id"}
+            $item=New-IncompleteLocalSession $id $sessionPages 'Canonical latest path has no collected original' $Base $Remote
+            $result[$item.Manifest.vaultSessionId]=$item;continue
+        }
         $last=$null;foreach($page in $sessionPages){if($null-ne$page.Last-and($null-eq$last-or$page.Last-gt$last)){$last=$page.Last}}
         if ($null -eq $last -and (Field $sessionPages[0].Meta 'thread_source') -eq 'guardian_review') {
             $parent=[string](Field $sessionPages[0].Meta 'parent_thread_id')
@@ -967,11 +1092,15 @@ function Prepare-Local($Base,$Remote) {
             $extras[$table]=@();if($foreign){$extras[$table]=Db-Table $statePath $table 'WHERE id=?' @($foreign);if($extras[$table].Count-ne1){throw "Missing $table relationship: $id"}}
         }
         $owned=New-Object 'Collections.Generic.List[string]'
+        $ownedPaths=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach($path in @(Field $attachmentIndex 'attachmentPaths' @())){
-            $used=$false;foreach($page in $sessionPages){foreach($text in $page.Texts){if($text.Contains([string]$path)){$used=$true;break}}}
-            if($used){$full=[IO.Path]::GetFullPath([string]$path);$relative=$full.Substring($script:appHome.Length).TrimStart('\','/');Resolve-Within $script:appHome $relative|Out-Null
+            $reference=Find-AttachmentSourceReference ([string]$path) $sessionPages $Base $Remote $vaultId
+            if($reference){$full=[IO.Path]::GetFullPath([string]$path);$relative=$full.Substring($script:appHome.Length).TrimStart('\','/');Resolve-Within $script:appHome $relative|Out-Null
                 if(-not(Test-Path -LiteralPath $full -PathType Leaf)){throw "Missing owned attachment for $id : $path"}
-                $owned.Add([string]$path);$inventory.Add((Package-Payload $full ('attachments/'+$relative.Replace('\','/')) $files))}
+                # Index entries may spell the same Windows file with either separator.
+                # Keep original transcript text; package each physical path once.
+                if(-not$ownedPaths.Add($full)){continue}
+                $owned.Add([string]$reference);$inventory.Add((Package-Payload $full ('attachments/'+$relative.Replace('\','/')) $files))}
         }
         $browser=Resolve-Within $script:appHome ('browser/sessions/'+$id+'.toml')
         if(Test-Path -LiteralPath $browser){$inventory.Add((Package-Payload $browser ('browser/'+$id+'.toml') $files))}
@@ -997,7 +1126,11 @@ function Prepare-Local($Base,$Remote) {
         $entries=@{};foreach($path in $files.Keys){$entries["$state/$vaultId/$path"]=$files[$path]}
         $result[$vaultId]=[pscustomobject]@{State=$state;Manifest=$manifest;Prefix="$state/$vaultId/";Entries=$entries;LocalPages=$sessionPages;NeedsArchive=($state-eq'Archived'-and[long]$row['archived']-eq0)}
     }
-    foreach($id in $byId.Keys){if(-not$groups.ContainsKey($id)){throw "Incomplete local session: state row $id has no rollout. This is not deletion evidence."}}
+    foreach($id in $byId.Keys){if(-not$groups.ContainsKey($id)){
+        if(-not$InventoryIncomplete){throw "Incomplete local session: state row $id has no rollout. This is not deletion evidence."}
+        $item=New-IncompleteLocalSession $id @() 'State row has no rollout; this is not deletion evidence' $Base $Remote
+        $result[$item.Manifest.vaultSessionId]=$item
+    }}
     return $result
 }
 
@@ -1156,7 +1289,8 @@ function Materialize-Payload($Session,$Payload) {
 }
 function Get-RolloutDestination($Session,[string]$Source,[string]$Name) {
     $first=$null
-    foreach($line in [CodexStartNative]::Lines($Source)){if($line.Text){$first=Parse-Json $line.Text;break}}
+    $reader=New-Object IO.StreamReader($Source,$script:utf8,$true)
+    try{while($null-ne($line=$reader.ReadLine())){if($line){$first=Parse-Json $line;break}}}finally{$reader.Dispose()}
     if($null-eq$first-or(Field $first 'type')-ne'session_meta'){throw "Restored rollout has no initial session_meta: $Name"}
     $stamp=[DateTimeOffset]::MinValue
     if(-not[DateTimeOffset]::TryParse([string](Field (Field $first 'payload') 'timestamp'),[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind,[ref]$stamp)){throw "Restored rollout timestamp is invalid: $Name"}
@@ -1205,51 +1339,260 @@ function Get-StoredCatalogRows($Session) {
     return ,$rows
 }
 function Assert-TargetMappings($Remote,$Current) {
-    foreach($session in $Remote.Values) {
-        # Normal Start does not place Archived or Deleted sessions in the app.
-        # They therefore need no target-machine UI placement mapping.
-        if($session.State-ne'Active'){continue}
-        $id=[string]$session.Manifest.vaultSessionId
+    # Metadata is now prepared for the target, not required to pre-exist per thread.
+    $activeIds=@($Remote.Values|Where-Object{$_.State-eq'Active'}|ForEach-Object{[string]$_.Manifest.canonicalId})
+    $removedIds=@($Current.Values|ForEach-Object{[string]$_.Manifest.canonicalId}|Where-Object{$_-notin$activeIds})
+    $script:receiveMetadata=New-ReceiveMetadataPlan $Remote $removedIds
+    foreach($session in $Remote.Values){if($session.State-ne'Active'){continue}
         $projection=Get-Projection $session
-        $metadata=Field (Field $session.Manifest 'comparison') 'metadata'
-        foreach($pair in @(@('projectId','projects'),@('sectionId','thread_sections'))) {
-            $foreign=[string](Field $metadata $pair[0] '')
-            if(-not$foreign){continue}
-            $rows=@(Field (Field $projection 'relations') $pair[1] @())
-            if($rows.Count-ne1-or[string](Field $rows[0] 'id' '')-ne$foreign){throw "Stored $($pair[1]) relation is incomplete for $id."
+        foreach($pair in @(@('project_id','projects'),@('thread_section_id','thread_sections'))){
+            $foreign=Field $projection.state $pair[0]
+            if($pair[0]-eq'project_id'-and$foreign){$foreign=Get-ReceiveProjectId ([string]$foreign)}
+            if($foreign-and(Query (Join-Path $script:appHome 'state_5.sqlite') ('SELECT id FROM '+$pair[1]+' WHERE id=?') @($foreign)).Count-ne1){throw "Target $($pair[1]) mapping missing: $foreign. No app data was removed."}
+        }
+    }
+}
+# Receive placement uses the environment configured by Initialize.
+function Assert-ReceivePath([string]$Path) {
+    $full=[IO.Path]::GetFullPath($Path)
+    if(-not$full.StartsWith($script:appHome+'\',[StringComparison]::OrdinalIgnoreCase)){throw "Receive path escapes Codex Home: $full"}
+    $cursor=$full
+    while($cursor-and$cursor.Length-ge$script:appHome.Length){
+        if(Test-Path -LiteralPath $cursor){if((Get-Item -LiteralPath $cursor -Force).Attributes-band[IO.FileAttributes]::ReparsePoint){throw "Receive path is a reparse point: $cursor"}}
+        $cursor=[IO.Path]::GetDirectoryName($cursor)
+    }
+    return $full
+}
+function Set-ReceiveMember($Object,[string]$Name,$Value) {
+    $prop=$Object.PSObject.Properties[$Name]
+    if($null-ne$prop){$prop.Value=$Value}else{$Object|Add-Member -MemberType NoteProperty -Name $Name -Value $Value}
+}
+function Receive-Object($Parent,[string]$Key) {
+    $prop=$Parent.PSObject.Properties[$Key]
+    if($null-eq$prop){$value=[pscustomobject]@{};Set-ReceiveMember $Parent $Key $value;return $value}
+    if($prop.Value-isnot[pscustomobject]){Survey "Unknown target object shape: $Key"}
+    return $prop.Value
+}
+function Get-ReceiveProjectId([string]$Id) {
+    if($script:receiveConfig.ContainsKey('ProjectIdMappings')-and$script:receiveConfig.ProjectIdMappings.ContainsKey($Id)){return [string]$script:receiveConfig.ProjectIdMappings[$Id]}
+    return $Id
+}
+function Get-ReceiveProject([string]$Id,$Global) {
+    $mapped=Get-ReceiveProjectId $Id
+    $projects=Field $Global 'local-projects'
+    if($mapped-eq$Id-and-not($script:receiveConfig.ContainsKey('ProjectIdMappings')-and$script:receiveConfig.ProjectIdMappings.ContainsKey($Id))-and$projects-and$null-eq$projects.PSObject.Properties[$mapped]-and$script:receiveCwd){
+        $targetCwd=Get-RolloutComparisonPath (Get-ReceivePathValue $script:receiveCwd)
+        $matching=@($projects.PSObject.Properties|Where-Object {
+            $found=$false
+            foreach($root in @(Field $_.Value 'rootPaths' @())){
+                if($root-is[string]-and[IO.Path]::IsPathRooted($root)-and
+                    [string]::Equals((Get-RolloutComparisonPath $root).TrimEnd('\'),$targetCwd.TrimEnd('\'),[StringComparison]::OrdinalIgnoreCase)){$found=$true}
+            }
+            $found
+        })
+        if($matching.Count-gt1){throw "Multiple target projects match the received workspace for $Id. Configure Codex.ProjectIdMappings; no session was discarded."}
+        if($matching.Count-eq1){$mapped=$matching[0].Name}
+    }
+    if($null-eq$projects-or$null-eq$projects.PSObject.Properties[$mapped]){
+        $workspace=if($script:receiveCwd){Get-ReceivePathValue $script:receiveCwd}else{'not supplied'}
+        $registered=if($projects){@($projects.PSObject.Properties.Name)-join', '}else{'none'}
+        throw "Target project registration is missing: $Id. Target workspace=$workspace; requested target ID=$mapped; registered IDs=$registered. Register it on this PC or configure Codex.ProjectIdMappings; no session was discarded."
+    }
+    $project=$projects.PSObject.Properties[$mapped].Value
+    $roots=$project.PSObject.Properties['rootPaths']
+    if($null-eq$roots-or$roots.Value-isnot[Array]-or$roots.Value.Count-eq0){Survey "Unknown target project roots: $mapped"}
+    foreach($root in $roots.Value){if($root-isnot[string]-or-not[IO.Path]::IsPathRooted($root)-or-not[IO.Directory]::Exists($root)){throw "Target project root is unavailable: $root"}}
+    return $mapped
+}
+function Get-ReceivePathValue([string]$Path) {
+    if(-not[IO.Path]::IsPathRooted($Path)){throw "Unrooted source placement path: $Path"}
+    $full=[IO.Path]::GetFullPath($Path)
+    if($script:receiveConfig.ContainsKey('PathMappings')){
+        # Use the same Windows comparison namespace as rollout identity. Extended
+        # paths are compared without stripping their literal path semantics.
+        $pathKey=Get-RolloutComparisonPath $full
+        $prefixes=@{}
+        foreach($source in $script:receiveConfig.PathMappings.Keys){
+            $prefix=(Get-RolloutComparisonPath ([string]$source)).TrimEnd('\')
+            $target=[IO.Path]::GetFullPath([string]$script:receiveConfig.PathMappings[$source])
+            if($prefixes.ContainsKey($prefix)-and-not[string]::Equals((Get-RolloutComparisonPath $prefixes[$prefix]),(Get-RolloutComparisonPath $target),[StringComparison]::OrdinalIgnoreCase)){
+                throw 'Equivalent Codex.PathMappings source prefixes have conflicting destinations.'
+            }
+            $prefixes[$prefix]=$target
+        }
+        foreach($prefix in @($prefixes.Keys|Sort-Object Length -Descending)){
+            if([string]::Equals($pathKey,$prefix,[StringComparison]::OrdinalIgnoreCase)-or$pathKey.StartsWith($prefix+'\',[StringComparison]::OrdinalIgnoreCase)){
+                $suffix=$pathKey.Substring($prefix.Length)
+                if(-not$suffix){return $prefixes[$prefix]}
+                return $prefixes[$prefix].TrimEnd('\','/')+$suffix
             }
         }
-        # Heartbeat permissions describe the target machine's execution policy,
-        # not the identity or placement of a conversation. Keep the target's
-        # value (including absence) untouched; never import source permissions.
-        $permissionPointer='/electron-persisted-atom-state/heartbeat-thread-permissions-by-id/'+[string]$session.Manifest.canonicalId
-        $allRemoteRefs=@(Field $projection 'globalReferences' @())
-        $remoteRefs=@($allRemoteRefs|Where-Object{[string](Field $_ 'pointer')-cne$permissionPointer})
-        foreach($permissionRef in @($allRemoteRefs|Where-Object{[string](Field $_ 'pointer')-ceq$permissionPointer})){
-            $targetPermissions=@()
-            if($Current.ContainsKey($id)){
-                $targetPermissions=@((Field (Get-Projection $Current[$id]) 'globalReferences' @())|Where-Object{[string](Field $_ 'pointer')-ceq$permissionPointer})
-            }
-            if($targetPermissions.Count-ne1-or-not(Rows-Equal (Field $permissionRef 'value') (Field $targetPermissions[0] 'value'))){
-                $script:warnings.Add("Target-machine heartbeat permissions differ for $id. Existing target permissions were retained; source permissions were not applied.")
-            }
+    }
+    return $full
+}
+function Set-ReceiveUnreadMembership($Global,$Remote,[string[]]$RemovedIds,[string[]]$Incoming) {
+    # The surveyed local unread array is membership, not a portable array slot.
+    # Other host buckets and references outside this receive scope survive.
+    $affected=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach($id in $RemovedIds){[void]$affected.Add($id)}
+    foreach($session in $Remote.Values){
+        foreach($id in @($session.Manifest.lineageIds)){[void]$affected.Add([string]$id)}
+        if($session.State-ne'Deleted'){[void]$affected.Add([string]$session.Manifest.canonicalId)}
+    }
+    $electron=Field $Global 'electron-persisted-atom-state'
+    if($null-ne$electron-and$electron-isnot[pscustomobject]){Survey 'Unknown target electron state shape.'}
+    $hosts=Field $electron 'unread-thread-ids-by-host-v1'
+    if($null-ne$hosts-and$hosts-isnot[pscustomobject]){Survey 'Unknown target unread host map.'}
+    $property=if($null-ne$hosts){$hosts.PSObject.Properties['local']}else{$null}
+    $old=@()
+    if($null-ne$property){
+        if($property.Value-isnot[Array]){Survey 'Unknown target local unread membership.'}
+        foreach($id in $property.Value){if($id-isnot[string]){Survey 'Unknown target local unread member.'}}
+        $old=$property.Value
+    }
+    if($null-eq$property-and$Incoming.Count-eq0){return}
+    $wanted=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach($id in $Incoming){[void]$wanted.Add($id)}
+    $next=New-Object 'Collections.Generic.List[string]'
+    foreach($id in $old){
+        if(-not$affected.Contains($id)){$next.Add($id)}
+        elseif($wanted.Contains($id)-and-not$next.Contains($id)){$next.Add($id)}
+    }
+    foreach($id in @($Incoming|Sort-Object -CaseSensitive -Unique)){if(-not$next.Contains($id)){$next.Add($id)}}
+    $target=Receive-Object (Receive-Object $Global 'electron-persisted-atom-state') 'unread-thread-ids-by-host-v1'
+    Set-ReceiveMember $target 'local' $next.ToArray()
+}
+function New-ReceiveMetadataPlan($Remote,[string[]]$RemovedIds) {
+    $globalPath=Assert-ReceivePath (Join-Path $script:appHome '.codex-global-state.json')
+    $global=if([IO.File]::Exists($globalPath)){Read-Json $globalPath}else{[pscustomobject]@{}}
+    if($global-isnot[pscustomobject]){Survey 'Unknown Codex global-state root.'}
+    $before=Json $global
+    $perThread=@('prompt-history','thread-descriptions-v1')
+    # Only measured session placement/content keys are removed. Permissions,
+    # writable roots, project registrations and unrelated app preferences survive.
+    foreach($id in $RemovedIds){
+        foreach($key in @('thread-project-assignments','thread-workspace-root-hints','thread-projectless-output-directories')){
+            $map=Field $global $key;if($null-ne$map){if($map-isnot[pscustomobject]){Survey "Unknown $key shape"};$map.PSObject.Properties.Remove($id)}
         }
-        if($remoteRefs.Count) {
-            if(-not$Current.ContainsKey($id)){throw "Target-machine global mapping is unavailable for $id. No mapping was invented."
+        $electron=Field $global 'electron-persisted-atom-state'
+        foreach($key in $perThread){$map=Field $electron $key;if($null-ne$map){if($map-isnot[pscustomobject]){Survey "Unknown $key shape"};$map.PSObject.Properties.Remove($id)}}
+        $bindings=Field $electron 'client-thread-bindings-v1'
+        if($bindings){foreach($prop in @($bindings.PSObject.Properties)){if($prop.Value-eq$id){$bindings.PSObject.Properties.Remove($prop.Name)}}}
+    }
+    $orders=Field $global 'sidebar-project-thread-orders'
+    if($orders){foreach($prop in @($orders.PSObject.Properties)){
+        $value=$prop.Value;$ids=$value.PSObject.Properties['threadIds']
+        if($null-eq$ids-or$ids.Value-isnot[Array]){Survey 'Unknown sidebar project order shape.'}
+        $ids.Value=@($ids.Value|Where-Object{$_-notin$RemovedIds})
+    }}
+    $projectless=$global.PSObject.Properties['projectless-thread-ids']
+    if($null-ne$projectless){if($projectless.Value-isnot[Array]){Survey 'Unknown projectless thread list.'};$projectless.Value=@($projectless.Value|Where-Object{$_-notin$RemovedIds})}
+    $ordered=@{};$sourceAttachments=New-Object 'Collections.Generic.List[string]'
+    $unreadIds=New-Object 'Collections.Generic.List[string]'
+    foreach($session in $Remote.Values){
+        if($session.State-ne'Active'){continue}
+        $id=[string]$session.Manifest.canonicalId;$projection=Get-Projection $session
+        $script:receiveCwd=[string](Field $projection.state 'cwd' '')
+        foreach($ref in @(Field $projection 'globalReferences' @())){
+            $pointer=[string]$ref.pointer;$value=$ref.value
+            if($pointer-eq('/electron-persisted-atom-state/heartbeat-thread-permissions-by-id/'+$id)-or$pointer-eq('/thread-writable-roots/'+$id)){continue}
+            if($pointer-like '/electron-persisted-atom-state/client-thread-bindings-v1/*'-or$pointer-eq('/electron-remote-hosted-pip-task-visibility-state/'+$id)){continue}
+            if($pointer-eq('/electron-persisted-atom-state/prompt-history/'+$id)-or$pointer-eq('/electron-persisted-atom-state/thread-descriptions-v1/'+$id)){
+                $key=($pointer-split'/')[2];$map=Receive-Object (Receive-Object $global 'electron-persisted-atom-state') $key
+                if(($key-eq'prompt-history'-and$value-isnot[Array])-or($key-eq'thread-descriptions-v1'-and$value-isnot[string])){Survey "Unknown remote $key value"}
+                Set-ReceiveMember $map $id $value;continue
             }
-            $localRefs=@(Field (Get-Projection $Current[$id]) 'globalReferences' @())
-            foreach($reference in $remoteRefs){
-                $found=@($localRefs|Where-Object{[string](Field $_ 'pointer')-ceq[string](Field $reference 'pointer')-and(Json (Field $_ 'value'))-ceq(Json (Field $reference 'value'))})
-                if($found.Count-ne1){throw "Target-machine global mapping differs for $id at $(Field $reference 'pointer'). Nothing was guessed."
-                }
+            if($pointer-match '^/electron-persisted-atom-state/unread-thread-ids-by-host-v1/local/[0-9]+$'){
+                if($value-isnot[string]-or$value-cne$id){Survey 'Invalid local unread thread reference.'}
+                $unreadIds.Add($id);continue
             }
+            if($pointer-match '^/app-server-migrated-pinned-thread-ids-by-host/[^/]+/[0-9]+$'){
+                # Surveyed host migration completion, not portable pinned state.
+                # The app keys markThreadMigrated/getMigratedThreadIds by host.
+                # Preserve the target marker; do not mark source work done here.
+                if($value-isnot[string]-or$value-ne$id){Survey 'Invalid host migration thread reference.'}
+                continue
+            }
+            if($pointer-eq('/thread-project-assignments/'+$id)){
+                if((Field $value 'projectKind')-ne'local'){Survey "Unknown project assignment kind for $id"}
+                $project=Get-ReceiveProject ([string]$value.projectId) $global
+                Set-ReceiveMember (Receive-Object $global 'thread-project-assignments') $id ([pscustomobject]@{projectKind='local';projectId=$project});continue
+            }
+            if($pointer-match '^/sidebar-project-thread-orders/([^/]+)/threadIds/([0-9]+)$'){
+                $sourceProject=$Matches[1].Replace('~1','/').Replace('~0','~');$position=[int]$Matches[2]
+                $project=Get-ReceiveProject $sourceProject $global
+                if([string]$value-ne$id){throw 'Sidebar reference points to a different session.'}
+                if(-not$ordered.ContainsKey($project)){$ordered[$project]=New-Object 'Collections.Generic.List[object]'}
+                $ordered[$project].Add([pscustomobject]@{Id=$id;Position=$position});continue
+            }
+            if($pointer-match '^/projectless-thread-ids/[0-9]+$'){
+                if([string]$value-ne$id){throw 'Projectless reference points to a different session.'}
+                $ids=@(Field $global 'projectless-thread-ids' @());Set-ReceiveMember $global 'projectless-thread-ids' @($ids|Where-Object{$_-ne$id})
+                $global.PSObject.Properties['projectless-thread-ids'].Value+=@($id);continue
+            }
+            if($pointer-eq('/thread-workspace-root-hints/'+$id)-or$pointer-eq('/thread-projectless-output-directories/'+$id)){
+                $path=Get-ReceivePathValue ([string]$value)
+                $key=($pointer-split'/')[1];Set-ReceiveMember (Receive-Object $global $key) $id $path;continue
+            }
+            Survey "Unsurveyed portable global reference: $pointer"
         }
-        $remoteAttachments=@(Field $projection 'attachmentReferences' @())
-        if($remoteAttachments.Count) {
-            if(-not$Current.ContainsKey($id)){throw "Target-machine attachment index mapping is unavailable for $id. No path was invented."
-            }
-            $localAttachments=@(Field (Get-Projection $Current[$id]) 'attachmentReferences' @())
-            foreach($reference in $remoteAttachments){if([string]$reference-notin@($localAttachments|ForEach-Object{[string]$_})){throw "Target-machine attachment mapping differs for $id. No path was invented."}}
+        foreach($path in @(Field $projection 'attachmentReferences' @())){
+            # The original mentions this absolute path. Never rewrite a rollout
+            # or silently claim an attachment at another path is equivalent.
+            $relative=Get-TransportedAttachmentRelative $session ([string]$path)
+            $absolute=Assert-ReceivePath (Join-Path $script:appHome $relative)
+            if(-not$absolute.StartsWith($script:appHome+'\attachments\',[StringComparison]::OrdinalIgnoreCase)){throw "Unsupported attachment destination: $path"}
+            $logical='attachments/'+$absolute.Substring($script:appHome.Length+1).Replace('\','/')
+            if(@($session.Manifest.payloads|Where-Object{$_.path-ceq$logical}).Count-ne1){throw "Attachment reference has no unique transported payload: $path"}
+            if(-not$sourceAttachments.Contains($absolute)){$sourceAttachments.Add($absolute)}
+        }
+    }
+    Set-ReceiveUnreadMembership $global $Remote $RemovedIds $unreadIds.ToArray()
+    foreach($project in $ordered.Keys){
+        $order=Receive-Object (Receive-Object $global 'sidebar-project-thread-orders') $project
+        $old=@(Field $order 'threadIds' @());$incoming=@($ordered[$project]|Sort-Object Position,Id|ForEach-Object{$_.Id}|Select-Object -Unique)
+        Set-ReceiveMember $order 'threadIds' @($incoming+@($old|Where-Object{$_-notin$incoming}))
+    }
+    $indexPath=Assert-ReceivePath (Join-Path $script:appHome 'attachments/pasted-text-attachments.json')
+    $index=if([IO.File]::Exists($indexPath)){Read-Json $indexPath}else{[pscustomobject]@{attachmentPaths=@()}}
+    $indexBefore=Json $index
+    $paths=$index.PSObject.Properties['attachmentPaths'];if($null-eq$paths-or$paths.Value-isnot[Array]){Survey 'Unknown pasted-text attachment index shape.'}
+    $seenPaths=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $uniquePaths=New-Object 'Collections.Generic.List[string]'
+    foreach($path in @($paths.Value)+$sourceAttachments.ToArray()){
+        if($path-isnot[string]-or-not[IO.Path]::IsPathRooted($path)){Survey 'Unknown pasted-text attachment index path.'}
+        if($seenPaths.Add([IO.Path]::GetFullPath($path))){$uniquePaths.Add($path)}
+    }
+    # Retain the first spelling: other index fields may key cached text by it.
+    $paths.Value=$uniquePaths.ToArray()
+    return [pscustomobject]@{GlobalPath=$globalPath;Global=$global;GlobalChanged=((Json $global)-cne$before);IndexPath=$indexPath;Index=$index;IndexChanged=((Json $index)-cne$indexBefore)}
+}
+function Apply-ReceiveMetadata($Plan) {
+    foreach($kind in @('Global','Index')){
+        if(-not$Plan.($kind+'Changed')){continue}
+        $file=Join-Path $script:runRoot ('receive-'+$kind+'.json');[IO.File]::WriteAllText($file,(Json $Plan.$kind),$script:utf8)
+        Write-PreparedFile $file $Plan.($kind+'Path')
+    }
+}
+function Assert-ReceiveDestinations($Remote) {
+    $destinations=@{}
+    foreach($session in $Remote.Values){if($session.State-ne'Active'){continue}
+        foreach($payload in @($session.Manifest.payloads)){
+            $logical=[string]$payload.path;$source=Materialize-Payload $session $payload
+            if($logical.StartsWith('rollouts/')){$destination=Get-RolloutDestination $session $source ([IO.Path]::GetFileName($logical))}
+            elseif($logical.StartsWith('attachments/')){$relative=$logical.Substring(12);if($relative.StartsWith('attachments/')){$relative=$relative.Substring(12)};$destination=Resolve-Within $script:appHome ('attachments/'+$relative)}
+            elseif($logical.StartsWith('browser/')){$destination=Resolve-Within $script:appHome ('browser/sessions/'+[IO.Path]::GetFileName($logical))}
+            elseif($logical.StartsWith('visualizations/')){$destination=Resolve-Within $script:appHome $logical}
+            else{throw "Unsupported app payload path: $logical"}
+            $destination=Assert-ReceivePath $destination
+            if($destinations.ContainsKey($destination)-and$destinations[$destination]-ne[string]$payload.sha256){throw "Two payloads disagree at destination: $destination"}
+            $destinations[$destination]=[string]$payload.sha256
+        }
+        $projection=Get-Projection $session
+        foreach($table in @('thread_turns','thread_items','thread_history_projection_state','thread_realtime_items')){
+            $columns=@((Query (Join-Path $script:appHome 'thread_history_1.sqlite') ('PRAGMA table_info('+$table+')'))|ForEach-Object{$_['name']}|Sort-Object)
+            if($columns.Count-eq0){Survey "Required history table is missing: $table"}
+            foreach($row in @(Field $projection.history $table @())){if((@($row.PSObject.Properties.Name|Sort-Object)-join',')-cne($columns-join',')){Survey "Stored history schema differs: $table"}}
         }
     }
 }
@@ -1265,10 +1608,16 @@ function Assert-LocalDiscard($Base,$Remote,$Local) {
     $all=@{};foreach($set in @($Base,$Local)){foreach($id in $set.Keys){$all[$id]=$true}}
     foreach($id in $all.Keys){
         $b=$null;$l=$null;if($Base.ContainsKey($id)){$b=$Base[$id]};if($Local.ContainsKey($id)){$l=$Local[$id]}
-        if($null-ne$b-and$b.State-eq'Deleted'-and$null-eq$l){continue}
+        # Local absence alone is not unpublished work and not deletion proof.
+        # The verified remote supplies missing state; no data is discarded here.
+        if($null-eq$l){continue}
+        if($Remote.ContainsKey($id)-and(Same-LocalSnapshot $l $Remote[$id])){continue}
         if(-not(Same-LocalSnapshot $b $l)){$changed.Add($id)}
     }
-    if($changed.Count-and-not$DiscardLocalChanges){throw ('Unpublished local Codex changes would be replaced: '+(($changed|Sort-Object)-join', ')+'. Run root Start again and explicitly approve the discard.')}
+    if($changed.Count-and-not$DiscardLocalChanges){
+        $script:discardRequired=$true
+        throw ('Local-only, changed or incomplete Codex sessions would be replaced: '+(($changed|Sort-Object)-join', ')+'. Missing originals were not reconstructed as local work. Approve discard to apply the verified remote; decline to retain local state for separately instructed reconciliation.')
+    }
 }
 function Backup-DatabaseFamily([string]$Path) {
     foreach($candidate in @($Path,($Path+'-wal'),($Path+'-shm'))){Backup-Path $candidate}
@@ -1485,6 +1834,8 @@ function Restore-PortableStateMetadata($Remote) {
                 $db.Query('UPDATE threads SET archived=?, archived_at=? WHERE id=?',@((Get-NativeArchiveFlag $session),(Field $portable 'archived_at'),$id))|Out-Null
             }
             $projectId=Field $portable 'project_id';$sectionId=Field $portable 'thread_section_id'
+            if($projectId){$projectId=Get-ReceiveProjectId ([string]$projectId)}
+            $cwd=Field $portable 'cwd';if($cwd){$db.Query('UPDATE threads SET cwd=? WHERE id=?',@((Get-ReceivePathValue ([string]$cwd)),$id))|Out-Null}
             if($projectId-and($db.Query('SELECT id FROM projects WHERE id=?',@($projectId))).Count-ne1){throw "Target project mapping is missing: $id -> $projectId"}
             if($sectionId-and($db.Query('SELECT id FROM thread_sections WHERE id=?',@($sectionId))).Count-ne1){throw "Target section mapping is missing: $id -> $sectionId"}
             $db.Query('UPDATE threads SET title=?, name=?, is_pinned=?, project_id=?, thread_section_id=?, section_position=?, section_entered_at_ms=? WHERE id=?',@($title,$name,$pinned,$projectId,$sectionId,(Field $portable 'section_position'),(Field $portable 'section_entered_at_ms'),$id))|Out-Null
@@ -1530,11 +1881,16 @@ function Same-AppliedEntries($Local,$Remote) {
     return $true
 }
 function Same-ApplicationTarget($Local,$Remote,$Basis) {
+    if(Field $Local 'Incomplete' $false){return $false}
     if(Same-AppliedEntries $Local $Remote){return $true}
     # A received projection contains source-machine metadata that thread/read
     # derives again. Require the ENTIRE actual local snapshot to still match its
     # accepted basis before comparing the fields Start applies from the remote.
-    if(-not(Same-AppliedEntries $Local $Basis)-or$Remote.State-ne'Active'-or-not(Same-LocalSnapshot $Local $Remote)){return $false}
+    if(-not(Same-AppliedEntries $Local $Basis)-or$Remote.State-ne'Active'){return $false}
+    $lc=Parse-Json (Json $Local.Manifest.comparison);$rc=Parse-Json (Json $Remote.Manifest.comparison)
+    $lc.metadata.PSObject.Properties.Remove('placement');$rc.metadata.PSObject.Properties.Remove('placement')
+    if($rc.metadata.projectId){$rc.metadata.projectId=Get-ReceiveProjectId ([string]$rc.metadata.projectId)}
+    if((Json $lc)-cne(Json $rc)){return $false}
     $lp=Get-Projection $Local;$rp=Get-Projection $Remote
     foreach($key in @('history','sessionIndex','relations','attachmentReferences')){
         if((Json (Field $lp $key))-cne(Json (Field $rp $key))){return $false}
@@ -1554,10 +1910,8 @@ function Same-ApplicationTarget($Local,$Remote,$Basis) {
         $catalogs.Add((Json $rows.ToArray()))
     }
     if($catalogs[0]-cne$catalogs[1]){return $false}
-    $permission='/electron-persisted-atom-state/heartbeat-thread-permissions-by-id/'+[string]$Remote.Manifest.canonicalId
-    $lg=@($lp.globalReferences|Where-Object{[string]$_.pointer-cne$permission})
-    $rg=@($rp.globalReferences|Where-Object{[string]$_.pointer-cne$permission})
-    return (Json $lg)-ceq(Json $rg)
+    if($null-eq$script:receiveMetadata){return $false}
+    return (-not$script:receiveMetadata.GlobalChanged-and-not$script:receiveMetadata.IndexChanged)
 }
 function Select-ApplicationChanges($Current,$Remote,$Base) {
     $local=@{};$desired=@{};$all=@{};$unchanged=0
@@ -1642,6 +1996,15 @@ try {
     if(Test-Path -LiteralPath $script:runRoot){throw 'RunId already exists.'};[IO.Directory]::CreateDirectory($script:runRoot)|Out-Null
     $config=Import-PowerShellDataFile -LiteralPath (Join-Path $script:repo 'AgentSessionSync.config.psd1')
     if(-not$config.ContainsKey('Codex')-or-not$config.Codex.Enabled){throw 'Codex was not selected as a registered app.'}
+    $script:receiveConfig=$config.Codex
+    foreach($key in @('PathMappings','ProjectIdMappings')){
+        if(-not$script:receiveConfig.ContainsKey($key)){continue}
+        $map=$script:receiveConfig[$key];if($map-isnot[hashtable]){throw "Codex.$key must be a map in this PC's configuration."}
+        foreach($source in $map.Keys){
+            if($source-isnot[string]-or-not$source-or$map[$source]-isnot[string]-or-not$map[$source]){throw "Codex.$key requires nonempty string pairs."}
+            if($key-eq'PathMappings'-and(-not[IO.Path]::IsPathRooted($source)-or-not[IO.Path]::IsPathRooted($map[$source])-or-not[IO.Directory]::Exists($map[$source]))){throw 'Codex.PathMappings requires absolute prefixes and existing target directories.'}
+        }
+    }
     $script:appHome=[IO.Path]::GetFullPath([string]$config.Codex.Home).TrimEnd('\','/');if(-not(Test-Path -LiteralPath $script:appHome -PathType Container)){throw 'Configured Codex Home does not exist.'}
     $script:days=[int]$config.ActiveWindowDays;$script:limit=[long]$config.TransportFileLimitBytes;$script:now=[DateTimeOffset]::UtcNow
     if($script:days-ne30-or$script:limit-ne99614720){throw 'Expected the agreed 30 days and 99614720-byte transport threshold.'}
@@ -1655,22 +2018,30 @@ try {
     Write-CodexStartProgress 'Verifying stored payloads and transport markers'
     Verify-StoredSessions $base;Verify-StoredSessions $remote
     Write-CodexStartProgress 'Inspecting current local originals and comparison metadata'
-    $current=Prepare-Local $base $remote;Assert-LocalDiscard $base $remote $current
+    $current=Prepare-Local $base $remote -InventoryIncomplete
     Assert-TargetMappings $remote $current
+    $changes=Select-ApplicationChanges $current $remote $base
+    Assert-ReceiveDestinations $changes.Remote
+    Assert-LocalDiscard $base $remote $current
     Write-CodexStartProgress 'Validation passed; applying remote state with app-owned backups'
     $script:receipt.status='applying';Save-Receipt
-    $changes=Select-ApplicationChanges $current $remote $base
     if($changes.Current.Count-or$changes.Remote.Count){Apply-Remote $changes.Current $changes.Remote}
+    Apply-ReceiveMetadata $script:receiveMetadata
     Write-CodexStartProgress 'Checking applied app state'
     Validate-Applied $changes.Remote $changes.Current
     # The local basis records what this target machine actually received.  It
     # deliberately keeps target-derived app metadata rather than pretending
     # that a source machine's portable projection was installed byte-for-byte.
     Write-CodexStartProgress 'Recording the actual applied local comparison basis'
-    $applied=if($changes.Current.Count-or$changes.Remote.Count){Prepare-Local $remote $remote}else{$current}
+    $applied=if($changes.Current.Count-or$changes.Remote.Count-or$script:receiveMetadata.GlobalChanged-or$script:receiveMetadata.IndexChanged){Prepare-Local $remote $remote}else{$current}
     $basis=@{}
     foreach($session in $remote.Values){if($session.State-eq'Deleted'){Copy-Session $session $basis}}
-    foreach($session in $applied.Values){Copy-Session $session $basis}
+    foreach($session in $applied.Values){
+        $id=[string]$session.Manifest.vaultSessionId
+        $witness=$null
+        if($remote.ContainsKey($id)-and$remote[$id].State-ne'Deleted'){$witness=Remote-Witness $remote[$id]}
+        Copy-LocalBasis $session $witness $basis
+    }
     $tree=Make-Tree $basis;Object-Id $tree 'tree'
     Write-CodexStartProgress ("Reused result objects: {0}; existing trees: {1}" -f $script:reusedJson,$script:reusedTrees)
     Write-CodexStartProgress 'Application verified; releasing this Start backup and scratch'
@@ -1686,5 +2057,6 @@ try {
     }
     if(-not$retain-and$script:runRoot){try{Clear-StartReceipt}catch{$detail+=' Scratch cleanup failed: '+$_.Exception.Message}}
     Report 'Failure' 'Codex Start could not complete' $detail
+    if($script:discardRequired-and-not$retain){Write-Output 'DISCARD_REQUIRED: True'}
     exit 1
 }

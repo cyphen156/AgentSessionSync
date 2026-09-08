@@ -22,6 +22,12 @@
     Codex = @{
         Enabled = $true
         Home = ''
+        # Optional environment mappings, recorded by Initialize. No session IDs.
+        # PathMappings maps source workspace prefixes to existing local roots.
+        # ProjectIdMappings maps source project registrations to local ones.
+        # Leave empty when the existing target registration/path is unambiguous.
+        PathMappings = @{}
+        ProjectIdMappings = @{}
         AppId = ''
         ProcessNames = @()
     }

@@ -1,7 +1,8 @@
 # Windows 설치
 
-2026-09-06 구현 기준입니다. 기존 도구의 `Agents/*.psd1`, 체크포인트 파일,
-`-EnableSessionPush`, Pull/Push-Sessions 진입점은 사용하지 않습니다.
+2026-09-06 구현 기준입니다. 기존 도구의 `Agents/*.psd1`과
+Pull/Push-Sessions 진입점은 현재 배포본에서 제거했습니다. 체크포인트 파일과
+`-EnableSessionPush` 옵션도 사용하지 않습니다.
 
 ## 1. 비공개 설치본 준비
 

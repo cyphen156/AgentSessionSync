@@ -704,15 +704,78 @@ function Read-Sessions($Entries) {
     }
     return $sessions
 }
+
+# Only keyed collections are unordered. Do not sort transcript records, lineage,
+# or other arrays whose order carries app meaning.
+function Comparable-SessionData($Comparison) {
+    $copy=Parse-Json (Json $Comparison)
+    $payloads=New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach($payload in @($copy.payloads)){
+        $key=[string]$payload.path
+        if(-not$key){throw 'Invalid comparison payload path.'}
+        if($payloads.ContainsKey($key)){
+            # Older Start bases counted slash aliases twice. Only identical
+            # attachment descriptors are redundant; conflicting bytes still fail.
+            if($key.StartsWith('attachments/',[StringComparison]::Ordinal)-and(Rows-Equal $payloads[$key] $payload)){continue}
+            throw 'Conflicting or duplicate comparison payload path.'
+        }
+        $payloads.Add($key,$payload)
+    }
+    $copy.payloads=$payloads
+    $placement=New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach($entry in @($copy.metadata.placement)){
+        $key=[string]$entry.pointer
+        if(-not$key-or$placement.ContainsKey($key)){throw 'Invalid or duplicate comparison placement pointer.'}
+        $placement.Add($key,$entry.value)
+    }
+    $copy.metadata.placement=$placement
+    return $copy
+}
+function Same-Comparison($Left,$Right) {
+    return Rows-Equal (Comparable-SessionData $Left) (Comparable-SessionData $Right)
+}
+# This witness belongs only to the existing local basis tree, never publication.
+# Local edits are compared to actual applied state; remote edits to received state.
+function Remote-Witness($Session) {
+    if($null-eq$Session){return $null}
+    if($Session.State-eq'Deleted'){throw 'Deleted uses its existing minimal record, not a comparison witness.'}
+    return [pscustomobject]@{state=$Session.State;comparison=$Session.Manifest.comparison}
+}
+function Accepted-RemoteWitness($Basis) {
+    if($null-eq$Basis-or$Basis.State-eq'Deleted'){return $null}
+    $witness=Field $Basis.Manifest 'acceptedRemoteComparison'
+    if($null-eq$witness){return $null}
+    if((@($witness.PSObject.Properties.Name|Sort-Object)-join ',')-ne'comparison,state'-or
+        $witness.state-notin@('Active','Archived')-or
+        [string]$witness.comparison.canonicalId-cne[string]$Basis.Manifest.canonicalId){
+        throw 'Invalid accepted remote comparison in local basis.'
+    }
+    return $witness
+}
+function Copy-LocalBasis($Session,$Witness,$Output) {
+    Copy-Session $Session $Output
+    if($null-eq$Session-or$Session.State-eq'Deleted'-or$null-eq$Witness){return}
+    $manifest=Parse-Json (Json $Session.Manifest)
+    $manifest|Add-Member -NotePropertyName acceptedRemoteComparison -NotePropertyValue $Witness -Force
+    $Output[$Session.Prefix+'manifest.json']=Blob-Json $manifest
+}
+
 function Copy-Session($Session,$Output) {
     if($null-eq$Session){return}
     foreach($path in $Session.Entries.Keys){if(($Session.State-eq'Deleted'-and$path-eq$Session.Prefix)-or($Session.State-ne'Deleted'-and$path.StartsWith($Session.Prefix,[StringComparison]::Ordinal))){$Output[$path]=$Session.Entries[$path]}}
+    if($Session.State-ne'Deleted'-and($null-ne(Field $Session.Manifest 'acceptedRemoteComparison')-or$null-ne(Field $Session.Manifest 'confirmedAppDeletion'))){
+        $manifest=Parse-Json (Json $Session.Manifest)
+        $manifest.PSObject.Properties.Remove('acceptedRemoteComparison')
+        $manifest.PSObject.Properties.Remove('confirmedAppDeletion')
+        $Output[$Session.Prefix+'manifest.json']=Blob-Json $manifest
+    }
+
 }
 function Same-Session($A,$B) {
     if($null-eq$A-or$null-eq$B){return $null-eq$A-and$null-eq$B}
     if($A.State-ne$B.State){return $false}
     if($A.State-eq'Deleted'){return Rows-Equal $A.Manifest $B.Manifest}
-    return Rows-Equal $A.Manifest.comparison $B.Manifest.comparison
+    return Same-Comparison $A.Manifest.comparison $B.Manifest.comparison
 }
 
 
@@ -1151,6 +1214,36 @@ function Get-DeleteRequest($Row) {
     catch{Survey 'Native deletion transit timestamp is outside the supported range.'}
 }
 
+function Get-TransportedAttachmentRelative($Session,[string]$Reference) {
+    $normal=$Reference.Replace('\','/');$found=New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+    foreach($payload in @($Session.Manifest.payloads)){
+        $logical=[string]$payload.path
+        if(-not$logical.StartsWith('attachments/attachments/',[StringComparison]::Ordinal)){continue}
+        $relative=$logical.Substring('attachments/'.Length)
+        if($normal.EndsWith('/'+$relative,[StringComparison]::OrdinalIgnoreCase)){
+            if($found.ContainsKey($relative)){
+                if(-not(Rows-Equal $found[$relative] $payload)){throw "Conflicting attachment transport descriptors: $Reference"}
+            }else{$found.Add($relative,$payload)}
+        }
+    }
+    if($found.Count-ne1){throw "Attachment reference has no unique relative transport path: $Reference"}
+    return @($found.Keys)[0]
+}
+function Find-AttachmentSourceReference([string]$Path,$Pages,$Base,$Remote,[string]$VaultId) {
+    $candidates=New-Object 'Collections.Generic.List[string]';$candidates.Add($Path)
+    $full=[IO.Path]::GetFullPath($Path)
+    if(-not$full.StartsWith($script:appHome+'\attachments\',[StringComparison]::OrdinalIgnoreCase)){throw "Attachment index path escapes configured Home: $Path"}
+    $relative=$full.Substring($script:appHome.Length).TrimStart('\','/').Replace('\','/')
+    foreach($set in @($Base,$Remote)){
+        if(-not$set.ContainsKey($VaultId)-or$set[$VaultId].State-eq'Deleted'){continue}
+        $session=$set[$VaultId];$projection=Read-BlobJson $session.Entries[$session.Prefix+'projection.json']
+        foreach($reference in @(Field $projection 'attachmentReferences' @())){
+            if((Get-TransportedAttachmentRelative $session ([string]$reference))-ceq$relative-and-not$candidates.Contains([string]$reference)){$candidates.Add([string]$reference)}
+        }
+    }
+    foreach($reference in $candidates){foreach($page in $Pages){foreach($text in $page.Texts){if($text.Contains($reference)){return $reference}}}}
+    return $null
+}
 function Prepare-Local($Base,$Remote) {
     Index-ReusablePayloads $Base $Remote
     $pages=New-Object 'Collections.Generic.List[object]'
@@ -1257,11 +1350,15 @@ function Prepare-Local($Base,$Remote) {
             $extras[$table]=@();if($foreign){$extras[$table]=Db-Table $statePath $table 'WHERE id=?' @($foreign);if($extras[$table].Count-ne1){throw "Missing $table relationship: $id"}}
         }
         $owned=New-Object 'Collections.Generic.List[string]'
+        $ownedPaths=New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         foreach($path in @(Field $attachmentIndex 'attachmentPaths' @())){
-            $used=$false;foreach($page in $sessionPages){foreach($text in $page.Texts){if($text.Contains([string]$path)){$used=$true;break}}}
-            if($used){$full=[IO.Path]::GetFullPath([string]$path);$relative=$full.Substring($script:appHome.Length).TrimStart('\','/');Resolve-Within $script:appHome $relative|Out-Null
+            $reference=Find-AttachmentSourceReference ([string]$path) $sessionPages $Base $Remote $vaultId
+            if($reference){$full=[IO.Path]::GetFullPath([string]$path);$relative=$full.Substring($script:appHome.Length).TrimStart('\','/');Resolve-Within $script:appHome $relative|Out-Null
                 if(-not(Test-Path -LiteralPath $full -PathType Leaf)){throw "Missing owned attachment for $id : $path"}
-                $owned.Add([string]$path);$inventory.Add((Package-Payload $full ('attachments/'+$relative.Replace('\','/')) $files))}
+                # Index entries may spell the same Windows file with either separator.
+                # Keep original transcript text; package each physical path once.
+                if(-not$ownedPaths.Add($full)){continue}
+                $owned.Add([string]$reference);$inventory.Add((Package-Payload $full ('attachments/'+$relative.Replace('\','/')) $files))}
         }
         $browser=Resolve-Within $script:appHome ('browser/sessions/'+$id+'.toml')
         if(Test-Path -LiteralPath $browser){$inventory.Add((Package-Payload $browser ('browser/'+$id+'.toml') $files))}
@@ -1329,12 +1426,53 @@ function Verify-StoredSessions($Sessions) {
         }
     }
 }
+function Same-RemoteBasis($Remote,$Basis) {
+    $witness=Accepted-RemoteWitness $Basis
+    # Legacy same-environment bases remain supported conservatively. A legacy
+    # cross-environment mismatch is not silently accepted or repaired here.
+    if($null-eq$witness){return Same-Session $Remote $Basis}
+    if($null-eq$Remote-or$Remote.State-ne$witness.state){return $false}
+    return Same-Comparison $Remote.Manifest.comparison $witness.comparison
+}
+
+# An explicit, observed app deletion can be recorded in the existing local basis
+# by the operator that performed it. Absence alone never creates this evidence.
+function Confirmed-AppDeletion($Basis) {
+    if($null-eq$Basis-or$Basis.State-eq'Deleted'){return $null}
+    $record=Field $Basis.Manifest 'confirmedAppDeletion'
+    if($null-eq$record){return $null}
+    if((@($record.PSObject.Properties.Name|Sort-Object)-join ',')-ne'archivedAt,canonicalId,method'-or
+        [string]$record.canonicalId-cne[string]$Basis.Manifest.canonicalId-or
+        $record.method-cne'thread/delete'-or
+        ($record.archivedAt-isnot[int]-and$record.archivedAt-isnot[long])-or$record.archivedAt-le0){
+        throw 'Invalid explicit app-deletion evidence in local basis.'
+    }
+    try{return [DateTimeOffset]::FromUnixTimeSeconds([long]$record.archivedAt).ToUniversalTime().ToString('o')}
+    catch{throw 'Explicit app-deletion evidence has an invalid native archive timestamp.'}
+}
+
 function Select-Contributions($base, $remote, $local) {
     $prepared=@{};$basis=@{};$all=@{}
     foreach($collection in @($base,$remote,$local)){foreach($id in $collection.Keys){$all[$id]=$true}}
     foreach($id in @($all.Keys|Sort-Object)){
         $b=$null;$r=$null;$l=$null
         if($base.ContainsKey($id)){$b=$base[$id]};if($remote.ContainsKey($id)){$r=$remote[$id]};if($local.ContainsKey($id)){$l=$local[$id]}
+
+        $confirmedDeleteAt=Confirmed-AppDeletion $b
+        if($null-ne$confirmedDeleteAt){
+            if($null-ne$l){throw "Confirmed deleted session reappeared on this PC: $id. Review required; no automatic deletion or publication."}
+            if($null-eq$r){throw "Confirmed deletion refers to a remote session missing without a Deleted record: $id. Review required."}
+            if($r.State-eq'Deleted'){
+                Copy-Session $r $prepared;Copy-Session $r $basis
+            }else{
+                if(-not(Same-RemoteBasis $r $b)){throw "Session conflict: explicitly deleted locally but the remote changed since receipt: $id. Nothing was published."}
+                $deleted=[ordered]@{schemaVersion=1;vaultSessionId=$id;lineageIds=@($r.Manifest.lineageIds);deletedAt=$confirmedDeleteAt;source='verified-app-delete'}
+                $path="Deleted/$id.json";$blob=Blob-Json $deleted
+                $prepared[$path]=$blob;$basis[$path]=$blob
+            }
+            $script:warnings.Add("Confirmed app deletion prepared: $id; official thread/delete previously succeeded and the session remains absent. No Active/Archived payload will be published.")
+            continue
+        }
         if($null-eq$l){
             if($null-ne$b-and$b.State-eq'Active'-and($null-eq$r-or$r.State-ne'Deleted')){
                 throw "Accepted Active session is missing from this PC without a verifiable deletion transit: $id. Review required; no deletion was inferred and no stale Active copy was silently retained for publication."
@@ -1352,7 +1490,7 @@ function Select-Contributions($base, $remote, $local) {
             if($null-ne$b-and$null-eq$r){throw "Deletion request refers to a session missing from the remote without a Deleted record: $id. Review required."}
             if($null-ne$r){
                 if($null-ne$b){
-                    if(-not(Same-Session $r $b)){throw "Session conflict: local deletion requested but the remote changed since the accepted basis: $id. Nothing was removed."}
+                    if(-not(Same-RemoteBasis $r $b)){throw "Session conflict: local deletion requested but the remote changed since the accepted basis: $id. Nothing was removed."}
                 }elseif(-not(Rows-Equal $l.Manifest.comparison $r.Manifest.comparison)){
                     throw "Session conflict: deletion has no accepted basis and differs from the remote: $id. Nothing was removed."
                 }
@@ -1365,11 +1503,14 @@ function Select-Contributions($base, $remote, $local) {
             $l.NeedsRemoval=$true;$l.RemovalState='Deleted'
             continue
         }
-        Copy-Session $l $basis
-        if(Same-Session $l $r){Copy-Session $r $prepared}
+        $witness=Accepted-RemoteWitness $b
+        if(Same-Session $l $r){Copy-Session $r $prepared;$witness=Remote-Witness $r}
         elseif(Same-Session $l $b){Copy-Session $r $prepared}
-        elseif(Same-Session $r $b){Copy-Session $l $prepared}
+        elseif(Same-RemoteBasis $r $b){Copy-Session $l $prepared;$witness=Remote-Witness $l}
         else{throw "Session conflict: $id; basis=$BaselineCommit; remote=$RemoteCommit; local=$($l.State); remoteState=$(if($r){$r.State}else{'Absent'}). Neither side was changed. User resolution required."}
+        # If unchanged local work kept a newer remote version, do not pretend
+        # this PC received it. Preserve the earlier witness until Start applies it.
+        Copy-LocalBasis $l $witness $basis
     }
     return @{Prepared=$prepared; Basis=$basis}
 }

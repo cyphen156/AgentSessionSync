@@ -173,7 +173,9 @@ AgentSessionSync/
   LICENSE
 ```
 
-Nine PowerShell entry files. No common script, no gate, no preflight entry
+Nine normal PowerShell entry files, plus two manually invoked app-local reset
+maintenance entries (Codex/Reset-LocalSessions.ps1 and
+Claude/Reset-LocalSessions.ps1). No common script, no gate, no preflight entry
 point, option or mode, no conflict-resolution script, no separate PowerShell
 test file in this repository.
 
@@ -246,6 +248,8 @@ Session payload allowances are added by Initialize, in the user's copy only.
     Codex = @{
         Enabled = $true
         Home = ''
+        PathMappings = @{}
+        ProjectIdMappings = @{}
         AppId = ''
         ProcessNames = @()
     }
@@ -272,6 +276,24 @@ every Vault path is relative to it.
 
 Initialize verifies and creates. It touches no session data and reaches no
 remote.
+
+The existing machine-local configuration is authoritative on repeated Initialize:
+validate its Home, AppData and registration values and leave its bytes intact.
+On first setup, resolve this machine's app paths and write them to that file.
+Codex must have its app-created SQLite stores; never create blank SQLite files
+or copy another machine's database/schema to satisfy setup. Claude retains its
+own account/device directories; Initialize can create its empty projects folder.
+
+Codex.PathMappings optionally maps source workspace prefixes to existing local
+workspace directories. Codex.ProjectIdMappings optionally maps source project
+registrations to this PC's existing registrations. Initialize accepts
+-CodexPathMappings and -CodexProjectIdMappings when creating a configuration.
+With an existing file, edit the machine-local values and rerun Initialize to
+verify them; setup never overwrites an existing configuration from defaults.
+These are environment mappings, not per-conversation exceptions. Home-relative
+transport destinations use the configured target Home without such mappings.
+Shared Start/Finish code must not contain machine names or private absolute paths.
+
 
 ```
 verifies
@@ -404,12 +426,87 @@ payload integrity, and safe app placement before changing its own data.
 The app reads the pinned remote directly from fetched Git objects, so HEAD need
 not move before its checks and any local discard question.
 
-Current-host local OR remote baton is reason to ask. Local-only Vault commits
-also require explicit confirmation before removal from the checked-out branch.
-If neither identifies the risk, app Start must detect unpublished local changes
-using its basis and ask before replacing them. A root confirmation is forwarded
-as `-DiscardLocalChanges`; without it the app has no blanket discard permission.
-Unattended execution with no affirmative answer must not imply consent.
+The interactive root asks before a current-PC local/remote baton or local-only
+Vault commits are replaced, unless the caller explicitly supplied
+-DiscardLocalChanges. Approval covers replacement of
+local sessions and local-only Vault commits. Another PC's baton remains warning
+only; it does not itself trigger a reset or block receiving remote state.
+The root forwards approval to children; redirected children never ask an
+interactive question. NONE cannot prove there is no unpublished work. After
+validating its receive targets, an app that finds an unapproved replacement
+reports Failure with DETAIL and DISCARD_REQUIRED: True, before changing app data.
+The root displays that report and asks for approval in this same Start. Yes
+reinvokes that app against the same pinned remote with a fresh RunId and explicit
+discard approval. This approval does not authorize discarding another app's work.
+No stops automatic application, preserves that app's local work, and reports that
+preservation/reconciliation requires separate user instructions. It does not run
+Finish, merge conversations, or choose a preservation method. Already successful
+apps may remain applied under the partial-Start rule; baton and basis do not
+advance. Refusing the initial root question leaves all app data, HEAD and worktree
+unchanged. No affirmative answer in unattended execution means no consent.
+
+Start classifies receive differences inside each app, not in the common script:
+
+| Observed state | Start action |
+| --- | --- |
+| Remote Active exists; local session absent with no deletion evidence | Receive normally; absence is not an orphan or deletion signal |
+| Local session exists; remote and accepted basis have no session | Report local-only work and ask before discarding it |
+| Local session differs from its accepted basis and from the remote | Report the difference and ask before replacing it |
+| Known local schema, but an original or canonical DB row is missing | Inventory the exact identity and missing component; compare with remote before asking about replacement |
+| Known local deletion evidence would be undone by receiving Remote Active | Report and require discard approval; partial or contradictory deletion signals remain structural failures |
+| Accepted published session disappears remotely without an Active, Archived or Deleted record | Stop and report the unexplained state; discard approval does not bypass this |
+| Unknown schema, ambiguous identity, contradictory lineage or invalid remote payload | Stop and report; no speculative repair |
+
+Codex's incomplete local inventory is temporary comparison input only. It never
+becomes a publishable tree or accepted basis. No absent transcript is fabricated.
+After approved application, normal strict app and payload validation still runs
+before a new local basis is returned. Start never requires the destination to
+already possess the source machine's session files merely to receive them.
+The known-shape distinction does not relax Finish's publication validation.
+
+One-time session disposal is separate from Start. The manual entries are
+Launchers/Codex/Reset-LocalSessions.ps1 and
+Launchers/Claude/Reset-LocalSessions.ps1. Each requires -ConfirmDiscard and
+uses this installation's existing Initialize configuration. It requires its
+configured app processes to be closed; it never closes or kills them itself.
+It validates the known target storage before discarding local session state
+WITHOUT BACKUP, and does not require malformed old conversations to be exportable.
+Database schemas, credentials, login, unrelated settings, project definitions
+and project files are retained. Measured session rows, originals and session
+placement references are removed by the owning app's maintenance entry.
+Claude uses an isolated storage-engine candidate for its measured placement
+cleanup; this scratch is not a promised rollback backup.
+
+Reset does not fetch, publish, receive any remote payload, or change the Vault,
+baton or local comparison ref. After successful disposal, the user runs ordinary
+Start separately. Its normal approval and backup rules still apply; this is not
+an option, an extra check, or an automatic call in Start, Finish or Initialize.
+If a reset fails after mutation began, it reports possible incomplete disposal,
+retains available inspection scratch, and does not claim rollback. Resolve that
+failure before receiving; do not publish the partly reset store with Finish.
+
+Codex builds target conversation references from verified portable metadata and
+the target project registration. It does not require those conversations to
+already exist. Target permissions, writable roots, account and client bindings
+are not imported from the source PC. Workspace mappings affect local app metadata;
+original rollout bytes are not rewritten. Project-root matching and configured
+PathMappings compare ordinary drive/UNC paths and their extended Windows forms
+in the same namespace. Different project IDs may resolve through one uniquely
+matching target workspace; multiple matches require an explicit mapping. Merely
+using an extended path must not produce a missing-project error. An actual
+unresolved project report includes the target workspace and registered IDs.
+The surveyed app-server-migrated-pinned-thread-ids-by-host references record the
+source host's migration completion. Start validates their thread-reference form
+but does not apply them; the target host's completion markers remain untouched.
+Pinned app state is still received from the transported state projection.
+Attachment payloads are placed below
+the configured Home by their verified relative transport paths; the attachment
+index uses those destinations. Start and subsequent Finish associate the original
+source reference with that same verified payload, so moving Home does not drop
+attachments. Unknown or ambiguous references are reported, never guessed.
+
+These manual reset entries are invoked directly only for an explicit local
+disposal request. Generic All-Start and workbench adapter interfaces are unchanged.
 
 Another host's baton alone is warning-only. It does not prove this PC has no
 unpublished data. Baton NONE is not such proof either.
@@ -1196,6 +1293,11 @@ Each call runs in a child PowerShell process. It prints the normal RESULT fields
 once; exit 0 and RESULT Success are both required. The root prefixes displayed
 child output with its app name. The workbench still aggregates the root exit code.
 Missing/malformed/duplicate required object fields are failures, not success.
+Start alone may emit DISCARD_REQUIRED: True alongside Failure and DETAIL, before
+any app mutation, to request the interactive parent's discard decision. This is
+not Ready or Success and does not advance Git, baton or comparison basis. The
+app rechecks the same receive operation on approval; it never prompts on its
+redirected child input. Ordinary failures do not become discard requests.
 
 Prepared tree is the complete intended contents below that app's Vault directory.
 Local basis tree is the app-defined actual local comparison snapshot, interpreted
@@ -1261,11 +1363,9 @@ full-scan improvement candidates. Private logs, IDs and recovery paths live
 only in the installed Vault's closeout evidence document.
 
 The nine entry files do not depend on the former support scripts, tests,
-Agents configuration or old layout examples. Removal of that obsolete set was
-blocked by approval review because explicit deletion authority was not granted.
-Those files remain as unsupported legacy material pending user approval; do not
-run their tests as evidence for the new implementation. A pre-closeout backup
-exists. No new test framework is added to the public distribution.
+Agents configuration or old layout examples. The obsolete set was removed after
+explicit user approval. Historical test results are not evidence for the current
+implementation. No replacement test framework is added to the public distribution.
 
 Verification distinguishes parser checks, isolated real-entry execution,
 single-machine app observations and an actual second-machine UI round trip.
@@ -1395,3 +1495,74 @@ rollout alone never proves these independent states unchanged. Cancel/Complete,
 baton rules and common publication ordering are not changed. Progress reports
 reused JSON objects and existing trees. Code replacement still invalidates the
 previous derived rollout-analysis cache once.
+
+
+### Codex received and applied comparison bases (2026-09-07)
+
+A successful Start can legitimately rebuild sidebar indices and keep this
+machine's permissions while preserving every conversation payload. Finish must
+not interpret that application difference as a subsequent remote edit.
+Codex records acceptedRemoteComparison (state and comparison) only inside each
+non-Deleted manifest in the existing local basis tree. It never publishes this
+field. Start pairs the actual applied local comparison with the pinned received
+remote comparison. Finish compares local changes against the former and remote
+changes against the latter; Git HEAD is not the app comparison authority.
+A successful local contribution advances both comparisons to its contributed
+state. Keeping newer remote work without applying it locally retains the old
+received comparison, so a later local edit cannot silently overwrite unseen work.
+Deleted retains its existing minimal record. Legacy bases use the previous strict
+comparison; unknown legacy mismatches are not automatically accepted.
+Payload inventories compare by exact path and placement references by exact JSON
+pointer, rejecting duplicates. Enumeration order is not a content change. Actual
+sidebar positions, project assignments, pinned state and other metadata are not
+blanket-ignored, and transcript/lineage array ordering is not changed.
+Backfilling an existing basis requires evidence of the successful Start and its
+exact received commit. This is not a new Start or an app-local reset.
+
+
+### Codex explicit deletion observed before Finish (2026-09-07)
+
+An operator that performed an explicitly authorized official thread/delete and
+verified removal may record confirmedAppDeletion only in that session's existing
+local basis manifest. It contains canonicalId, the observed native archivedAt
+integer and method=thread/delete. Finish never creates this record from absence.
+The record must match the basis identity. A reappeared local session, unknown
+remote absence or remote change since the accepted received comparison blocks
+publication. Otherwise Finish prepares the existing minimal Deleted record and
+excludes Active/Archived payloads. Already published Deleted is idempotent.
+This pre-run user deletion is not rolled back by Cancel. Failed publication
+retains the existing local basis evidence; successful publication replaces it
+with the minimal Deleted basis. Neither this evidence nor the accepted remote
+comparison is included in a transported manifest. No new entry point, global
+absence exception, app-data reconstruction or direct live SQLite edit is added.
+
+
+### Codex unread membership receive (2026-09-07)
+
+Finish can carry /electron-persisted-atom-state/unread-thread-ids-by-host-v1/local/<index>
+in projection.globalReferences. Start accepts the measured string-ID membership
+for that canonical session. The numeric index is a source array position, not a
+destination slot, session identity, lineage link, or deletion signal.
+The source membership is reconciled for received Active sessions. Received
+Archived/Deleted and explicitly removed local sessions lose their stale local
+unread references. Target references outside that receive scope and other host
+buckets are retained. Source non-local host buckets and unknown shapes remain
+unsupported, rather than being silently transplanted or globally ignored.
+Planning validates before writes. Application uses the existing app-owned global
+file backup and hash verification. No common launcher, baton, publication,
+conflict comparison, or raw transcript rewriting rule changes here.
+Read/unread alone is not added to the conversation-change comparison by this fix;
+the receiver handles metadata already carried in a selected published projection.
+
+### Codex attachment index aliases (2026-09-07)
+
+Windows slash variants in attachmentPaths can identify the same local file.
+Start unions received paths by full Windows path with ordinal case-insensitive
+comparison, retaining the first stored spelling for index-key compatibility.
+Start and Finish package an owned physical attachment path only once per session;
+original transcript references and attachment bytes are not rewritten.
+Earlier local bases can contain identical attachment descriptors twice. Lookup
+and comparison collapse only identical descriptors for the same transport path.
+Conflicting descriptors, missing transport paths and ambiguous mappings still
+fail. No local ref is reset: the next successful operation builds a unique basis
+through its existing flow. Rollout, lineage, deletion and baton rules are unchanged.

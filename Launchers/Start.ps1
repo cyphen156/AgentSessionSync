@@ -1,6 +1,6 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param()
+param([switch]$DiscardLocalChanges)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -230,7 +230,8 @@ function Invoke-AppCall {
                         # and heartbeat messages never become a root RESULT.
                         if ($stream -eq 'stdout') {
                             if ($line -match '^SURVEY_REQUIRED:\s*True\s*$') { $script:surveyRequired = $true }
-                            if ($line -match '^(RESULT|PREPARED_TREE|LOCAL_BASE_TREE):\s*(\S+)\s*$') {
+                            if ($line -match '^DETAIL:\s*(.*)$') { $fields['DETAIL']=$Matches[1] }
+                            if ($line -match '^(RESULT|PREPARED_TREE|LOCAL_BASE_TREE|DISCARD_REQUIRED):\s*(\S+)\s*$') {
                                 if ($fields.ContainsKey($Matches[1])) { $fields[$Matches[1]] = 'DUPLICATE' }
                                 else { $fields[$Matches[1]] = $Matches[2] }
                             }
@@ -257,14 +258,17 @@ function Invoke-AppCall {
             $process.Dispose()
             Write-StartProgress ("{0} Start returned after {1:N1}s" -f $App.Name, $appWatch.Elapsed.TotalSeconds)
         }
+        if($code-ne0-and$fields['RESULT']-eq'Failure'-and$fields['DISCARD_REQUIRED']-eq'True'){
+            return [pscustomobject]@{Name=$App.Name;Success=$false;Reason=[string]$fields['DETAIL'];PreparedTree='';LocalTree='';DiscardRequired=$true}
+        }
         if ($code -ne 0 -or $fields['RESULT'] -ne 'Success') { throw "$($App.Name) $Operation failed (exit $code). See the app report above." }
         $preparedTree = ''; $localTree = ''
         if ($Operation -eq 'Prepare') { $preparedTree = [string]$fields['PREPARED_TREE']; Assert-TreeObject $preparedTree }
         if ($Operation -eq 'Complete' -or -not $Operation) { $localTree = [string]$fields['LOCAL_BASE_TREE']; Assert-TreeObject $localTree }
-        return [pscustomobject]@{ Name=$App.Name; Success=$true; Reason='Completed'; PreparedTree=$preparedTree; LocalTree=$localTree }
+        return [pscustomobject]@{ Name=$App.Name; Success=$true; Reason='Completed'; PreparedTree=$preparedTree; LocalTree=$localTree; DiscardRequired=$false }
     }
     catch {
-        return [pscustomobject]@{ Name=$App.Name; Success=$false; Reason=$_.Exception.Message; PreparedTree=''; LocalTree='' }
+        return [pscustomobject]@{ Name=$App.Name; Success=$false; Reason=$_.Exception.Message; PreparedTree=''; LocalTree=''; DiscardRequired=$false }
     }
 }
 function Get-RegisteredApps {
@@ -420,25 +424,40 @@ try {
     $baton = Get-Baton $remoteCommit
     $localBaton = Get-Baton $originalHead
     $thisHost = [Environment]::MachineName
-    $discardConfirmed = $false
+    $discardConfirmed = [bool]$DiscardLocalChanges
     $hasLocalCommits = -not (Test-CommitIsAncestor $originalHead $remoteCommit)
     if ($baton -ne 'NONE' -and $baton -ne $thisHost) {
         Write-Warning "ACTIVE_HOST is $baton. This records use, not authority over this PC's unpublished work."
     }
-    if ($baton -eq $thisHost -or $localBaton -eq $thisHost -or $hasLocalCommits) {
-        $answer = Read-Host 'Start replaces local sessions with remote state. Unpublished app work and local-only Vault commits may be discarded. Continue? [y/N]'
+    if (-not $discardConfirmed -and ($baton -eq $thisHost -or $localBaton -eq $thisHost -or $hasLocalCommits)) {
+        $prompt = 'Start replaces local sessions with remote state. Unpublished app work and local-only Vault commits may be discarded. Continue? [y/N]'
+        $answer = Read-Host $prompt
         if ($answer -notmatch '^(?i:y|yes)$') { throw 'Start cancelled. Fetch completed; HEAD, worktree and app data were not changed.' }
         $discardConfirmed = $true
     }
     # App Start reads the pinned remote directly, before any checkout change.
-    # It must ask about unpublished app data when no root confirmation was given.
+    # Confirmation is owned by this interactive parent, never a redirected child.
     foreach ($app in $apps) {
         try {
             Write-StartProgress ("Closing {0}; graceful wait up to {1}s" -f $app.Name, $timeout)
             Stop-AppGracefully $app $timeout
             Write-StartProgress ("{0} closed; settling file handles" -f $app.Name)
             Start-Sleep -Seconds 1
-            $appResults.Add((Invoke-AppCall $app -RemoteCommit $remoteCommit -DiscardConfirmed:$discardConfirmed))
+            $result=Invoke-AppCall $app -RemoteCommit $remoteCommit -DiscardConfirmed:$discardConfirmed
+            if($result.DiscardRequired){
+                Write-Warning $result.Reason
+                $answer=Read-Host ("{0}: discard the reported unpublished local session state and apply the fetched remote? No keeps it unchanged for separate reconciliation. [y/N]" -f $app.Name)
+                if($answer-notmatch '^(?i:y|yes)$'){
+                    $result.Reason='Discard declined. Local data was retained; automatic Start stopped. Preservation/reconciliation requires user instructions.'
+                    $appResults.Add($result)
+                    break
+                }
+                # Approval is for this app and these reported differences, not
+                # an automatic authorization to discard another app's work.
+                $script:runId=[guid]::NewGuid().ToString('D')
+                $result=Invoke-AppCall $app -RemoteCommit $remoteCommit -DiscardConfirmed
+            }
+            $appResults.Add($result)
         }
         catch { $appResults.Add([pscustomobject]@{ Name=$app.Name; Success=$false; Reason=$_.Exception.Message; LocalTree='' }) }
     }
